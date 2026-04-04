@@ -123,6 +123,117 @@ def cv2_perspective_warp(img_rgba, strength=0.1):
     return warped, corners
 
 
+def add_drop_shadow(img_rgba, corners, offset=2, spread=25, opacity=0.5):
+    """Add a realistic drop shadow for photos lying flat.
+    
+    Creates a soft, spread shadow around the photo - the shadow will be
+    composited onto the background when placed on the scene.
+    
+    Args:
+        img_rgba: Warped photo with alpha channel
+        corners: 4 corner positions of the warped photo
+        offset: How far shadow starts from photo edge (default 2px)
+        spread: How wide the shadow spreads (default 25px)
+        opacity: Shadow intensity (default 0.5)
+    
+    Returns:
+        (photo_with_shadow_canvas, new_corners, shadow_mask)
+        The shadow_mask should be composited onto background, then photo on top.
+    """
+    h, w = img_rgba.shape[:2]
+    
+    # Calculate bounds with spread
+    min_x = min(c[0] for c in corners) - offset - spread
+    max_x = max(c[0] for c in corners) + offset + spread
+    min_y = min(c[1] for c in corners) - offset - spread
+    max_y = max(c[1] for c in corners) + offset + spread
+    
+    # Output canvas size
+    out_w = int(max_x - min_x) + 1
+    out_h = int(max_y - min_y) + 1
+    offset_x = -min_x
+    offset_y = -min_y
+    
+    # Photo corners in output coordinates
+    photo_corners = corners.copy().astype(np.float32)
+    photo_corners[:, 0] += offset_x
+    photo_corners[:, 1] += offset_y
+    
+    # Create shadow mask
+    shadow_mask = np.zeros((out_h, out_w), dtype=np.float32)
+    cv2.fillPoly(shadow_mask, [photo_corners.astype(np.int32)], 255)
+    
+    # Dilate for offset + spread
+    kernel_size = max(3, (offset + spread) // 2)
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    expanded = cv2.dilate(shadow_mask.astype(np.uint8), kernel, iterations=1)
+    
+    # Subtract photo to get shadow ring
+    shadow_mask = cv2.subtract(expanded, shadow_mask.astype(np.uint8)).astype(np.float32)
+    
+    # Blur for soft edges
+    blur_size = max(7, (spread // 2) | 1)
+    shadow_mask = cv2.GaussianBlur(shadow_mask, (blur_size, blur_size), 0)
+    
+    # Normalize to opacity
+    shadow_mask = shadow_mask / 255.0 * opacity
+    
+    # Create output canvas with photo placed correctly
+    output = np.zeros((out_h, out_w, 4), dtype=np.uint8)
+    
+    # Place photo onto output
+    px1, py1 = int(offset_x), int(offset_y)
+    px2, py2 = int(offset_x + w), int(offset_y + h)
+    
+    # Clamp
+    ox1, oy1 = max(0, px1), max(0, py1)
+    ox2, oy2 = min(out_w, px2), min(out_h, py2)
+    sx1, sy1 = ox1 - px1, oy1 - py1
+    sx2, sy2 = sx1 + (ox2 - ox1), sy1 + (oy2 - oy1)
+    
+    # Copy photo to output (no RGB modification)
+    output[oy1:oy2, ox1:ox2] = img_rgba[sy1:sy2, sx1:sx2]
+    
+    return output, photo_corners, shadow_mask
+
+
+def composite_with_shadow(bg, photo, shadow_mask, pos):
+    """Composite photo onto background, applying shadow first.
+    
+    The shadow is applied to the background before the photo is placed.
+    """
+    bx, by = pos
+    bh, bw = bg.shape[:2]
+    ph, pw = photo.shape[:2]
+    sh, sw = shadow_mask.shape[:2]
+    
+    # Calculate output bounds
+    x1 = max(0, bx)
+    y1 = max(0, by)
+    x2 = min(bw, bx + sw)
+    y2 = min(bh, by + sh)
+    
+    if x1 >= x2 or y1 >= y2:
+        return bg
+    
+    # Calculate offsets
+    ox1 = x1 - bx
+    oy1 = y1 - by
+    ox2 = ox1 + (x2 - x1)
+    oy2 = oy1 + (y2 - y1)
+    
+    # Apply shadow to background (darken where shadow exists)
+    shadow_region = shadow_mask[oy1:oy2, ox1:ox2]
+    bg_region = bg[y1:y2, x1:x2].astype(np.float32)
+    
+    # Darken background by shadow amount
+    darkening = np.stack([shadow_region] * 3, axis=-1) * 0.4
+    bg[y1:y2, x1:x2] = np.clip(bg_region - darkening * 255 * 0.5, 0, 255).astype(np.uint8)
+    
+    # Now composite photo on top
+    return composite_overlay(bg, photo, (bx, by))
+
+
 class BackgroundGenerator:
     """Generates simple backgrounds."""
     
@@ -245,14 +356,19 @@ def apply_luma_gradient(bg_arr):
 def process_photo(img_path, min_size, max_size):
     """Process source image into photo instance with perspective transform.
     
-    Returns: (warped_photo, corners) where corners are the 4 corner positions
+    Returns: (warped_photo, corners, shadow_mask) 
+        corners are the 4 corner positions
+        shadow_mask is the drop shadow (or None)
     """
     try:
-        pil_img = Image.open(img_path).convert('RGBA')
+        # Use cv2 to load consistently in BGR format
+        img_bgr = cv2.imread(str(img_path))
+        if img_bgr is None:
+            return None, None, None
+        # Convert BGR to RGBA
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2BGRA)
     except:
-        return None, None
-    
-    img = np.array(pil_img)
+        return None, None, None
     
     # Resize to target size
     ih, iw = img.shape[:2]
@@ -268,24 +384,31 @@ def process_photo(img_path, min_size, max_size):
     # Extract RGB for processing
     rgb = img[:, :, :3]
     
-    # Optional effects (operate on RGB only)
+    # Apply color effects (increase AND decrease variations)
+    # Saturation adjustment
     if random.random() < 0.5:
-        noise = np.random.randint(-20, 20, rgb.shape)
-        rgb = np.clip(rgb.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        # Convert to HSV, adjust S channel, convert back
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_BGR2HSV).astype(np.float32)
+        sat_factor = random.uniform(0.5, 1.8)  # 0.5 = half saturation, 1.8 = 80% more
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_factor, 0, 255)
+        rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
     
-    if random.random() < 0.4:
-        gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
-        gray_3ch = cv2.cvtColor(gray, cv2.COLOR_BGR2RGB)
-        factor = random.uniform(0.2, 0.8)
-        rgb = cv2.addWeighted(rgb, factor, gray_3ch, 1 - factor, 0)
-    
-    if random.random() < 0.4:
-        alpha_effect = random.uniform(0.5, 0.85)
-        rgb = cv2.convertScaleAbs(rgb, alpha=alpha_effect, beta=0)
-    
+    # Contrast adjustment
     if random.random() < 0.5:
-        beta = random.uniform(-30, 30)
-        rgb = cv2.convertScaleAbs(rgb, alpha=1.0, beta=beta)
+        contrast_factor = random.uniform(0.7, 1.5)  # 0.7 = less contrast, 1.5 = more
+        rgb = cv2.convertScaleAbs(rgb, alpha=contrast_factor, beta=0)
+    
+    # Brightness adjustment
+    if random.random() < 0.5:
+        brightness_offset = random.uniform(-40, 40)  # Negative = darker, positive = brighter
+        rgb = cv2.convertScaleAbs(rgb, alpha=1.0, beta=brightness_offset)
+    
+    # Gamma curve adjustment
+    if random.random() < 0.4:
+        gamma = random.uniform(0.6, 1.6)  # < 1 = brighten shadows, > 1 = darken shadows
+        inv_gamma = 1.0 / gamma
+        table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype(np.uint8)
+        rgb = cv2.LUT(rgb, table)
     
     # Re-add alpha channel (fully opaque)
     img = np.dstack([rgb, np.full((target_h, target_w), 255, dtype=np.uint8)])
@@ -293,7 +416,21 @@ def process_photo(img_path, min_size, max_size):
     # Apply perspective warp - returns corners for keypoint tracking
     warped, corners = cv2_perspective_warp(img, strength=random.uniform(0.08, 0.16))
     
-    return warped, corners
+    # Optionally add drop shadow
+    shadow_mask = None
+    if random.random() < 0.7:  # 70% chance of shadow
+        # Parameters for realistic flat photo shadows
+        offset = random.randint(0, 15)  # How far shadow starts from edge (0-15px)
+        spread = random.randint(20, 40)  # How wide the shadow spreads (20-40px)
+        opacity = random.uniform(0.15, 0.50)  # Shadow intensity
+        warped, corners, shadow_mask = add_drop_shadow(
+            warped, corners,
+            offset=offset,
+            spread=spread,
+            opacity=opacity
+        )
+    
+    return warped, corners, shadow_mask
 
 
 def find_position(w, h, placed, margin=8):
@@ -407,9 +544,9 @@ def render_scene(config, sources):
     # Process photos
     photos = []
     for path in sampled:
-        photo, corners = process_photo(path, config.min_photo_size, config.max_photo_size)
+        photo, corners, shadow_mask = process_photo(path, config.min_photo_size, config.max_photo_size)
         if photo is not None and photo.shape[0] > 50 and photo.shape[1] > 50:
-            photos.append((photo, corners))
+            photos.append((photo, corners, shadow_mask))
     
     # Sort by area (larger first)
     photos.sort(key=lambda p: p[0].shape[0] * p[0].shape[1], reverse=True)
@@ -418,7 +555,7 @@ def render_scene(config, sources):
     placed = []
     infos = []
     
-    for photo, corners in photos:
+    for photo, corners, shadow_mask in photos:
         ph, pw = photo.shape[:2]
         
         # Use photo size for collision detection
@@ -428,8 +565,11 @@ def render_scene(config, sources):
         
         px, py = pos
         
-        # Composite onto background
-        bg = composite_overlay(bg, photo, (px, py))
+        # Apply shadow first if exists, then composite photo
+        if shadow_mask is not None:
+            bg = composite_with_shadow(bg, photo, shadow_mask, (px, py))
+        else:
+            bg = composite_overlay(bg, photo, (px, py))
         
         placed.append((px, py, pw, ph))
         
