@@ -197,6 +197,46 @@ def add_drop_shadow(img_rgba, corners, offset=2, spread=25, opacity=0.5):
     return output, photo_corners, shadow_mask
 
 
+def add_glare(img_rgb, radius_ratio=0.4, intensity=0.65, cx=None, cy=None):
+    """Add simulated glare using screen blend mode with radial gradient.
+    
+    Args:
+        img_rgb: Image in BGR format (no alpha)
+        radius_ratio: Size of glare spot relative to image (0.1-1.5)
+        intensity: Brightness of glare center (0.1-1.0)
+        cx, cy: Position override (None for random)
+    
+    Returns:
+        Image with glare applied
+    """
+    h, w = img_rgb.shape[:2]
+    
+    # Random position - can be anywhere including well outside image
+    if cx is None:
+        cx = random.randint(int(w * -0.8), int(w * 1.8))
+    if cy is None:
+        cy = random.randint(int(h * -0.8), int(h * 1.8))
+    
+    radius = int(min(w, h) * radius_ratio)
+    
+    # Create radial gradient
+    y, x = np.ogrid[:h, :w]
+    dist = np.sqrt((x - cx)**2 + (y - cy)**2)
+    gradient = np.clip(1 - dist / radius, 0, 1)
+    
+    # Apply falloff shaping (sharper falloff for more realistic glare)
+    gradient = gradient ** 1.5
+    
+    # Screen blend mode: result = 1 - (1-a)*(1-b)
+    gradient_float = (gradient * intensity).astype(np.float32)
+    img_float = img_rgb.astype(np.float32) / 255.0
+    
+    result = 1.0 - (1.0 - img_float) * (1.0 - gradient_float[..., np.newaxis])
+    result = (result * 255).astype(np.uint8)
+    
+    return result
+
+
 def composite_with_shadow(bg, photo, shadow_mask, pos):
     """Composite photo onto background, applying shadow first.
     
@@ -409,6 +449,12 @@ def process_photo(img_path, min_size, max_size):
         inv_gamma = 1.0 / gamma
         table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype(np.uint8)
         rgb = cv2.LUT(rgb, table)
+    
+    # Simulated glare (screen blend with radial gradient)
+    if random.random() < 0.3:  # 30% chance
+        radius_ratio = random.uniform(0.1, 1.5)  # Tiny to massive
+        intensity = random.uniform(0.1, 1.0)  # Very subtle to full white
+        rgb = add_glare(rgb, radius_ratio=radius_ratio, intensity=intensity)
     
     # Re-add alpha channel (fully opaque)
     img = np.dstack([rgb, np.full((target_h, target_w), 255, dtype=np.uint8)])
