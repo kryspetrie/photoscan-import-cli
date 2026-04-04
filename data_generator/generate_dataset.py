@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""
+Photo Pose Detector - Synthetic Training Data Generator (v12)
+
+Uses OpenCV for proper image transformations with alpha channel support.
+Keypoints are placed at actual warped corners, not bounding box.
+"""
+
+import random
+import argparse
+import numpy as np
+import cv2
+from PIL import Image, ImageFilter, ImageEnhance
+from pathlib import Path
+import math
+
+DEFAULT_CONFIG = {
+    "num_train_images": 800,
+    "num_val_images": 200,
+    "image_width": 1920,
+    "image_height": 1080,
+    "num_photos_min": 4,
+    "num_photos_max": 9,
+    "min_photo_size": 200,
+    "max_photo_size": 550,
+    "source_images": "./images",
+    "output_dir": "../data",
+    "seed": 42,
+}
+
+
+class Config:
+    def __init__(self, **kwargs):
+        for k, v in DEFAULT_CONFIG.items():
+            setattr(self, k, kwargs.get(k, v))
+
+
+def cv2_perspective_warp(img_rgba, strength=0.1):
+    """Apply perspective warp with alpha based on warped quadrilateral.
+    
+    Both RGB and alpha are warped through the perspective transform.
+    Output canvas is sized to contain all warped corners.
+    Returns: (warped_image, corners) where corners are the 4 corner positions
+    """
+    h, w = img_rgba.shape[:2]
+    
+    # Source corners (image rectangle)
+    src = np.array([
+        [0.0, 0.0],
+        [w - 1.0, 0.0],
+        [w - 1.0, h - 1.0],
+        [0.0, h - 1.0]
+    ], dtype=np.float32)
+    
+    # Random corner displacements
+    tl = random.uniform(-w * strength, w * strength)
+    tr = random.uniform(-w * strength, w * strength)
+    bl = random.uniform(-w * strength, w * strength)
+    br = random.uniform(-w * strength, w * strength)
+    ty_top = random.uniform(-h * strength * 0.5, h * strength * 0.5)
+    ty_bottom = random.uniform(-h * strength * 0.5, h * strength * 0.5)
+    
+    # Destination corners (warped quadrilateral)
+    dst = np.array([
+        [tl, ty_top],
+        [w - 1.0 + tr, ty_top],
+        [w - 1.0 + br, h - 1.0 + ty_bottom],
+        [bl, h - 1.0 + ty_bottom]
+    ], dtype=np.float32)
+    
+    # Calculate bounding box of warped corners
+    min_x = min(c[0] for c in dst)
+    max_x = max(c[0] for c in dst)
+    min_y = min(c[1] for c in dst)
+    max_y = max(c[1] for c in dst)
+    
+    # Add margin for anti-aliasing
+    margin = 5
+    
+    # Output size must fit the warped corners
+    out_w = int(max_x - min_x) + 1 + margin * 2
+    out_h = int(max_y - min_y) + 1 + margin * 2
+    
+    # Offset to shift corners to positive coordinates
+    offset_x = -min_x + margin
+    offset_y = -min_y + margin
+    
+    # Adjusted destination corners (all positive)
+    dst_offset = dst.copy()
+    dst_offset[:, 0] += offset_x
+    dst_offset[:, 1] += offset_y
+    
+    # Get perspective transform
+    M = cv2.getPerspectiveTransform(src, dst_offset)
+    
+    # Warp RGB channels
+    warped_rgb = cv2.warpPerspective(
+        img_rgba[:, :, :3],
+        M,
+        (out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0)
+    )
+    
+    # Warp alpha channel - fully opaque source alpha
+    alpha_channel = img_rgba[:, :, 3] if img_rgba.shape[2] == 4 else np.full((h, w), 255, dtype=np.uint8)
+    warped_alpha = cv2.warpPerspective(
+        alpha_channel,
+        M,
+        (out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0
+    )
+    
+    # Combine RGB and alpha
+    warped = np.dstack([warped_rgb, warped_alpha])
+    
+    # Return corners in new local coordinates (all positive, within warped bounds)
+    corners = dst_offset.copy()
+    
+    return warped, corners
+
+
+class BackgroundGenerator:
+    """Generates simple backgrounds."""
+    
+    def __init__(self):
+        self.types = ['wood', 'marble', 'solid', 'fabric', 'laminate']
+    
+    def generate(self, width, height):
+        bg_type = random.choice(self.types)
+        
+        if bg_type == 'wood':
+            return self._generate_wood(width, height)
+        elif bg_type == 'marble':
+            return self._generate_marble(width, height)
+        elif bg_type == 'solid':
+            return self._generate_solid(width, height)
+        elif bg_type == 'fabric':
+            return self._generate_fabric(width, height)
+        else:
+            return self._generate_laminate(width, height)
+    
+    def _generate_wood(self, w, h):
+        base_r = random.randint(130, 170)
+        base_g = random.randint(95, 125)
+        base_b = random.randint(65, 90)
+        
+        arr = np.full((h, w, 3), [base_r, base_g, base_b], dtype=np.float32)
+        
+        for y in range(0, h, random.randint(10, 25)):
+            offset = random.randint(-10, 10)
+            arr[y, :] = np.clip(arr[y, :] + offset, 0, 255)
+        
+        img = Image.fromarray(arr.astype(np.uint8))
+        return np.array(img.filter(ImageFilter.GaussianBlur(radius=2)))
+    
+    def _generate_marble(self, w, h):
+        base = random.randint(200, 230)
+        arr = np.full((h, w, 3), base, dtype=np.float32)
+        
+        for _ in range(random.randint(2, 4)):
+            x0, y0 = random.randint(0, w), random.randint(0, h)
+            length = random.randint(h // 4, h)
+            angle = random.uniform(0, 2 * math.pi)
+            
+            for i in range(0, length, 3):
+                x, y = int(x0 + math.cos(angle) * i), int(y0 + math.sin(angle) * i)
+                if 0 <= x < w and 0 <= y < h:
+                    for dx in range(-1, 2):
+                        for dy in range(-1, 2):
+                            nx, ny = x + dx, y + dy
+                            if 0 <= nx < w and 0 <= ny < h:
+                                arr[ny, nx] = base - 30
+        
+        img = Image.fromarray(arr.astype(np.uint8))
+        return np.array(img.filter(ImageFilter.GaussianBlur(radius=3)))
+    
+    def _generate_solid(self, w, h):
+        c = random.randint(160, 220)
+        return np.full((h, w, 3), [c, c, c], dtype=np.uint8)
+    
+    def _generate_fabric(self, w, h):
+        base = random.randint(150, 190)
+        arr = np.full((h, w, 3), base, dtype=np.float32)
+        arr += np.random.randint(-10, 10, (h, w, 3))
+        arr = np.clip(arr, 0, 255)
+        img = Image.fromarray(arr.astype(np.uint8))
+        return np.array(img.filter(ImageFilter.GaussianBlur(radius=1)))
+    
+    def _generate_laminate(self, w, h):
+        base_r = random.randint(160, 180)
+        base_g = random.randint(130, 150)
+        base_b = random.randint(90, 110)
+        
+        arr = np.full((h, w, 3), [base_r, base_g, base_b], dtype=np.float32)
+        ph = random.randint(70, 100)
+        for y in range(0, h, ph):
+            arr[y, :] = np.clip(arr[y, :] - 15, 0, 255)
+        
+        img = Image.fromarray(arr.astype(np.uint8))
+        return np.array(img.filter(ImageFilter.GaussianBlur(radius=1)))
+
+
+def apply_luma_gradient(bg_arr):
+    """Apply luma gradient to background."""
+    if random.random() > 0.7:
+        return bg_arr
+    
+    h, w = bg_arr.shape[:2]
+    grad_type = random.choice(['linear_h', 'linear_v', 'corner', 'radial'])
+    
+    overlay = np.zeros((h, w), dtype=np.float32)
+    
+    if grad_type == 'linear_h':
+        for x in range(w):
+            overlay[:, x] = (x / w) * random.randint(20, 35)
+    elif grad_type == 'linear_v':
+        for y in range(h):
+            overlay[y, :] = (y / h) * random.randint(20, 35)
+    elif grad_type == 'corner':
+        max_d = math.sqrt(w**2 + h**2)
+        for y in range(h):
+            for x in range(w):
+                d = math.sqrt(x**2 + y**2)
+                overlay[y, x] = (d / max_d) * random.randint(30, 45)
+    else:
+        cx, cy = w // 2, h // 2
+        max_d = math.sqrt(cx**2 + cy**2)
+        for y in range(h):
+            for x in range(w):
+                d = math.sqrt((x - cx)**2 + (y - cy)**2)
+                overlay[y, x] = (d / max_d) * random.randint(25, 40)
+    
+    result = bg_arr.astype(np.float32)
+    result[:, :, 0] = np.clip(result[:, :, 0] - overlay, 0, 255)
+    result[:, :, 1] = np.clip(result[:, :, 1] - overlay, 0, 255)
+    result[:, :, 2] = np.clip(result[:, :, 2] - overlay, 0, 255)
+    
+    return result.astype(np.uint8)
+
+
+def process_photo(img_path, min_size, max_size):
+    """Process source image into photo instance with perspective transform.
+    
+    Returns: (warped_photo, corners) where corners are the 4 corner positions
+    """
+    try:
+        pil_img = Image.open(img_path).convert('RGBA')
+    except:
+        return None, None
+    
+    img = np.array(pil_img)
+    
+    # Resize to target size
+    ih, iw = img.shape[:2]
+    if iw > ih:
+        target_w = random.randint(min_size, max_size)
+        target_h = int(ih * (target_w / iw))
+    else:
+        target_h = random.randint(min_size, max_size)
+        target_w = int(iw * (target_h / ih))
+    
+    img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+    
+    # Extract RGB for processing
+    rgb = img[:, :, :3]
+    
+    # Optional effects (operate on RGB only)
+    if random.random() < 0.5:
+        noise = np.random.randint(-20, 20, rgb.shape)
+        rgb = np.clip(rgb.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    
+    if random.random() < 0.4:
+        gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+        gray_3ch = cv2.cvtColor(gray, cv2.COLOR_BGR2RGB)
+        factor = random.uniform(0.2, 0.8)
+        rgb = cv2.addWeighted(rgb, factor, gray_3ch, 1 - factor, 0)
+    
+    if random.random() < 0.4:
+        alpha_effect = random.uniform(0.5, 0.85)
+        rgb = cv2.convertScaleAbs(rgb, alpha=alpha_effect, beta=0)
+    
+    if random.random() < 0.5:
+        beta = random.uniform(-30, 30)
+        rgb = cv2.convertScaleAbs(rgb, alpha=1.0, beta=beta)
+    
+    # Re-add alpha channel (fully opaque)
+    img = np.dstack([rgb, np.full((target_h, target_w), 255, dtype=np.uint8)])
+    
+    # Apply perspective warp - returns corners for keypoint tracking
+    warped, corners = cv2_perspective_warp(img, strength=random.uniform(0.08, 0.16))
+    
+    return warped, corners
+
+
+def find_position(w, h, placed, margin=8):
+    """Find non-overlapping position."""
+    candidates = []
+    
+    for _ in range(100):
+        x = random.randint(margin, 1920 - w - margin)
+        y = random.randint(margin, 1080 - h - margin)
+        
+        if not _overlaps(x, y, w, h, placed, margin):
+            edge_score = min(x, y, 1920 - x - w, 1080 - y - h)
+            candidates.append((x, y, edge_score))
+    
+    if candidates:
+        candidates.sort(key=lambda c: c[2])
+        return candidates[0][0], candidates[0][1]
+    
+    return None
+
+
+def _overlaps(x, y, w, h, placed, margin):
+    for px, py, pw, ph in placed:
+        if (x < px + pw + margin and x + w + margin > px and
+            y < py + ph + margin and y + h + margin > py):
+            return True
+    return False
+
+
+def composite_overlay(bg, overlay, pos):
+    """Composite overlay onto background - PIXEL PERFECT alpha compositing."""
+    bx, by = pos
+    
+    # Get bounds
+    bh, bw = bg.shape[:2]
+    oh, ow = overlay.shape[:2]
+    
+    # Calculate overlap region
+    x1 = max(0, bx)
+    y1 = max(0, by)
+    x2 = min(bw, bx + ow)
+    y2 = min(bh, by + oh)
+    
+    if x1 >= x2 or y1 >= y2:
+        return bg
+    
+    # Calculate offset into overlay
+    ox1 = x1 - bx
+    oy1 = y1 - by
+    ox2 = ox1 + (x2 - x1)
+    oy2 = oy1 + (y2 - y1)
+    
+    # Extract regions
+    bg_region = bg[y1:y2, x1:x2].astype(np.float32)
+    ov_region = overlay[oy1:oy2, ox1:ox2].astype(np.float32)
+    
+    # Get alpha (4th channel)
+    if ov_region.shape[2] == 4:
+        alpha = ov_region[:, :, 3].astype(np.float32) / 255.0
+        ov_rgb = ov_region[:, :, :3]
+    else:
+        alpha = np.ones((ov_region.shape[0], ov_region.shape[1]), dtype=np.float32)
+        ov_rgb = ov_region[:, :, :3]
+    
+    # Ensure bg is RGB only (strip alpha if present)
+    if bg_region.shape[2] == 4:
+        bg_rgb = bg_region[:, :, :3]
+    else:
+        bg_rgb = bg_region
+    
+    # Reshape for broadcasting
+    h_reg, w_reg = bg_rgb.shape[:2]
+    alpha = alpha.reshape(h_reg, w_reg, 1)
+    
+    # Alpha compositing: result = bg * (1 - alpha) + overlay * alpha
+    result = bg_rgb * (1 - alpha) + ov_rgb * alpha
+    
+    # Write back to bg
+    bg[y1:y2, x1:x2, :3] = result.astype(np.uint8)
+    
+    return bg
+
+
+def get_warped_bounds(corners):
+    """Calculate bounding box of warped corners."""
+    min_x = min(c[0] for c in corners)
+    max_x = max(c[0] for c in corners)
+    min_y = min(c[1] for c in corners)
+    max_y = max(c[1] for c in corners)
+    return min_x, min_y, max_x - min_x, max_y - min_y
+
+
+def render_scene(config, sources):
+    """Render scene with densely placed photos."""
+    w, h = 1920, 1080
+    
+    # Create background
+    bg_gen = BackgroundGenerator()
+    bg = bg_gen.generate(w, h)
+    bg = apply_luma_gradient(bg)
+    
+    # Number of photos
+    num_photos = random.randint(config.num_photos_min, config.num_photos_max)
+    
+    # Sample sources
+    if len(sources) >= num_photos:
+        sampled = random.sample(sources, num_photos)
+    else:
+        sampled = (sources * (num_photos // len(sources) + 1))[:num_photos]
+    
+    # Process photos
+    photos = []
+    for path in sampled:
+        photo, corners = process_photo(path, config.min_photo_size, config.max_photo_size)
+        if photo is not None and photo.shape[0] > 50 and photo.shape[1] > 50:
+            photos.append((photo, corners))
+    
+    # Sort by area (larger first)
+    photos.sort(key=lambda p: p[0].shape[0] * p[0].shape[1], reverse=True)
+    
+    # Place photos
+    placed = []
+    infos = []
+    
+    for photo, corners in photos:
+        ph, pw = photo.shape[:2]
+        
+        # Use photo size for collision detection
+        pos = find_position(pw, ph, placed, margin=6)
+        if pos is None:
+            continue
+        
+        px, py = pos
+        
+        # Composite onto background
+        bg = composite_overlay(bg, photo, (px, py))
+        
+        placed.append((px, py, pw, ph))
+        
+        # Keypoints at actual warped corners (corners are in local coords)
+        # corners order: [TL, TR, BR, BL]
+        kps = [
+            (px + corners[0][0], py + corners[0][1]),  # TL
+            (px + corners[1][0], py + corners[1][1]),  # TR
+            (px + corners[2][0], py + corners[2][1]),  # BR
+            (px + corners[3][0], py + corners[3][1]),  # BL
+        ]
+        
+        # Calculate center from warped corners
+        xc = sum(c[0] for c in kps) / 4 + px
+        yc = sum(c[1] for c in kps) / 4 + py
+        
+        # Calculate bounding box for the box format
+        min_x = min(k[0] for k in kps)
+        max_x = max(k[0] for k in kps)
+        min_y = min(k[1] for k in kps)
+        max_y = max(k[1] for k in kps)
+        
+        bw_box = (max_x - min_x) / 1920
+        bh_box = (max_y - min_y) / 1080
+        
+        infos.append({
+            'x_center': xc / 1920,
+            'y_center': yc / 1080,
+            'width': bw_box,
+            'height': bh_box,
+            'keypoints': kps
+        })
+    
+    return bg, infos
+
+
+class DatasetGenerator:
+    def __init__(self, config, sources):
+        self.config = config
+        self.sources = [f for f in sources if f.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp')]
+        
+        if len(self.sources) < 5:
+            raise ValueError(f"Need at least 5 source images")
+    
+    def generate(self):
+        out_dir = Path(self.config.output_dir)
+        
+        for d in ['images/train', 'images/val', 'labels/train', 'labels/val']:
+            (out_dir / d).mkdir(parents=True, exist_ok=True)
+        
+        print(f"Generating {self.config.num_train_images} training images...")
+        self._generate_images(
+            out_dir / 'images/train',
+            out_dir / 'labels/train',
+            self.config.num_train_images,
+            'train'
+        )
+        
+        print(f"\nGenerating {self.config.num_val_images} validation images...")
+        self._generate_images(
+            out_dir / 'images/val',
+            out_dir / 'labels/val',
+            self.config.num_val_images,
+            'val'
+        )
+        
+        self._save_yaml(out_dir)
+        print(f"\nDone!")
+    
+    def _generate_images(self, img_dir, lbl_dir, num, prefix):
+        for i in range(num):
+            bg, infos = render_scene(self.config, self.sources)
+            
+            pil_img = Image.fromarray(cv2.cvtColor(bg, cv2.COLOR_BGR2RGB))
+            
+            img_path = img_dir / f"{prefix}_{i:05d}.jpg"
+            pil_img.save(img_path, quality=95)
+            
+            lbl_path = lbl_dir / f"{prefix}_{i:05d}.txt"
+            self._save_labels(lbl_path, infos)
+            
+            if (i + 1) % 100 == 0:
+                print(f"  {i + 1}/{num}")
+    
+    def _save_labels(self, path, infos):
+        with open(path, 'w') as f:
+            for p in infos:
+                line = f"0 {p['x_center']:.6f} {p['y_center']:.6f} {p['width']:.6f} {p['height']:.6f}"
+                for kx, ky in p['keypoints']:
+                    line += f" {kx / 1920:.6f} {ky / 1080:.6f} 2"
+                line += "\n"
+                f.write(line)
+    
+    def _save_yaml(self, out_dir):
+        yaml = f"""# YOLO Pose Dataset
+path: {out_dir.absolute()}
+train: images/train
+val: images/val
+
+kpt_shape: [4, 2]
+flip_idx: [1, 0, 3, 2]
+
+nc: 1
+names:
+  0: photo_corner
+
+pose:
+  flip_idx: [1, 0, 3, 2]
+"""
+        p = Path("../training/dataset.yaml")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(yaml)
+        print(f"  Config: {p.absolute()}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-train", type=int, default=DEFAULT_CONFIG["num_train_images"])
+    parser.add_argument("--num-val", type=int, default=DEFAULT_CONFIG["num_val_images"])
+    parser.add_argument("--source-images", type=str, default=DEFAULT_CONFIG["source_images"])
+    parser.add_argument("--output", type=str, default=DEFAULT_CONFIG["output_dir"])
+    parser.add_argument("--min-photos", type=int, default=DEFAULT_CONFIG["num_photos_min"])
+    parser.add_argument("--max-photos", type=int, default=DEFAULT_CONFIG["num_photos_max"])
+    parser.add_argument("--seed", type=int, default=DEFAULT_CONFIG["seed"])
+    
+    args = parser.parse_args()
+    
+    src_dir = Path(args.source_images)
+    if not src_dir.exists():
+        print(f"Error: {src_dir} not found")
+        return
+    
+    sources = list(src_dir.glob("*.jpg")) + list(src_dir.glob("*.jpeg")) + \
+              list(src_dir.glob("*.png")) + list(src_dir.glob("*.webp"))
+    
+    print(f"Found {len(sources)} source images")
+    
+    config = Config(
+        num_train_images=args.num_train,
+        num_val_images=args.num_val,
+        output_dir=args.output,
+        num_photos_min=args.min_photos,
+        num_photos_max=args.max_photos,
+        seed=args.seed,
+    )
+    
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    
+    DatasetGenerator(config, sources).generate()
+
+
+if __name__ == "__main__":
+    main()

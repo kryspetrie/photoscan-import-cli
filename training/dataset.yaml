@@ -1,0 +1,14 @@
+# YOLO Pose Dataset
+path: /Users/krys.petrie/dev/photo-pose-detector/data_generator/../data
+train: images/train
+val: images/val
+
+kpt_shape: [4, 2]
+flip_idx: [1, 0, 3, 2]
+
+nc: 1
+names:
+  0: photo_corner
+
+pose:
+  flip_idx: [1, 0, 3, 2]

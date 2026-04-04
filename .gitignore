@@ -1,0 +1,43 @@
+# Source images (large, not part of repo)
+data_generator/images
+
+# Generated training data (large, regenerate-able)
+data/
+../data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# ML/Training
+runs/
+wandb/
+logs/
+*.pt
+*.pth
+*.onnx
+*.h5
+*.ckpt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Images (generated outputs)
+*.jpg
+*.png
