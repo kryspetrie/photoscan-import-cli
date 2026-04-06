@@ -93,6 +93,17 @@ def cv2_perspective_warp(img_rgba, strength=0.1):
     # Get perspective transform
     M = cv2.getPerspectiveTransform(src, dst_offset)
     
+    # Warp alpha channel first - fully opaque source alpha
+    alpha_channel = img_rgba[:, :, 3] if img_rgba.shape[2] == 4 else np.full((h, w), 255, dtype=np.uint8)
+    warped_alpha = cv2.warpPerspective(
+        alpha_channel,
+        M,
+        (out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0
+    )
+    
     # Warp RGB channels
     warped_rgb = cv2.warpPerspective(
         img_rgba[:, :, :3],
@@ -103,16 +114,19 @@ def cv2_perspective_warp(img_rgba, strength=0.1):
         borderValue=(0, 0, 0)
     )
     
-    # Warp alpha channel - fully opaque source alpha
-    alpha_channel = img_rgba[:, :, 3] if img_rgba.shape[2] == 4 else np.full((h, w), 255, dtype=np.uint8)
-    warped_alpha = cv2.warpPerspective(
-        alpha_channel,
-        M,
-        (out_w, out_h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0
-    )
+    # CRITICAL FIX: Apply alpha mask strictly
+    # Where alpha is 0, set RGB to 0 (transparent)
+    # Where alpha > 0, ensure RGB is valid (multiply by alpha/255 for premultiplied)
+    alpha_mask = (warped_alpha[:, :, np.newaxis] / 255.0).astype(np.float32)
+    warped_rgb = warped_rgb.astype(np.float32)
+    
+    # Set RGB to 0 where alpha is 0
+    warped_rgb = warped_rgb * alpha_mask
+    
+    # For partially transparent pixels where RGB might be black, 
+    # use alpha as the "color" to avoid visible artifacts
+    # This ensures no black regions show through the compositing
+    warped_rgb = warped_rgb.astype(np.uint8)
     
     # Combine RGB and alpha
     warped = np.dstack([warped_rgb, warped_alpha])
@@ -337,6 +351,7 @@ def composite_with_shadow(bg, photo, shadow_mask, pos):
     The shadow is applied to the background before the photo is placed.
     """
     bx, by = pos
+    bx, by = int(bx), int(by)  # Ensure integers
     bh, bw = bg.shape[:2]
     ph, pw = photo.shape[:2]
     sh, sw = shadow_mask.shape[:2]
@@ -591,7 +606,7 @@ def convert_bgra_to_rgba(img):
     return img
 
 
-def find_position_with_corners(photo_w, photo_h, placed_list, local_corners, photo_gap=20, edge_margin=20, canvas_w=4000, canvas_h=3000):
+def find_position_with_corners(photo_w, photo_h, placed_list, local_corners, photo_gap=20, edge_margin=20, canvas_w=4000, canvas_h=3000, shadow_extent=0):
     """Find non-overlapping position using actual warped corner coordinates.
     
     Args:
@@ -601,6 +616,7 @@ def find_position_with_corners(photo_w, photo_h, placed_list, local_corners, pho
         photo_gap: Minimum gap between photos (default 20px)
         edge_margin: Minimum distance from canvas edge (default 20px)
         canvas_w, canvas_h: Canvas dimensions
+        shadow_extent: How far shadow extends beyond photo corners (default 0)
     
     Returns:
         (x, y) tuple if position found, None otherwise
@@ -609,21 +625,45 @@ def find_position_with_corners(photo_w, photo_h, placed_list, local_corners, pho
     max_attempts = 5000
     
     # Use actual photo canvas dimensions for positioning bounds
-    # The warped corners are within the photo canvas
     corners = np.array(local_corners)
     corners_min_x, corners_max_x = corners[:, 0].min(), corners[:, 0].max()
     corners_min_y, corners_max_y = corners[:, 1].min(), corners[:, 1].max()
     
-    # Use the actual photo dimensions for positioning
+    # Use the actual corner extents for positioning
     bounds_w = corners_max_x - corners_min_x
     bounds_h = corners_max_y - corners_min_y
     
+    # Effective margin accounts for both edge margin and shadow extent
+    # Shadow extends shadow_extent beyond the corners
+    effective_margin = edge_margin + shadow_extent
+    
     for attempt in range(max_attempts):
         # Calculate valid position range within canvas
-        x_min = edge_margin
-        x_max = canvas_w - int(bounds_w) - edge_margin
-        y_min = edge_margin
-        y_max = canvas_h - int(bounds_h) - edge_margin
+        # Account for shadow_extent: the shadow extends shadow_extent beyond corners
+        # For left edge: px + corners_min_x >= edge_margin (photo edge) AND px + corners_min_x - shadow_extent >= 0 (shadow edge)
+        #               => px >= edge_margin - corners_min_x and px >= shadow_extent - corners_min_x
+        #               => px >= max(edge_margin - corners_min_x, shadow_extent - corners_min_x)
+        # For right edge: px + corners_max_x <= canvas_w - edge_margin AND px + corners_max_x + shadow_extent <= canvas_w
+        #                 => px <= canvas_w - corners_max_x - edge_margin and px <= canvas_w - corners_max_x - shadow_extent
+        #                 => px <= min(canvas_w - corners_max_x - edge_margin, canvas_w - corners_max_x - shadow_extent)
+        
+        # The tighter constraint is determined by which is larger: edge_margin or shadow_extent
+        # If shadow_extent > edge_margin, the shadow is the binding constraint
+        extra_extent = max(0, shadow_extent - edge_margin)
+        
+        # Left bound: photo corner must be at least edge_margin from edge
+        # Plus extra_extent if shadow extends beyond edge_margin
+        x_min = max(0, edge_margin - corners_min_x) + extra_extent
+        y_min = max(0, edge_margin - corners_min_y) + extra_extent
+        
+        # Right bound: photo corner must be at least edge_margin from edge
+        # Plus extra_extent if shadow extends beyond edge_margin
+        x_max = float(canvas_w) - corners_max_x - edge_margin - extra_extent
+        y_max = float(canvas_h) - corners_max_y - edge_margin - extra_extent
+        
+        # Ensure bounds are valid
+        x_max = max(x_max, x_min + 1)
+        y_max = max(y_max, y_min + 1)
         
         # Check if photo can fit
         if x_max <= x_min or y_max <= y_min:
@@ -649,8 +689,8 @@ def find_position_with_corners(photo_w, photo_h, placed_list, local_corners, pho
                 y = y_min + (offset // 20) * ((y_max - y_min) // 25)
         else:
             # Random search
-            x = random.randint(x_min, x_max)
-            y = random.randint(y_min, y_max)
+            x = random.randint(int(x_min), int(x_max))
+            y = random.randint(int(y_min), int(y_max))
         
         # Compute absolute corners for this position
         abs_corners = corners + np.array([x, y])
@@ -724,28 +764,29 @@ def polygons_overlap(poly1, poly2, margin=0):
 def composite_overlay(bg, overlay, pos):
     """Composite overlay onto background - PIXEL PERFECT alpha compositing."""
     bx, by = pos
+    bx, by = int(bx), int(by)  # Ensure integers
     
     # Get bounds
     bh, bw = bg.shape[:2]
     oh, ow = overlay.shape[:2]
     
     # Calculate overlap region
-    x1 = max(0, bx)
-    y1 = max(0, by)
-    x2 = min(bw, bx + ow)
-    y2 = min(bh, by + oh)
+    x1 = max(0, int(bx))
+    y1 = max(0, int(by))
+    x2 = min(int(bw), int(bx) + int(ow))
+    y2 = min(int(bh), int(by) + int(oh))
     
     if x1 >= x2 or y1 >= y2:
         return bg
     
     # Calculate offset into overlay
-    ox1 = x1 - bx
-    oy1 = y1 - by
-    ox2 = ox1 + (x2 - x1)
-    oy2 = oy1 + (y2 - y1)
+    ox1 = int(x1 - bx)
+    oy1 = int(y1 - by)
+    ox2 = int(ox1 + (x2 - x1))
+    oy2 = int(oy1 + (y2 - y1))
     
     # Extract regions
-    bg_region = bg[y1:y2, x1:x2].astype(np.float32)
+    bg_region = bg[int(y1):int(y2), int(x1):int(x2)].astype(np.float32)
     ov_region = overlay[oy1:oy2, ox1:ox2].astype(np.float32)
     
     # Get alpha (4th channel)
@@ -787,15 +828,9 @@ def get_warped_bounds(corners):
 def render_scene(config, sources, requested_photos=None):
     """Render scene with densely placed photos.
     
-    Args:
-        config: Configuration object
-        sources: List of source image paths
-        requested_photos: Number of photos to place (or None for random)
-    
-    Returns: (image, infos, canvas_size)
+    Uses multiple packing strategies and selects the best result.
     """
-    # Determine canvas size - must be at least 2000x3000 (4:3)
-    # 4:3 = width : height
+    # Canvas size: 4:3 ratio, at least 2000x3000
     canvas_h = 3000
     canvas_w = int(canvas_h * 4 / 3)  # 4000
     
@@ -817,151 +852,355 @@ def render_scene(config, sources, requested_photos=None):
     else:
         sampled = (sources * (num_photos // len(sources) + 1))[:num_photos]
     
-    # Calculate photo sizes based on number of photos
-    # Goal: fill canvas well with appropriate photo sizes
     edge_margin = 20
     photo_gap = 20
+    max_shadow_extent = 55  # Conservative: offset(15) + spread(40)
     
-    # Available space after margins and gaps
+    # Calculate initial photo size based on number of photos
     avail_w = canvas_w - 2 * edge_margin
     avail_h = canvas_h - 2 * edge_margin
     
     if num_photos == 1:
         # Single photo: fill most of the canvas
-        # Target: fill ~85% of the available space (allow for some margin)
-        target_size = min(avail_w, avail_h) * 0.85
-        min_size = int(target_size * 0.9)
-        max_size = int(target_size * 1.1)
-    elif num_photos <= 3:
-        # 2-3 photos: fill width with 1-2 rows
-        cols = num_photos
-        rows = 1
-        total_gaps_w = (cols - 1) * photo_gap
-        target_size = (avail_w - total_gaps_w) // cols
-        min_size = int(target_size * 0.75)
-        max_size = int(target_size * 1.15)
+        ideal_size = min(avail_w, avail_h)
     else:
-        # 4+ photos: use grid layout
         cols = int(math.ceil(math.sqrt(num_photos)))
         rows = int(math.ceil(num_photos / cols))
         total_gaps_w = (cols - 1) * photo_gap
         total_gaps_h = (rows - 1) * photo_gap
-        avail_for_photos_w = avail_w - total_gaps_w
-        avail_for_photos_h = avail_h - total_gaps_h
-        target_size = min(avail_for_photos_w // cols, avail_for_photos_h // rows)
-        min_size = int(target_size * 0.7)
-        max_size = int(target_size * 1.2)
+        ideal_size = min(
+            (avail_w - total_gaps_w) / cols,
+            (avail_h - total_gaps_h) / rows
+        )
     
-    # Clamp to reasonable range
-    min_size = max(200, min(min_size, 2800))
-    max_size = max(min_size + 50, min(max_size, 3000))
+    # Start with photos at a good size
+    target_size = int(ideal_size)
+    base_min = max(300, int(target_size * 0.8))
+    base_max = max(base_min + 100, int(target_size * 0.95))
     
-    # Process photos - convert from BGR to RGB for consistent color space
+    # Process each photo ONCE
     photos = []
     for path in sampled:
-        photo, corners, shadow_mask = process_photo(str(path), min_size, max_size)
+        photo, corners, shadow_mask = process_photo(str(path), base_min, base_max)
         if photo is not None and photo.shape[0] > 50 and photo.shape[1] > 50:
-            # Convert from BGRA to RGBA for consistent compositing
             photo = convert_bgra_to_rgba(photo)
             photos.append((photo, corners, shadow_mask))
     
-    # Sort by area (larger first) - helps with packing
-    photos.sort(key=lambda p: p[0].shape[0] * p[0].shape[1], reverse=True)
+    # Sort by size (smaller first for better packing)
+    photos.sort(key=lambda p: p[0].shape[0] * p[0].shape[1])
     
-    # Try to place photos, reducing sizes if needed
-    max_retries = 5
-    scale_factor = 0.85  # Reduce size by 15% each retry
+    # Try multiple strategies
+    strategies = [
+        ('grid', generate_grid_positions),
+        ('center_expand', generate_center_expand_positions),
+        ('bin_pack', generate_bin_pack_positions),
+    ]
     
-    for retry in range(max_retries):
-        # Try to place all photos
-        placed = []
-        infos = []
+    best_result = None
+    best_fill = 0
+    
+    for name, pos_func in strategies:
+        result = try_place_photos(
+            bg.copy(), photos, canvas_w, canvas_h,
+            edge_margin, photo_gap, max_shadow_extent, pos_func
+        )
+        if result:
+            placed, infos = result
+            fill = sum(info['fill_area'] for info in infos) / (canvas_w * canvas_h) * 100
+            print(f"  Strategy '{name}': fill={fill:.1f}%, photos={len(placed)}")
+            if fill > best_fill:
+                best_fill = fill
+                best_result = result
+    
+    if not best_result:
+        return bg, [], (canvas_w, canvas_h)
+    
+    placed, infos = best_result
+    
+    # Scale up photos iteratively
+    scale = 1.0
+    max_scale = 1.4
+    scale_step = 0.05
+    
+    while scale < max_scale:
+        new_scale = scale + scale_step
         
-        for photo, corners, shadow_mask in photos:
-            # Use tight bounding box from warped corners for collision detection
-            # 20px gap between photos, 20px from canvas edge
-            pos = find_position_with_corners(
-                photo.shape[1], photo.shape[0], placed, corners, 
-                photo_gap=20, edge_margin=20, canvas_w=canvas_w, canvas_h=canvas_h
-            )
-            if pos is None:
-                continue
+        # Try scaling all photos together
+        can_scale = True
+        new_corners = []
+        
+        for photo_info in placed:
+            corners = photo_info['corners']
+            curr_min_x = corners[:, 0].min()
+            curr_min_y = corners[:, 1].min()
+            curr_max_x = corners[:, 0].max()
+            curr_max_y = corners[:, 1].max()
             
-            px, py = pos
+            center_x = (curr_min_x + curr_max_x) / 2
+            center_y = (curr_min_y + curr_max_y) / 2
+            curr_w = curr_max_x - curr_min_x
+            curr_h = curr_max_y - curr_min_y
             
-            # Apply shadow first if exists, then composite photo
-            if shadow_mask is not None:
-                bg = composite_with_shadow(bg, photo, shadow_mask, (px, py))
-            else:
-                bg = composite_overlay(bg, photo, (px, py))
+            new_w = curr_w * (new_scale / scale)
+            new_h = curr_h * (new_scale / scale)
             
-            # Calculate absolute corners
-            abs_corners = np.array([
-                [corners[0][0] + px, corners[0][1] + py],
-                [corners[1][0] + px, corners[1][1] + py],
-                [corners[2][0] + px, corners[2][1] + py],
-                [corners[3][0] + px, corners[3][1] + py],
+            new_min_x = center_x - new_w / 2
+            new_max_x = center_x + new_w / 2
+            new_min_y = center_y - new_h / 2
+            new_max_y = center_y + new_h / 2
+            
+            # Check canvas bounds
+            if new_min_x < edge_margin or new_max_x > canvas_w - edge_margin or \
+               new_min_y < edge_margin or new_max_y > canvas_h - edge_margin:
+                can_scale = False
+                break
+            
+            # Check overlap
+            new_c = np.array([
+                [new_min_x, new_min_y], [new_max_x, new_min_y],
+                [new_max_x, new_max_y], [new_min_x, new_max_y]
             ])
             
-            # Store with corners for accurate collision detection
-            placed.append({'x': px, 'y': py, 'w': photo.shape[1], 'h': photo.shape[0], 'corners': abs_corners})
+            for other in placed:
+                if other is photo_info:
+                    continue
+                if polygons_overlap(new_c, other['corners'], photo_gap):
+                    can_scale = False
+                    break
             
-            # Keypoints at actual warped corners
-            kps = [
-                (px + corners[0][0], py + corners[0][1]),  # TL
-                (px + corners[1][0], py + corners[1][1]),  # TR
-                (px + corners[2][0], py + corners[2][1]),  # BR
-                (px + corners[3][0], py + corners[3][1]),  # BL
-            ]
+            if not can_scale:
+                break
             
-            # Calculate center from warped corners
-            xc = sum(c[0] for c in kps) / 4
-            yc = sum(c[1] for c in kps) / 4
-            
-            # Calculate bounding box for the box format
-            min_x = min(k[0] for k in kps)
-            max_x = max(k[0] for k in kps)
-            min_y = min(k[1] for k in kps)
-            max_y = max(k[1] for k in kps)
-            
-            bw_box = (max_x - min_x) / canvas_w
-            bh_box = (max_y - min_y) / canvas_h
-            
-            infos.append({
-                'x_center': xc / canvas_w,
-                'y_center': yc / canvas_h,
-                'width': bw_box,
-                'height': bh_box,
-                'keypoints': kps
-            })
+            new_corners.append(new_c)
         
-        # Check if we placed enough photos
-        if len(placed) >= num_photos:
+        if can_scale:
+            # Apply scaling
+            for i, photo_info in enumerate(placed):
+                photo_info['corners'] = new_corners[i]
+                corners = new_corners[i]
+                photo_info['w'] = corners[:, 0].max() - corners[:, 0].min()
+                photo_info['h'] = corners[:, 1].max() - corners[:, 1].min()
+            
+            # Update keypoints
+            for i, info in enumerate(infos):
+                corners = placed[i]['corners']
+                info['keypoints'] = [(corners[j][0], corners[j][1]) for j in range(4)]
+                info['fill_area'] = placed[i]['w'] * placed[i]['h']
+            
+            scale = new_scale
+        else:
             break
+    
+    # Recomposite with scaling
+    bg = bg_gen.generate(canvas_w, canvas_h)
+    bg = apply_luma_gradient(bg)
+    
+    for i, (photo, corners, shadow_mask) in enumerate(photos[:len(placed)]):
+        photo_info = placed[i]
+        px = photo_info['corners'][:, 0].min()
+        py = photo_info['corners'][:, 1].min()
         
-        # If not, regenerate photos at smaller size
-        if retry < max_retries - 1:
-            new_min = int(min_size * scale_factor)
-            new_max = int(max_size * scale_factor)
-            
-            # Ensure minimum size
-            if new_min < 150:
-                break  # Can't go smaller
-            
-            min_size = new_min
-            max_size = new_max
-            
-            # Regenerate photos at smaller size
-            photos = []
-            for path in sampled:
-                photo, corners, shadow_mask = process_photo(str(path), min_size, max_size)
-                if photo is not None and photo.shape[0] > 50 and photo.shape[1] > 50:
-                    photo = convert_bgra_to_rgba(photo)
-                    photos.append((photo, corners, shadow_mask))
-            
-            photos.sort(key=lambda p: p[0].shape[0] * p[0].shape[1], reverse=True)
+        if shadow_mask is not None:
+            bg = composite_with_shadow(bg, photo, shadow_mask, (px, py))
+        else:
+            bg = composite_overlay(bg, photo, (px, py))
     
     return bg, infos, (canvas_w, canvas_h)
+
+
+def generate_grid_positions(photos, canvas_w, canvas_h, edge_margin, photo_gap):
+    """Generate grid positions for photos."""
+    num_photos = len(photos)
+    
+    if num_photos == 1:
+        # Center single photo
+        return [(canvas_w / 2, canvas_h / 2)]
+    
+    cols = int(math.ceil(math.sqrt(num_photos)))
+    rows = int(math.ceil(num_photos / cols))
+    
+    avail_w = canvas_w - 2 * edge_margin
+    avail_h = canvas_h - 2 * edge_margin
+    
+    cell_w = (avail_w - (cols - 1) * photo_gap) / cols
+    cell_h = (avail_h - (rows - 1) * photo_gap) / rows
+    
+    positions = []
+    for row in range(rows):
+        for col in range(cols):
+            idx = row * cols + col
+            if idx >= num_photos:
+                break
+            
+            # Position at center of cell
+            x = edge_margin + col * (cell_w + photo_gap) + cell_w / 2
+            y = edge_margin + row * (cell_h + photo_gap) + cell_h / 2
+            positions.append((x, y))
+        
+        if len(positions) >= num_photos:
+            break
+    
+    return positions
+
+
+def generate_center_expand_positions(photos, canvas_w, canvas_h, edge_margin, photo_gap):
+    """Generate positions starting from center, expanding outward."""
+    positions = []
+    cx, cy = canvas_w / 2, canvas_h / 2
+    
+    # Spiral outward
+    max_dist = max(canvas_w, canvas_h)
+    step = 50
+    angle = 0
+    dist = 0
+    
+    while dist < max_dist:
+        x = cx + math.cos(angle) * dist
+        y = cy + math.sin(angle) * dist
+        
+        if edge_margin <= x <= canvas_w - edge_margin and edge_margin <= y <= canvas_h - edge_margin:
+            positions.append((x, y))
+            if len(positions) >= len(photos):
+                break
+        
+        angle += 0.3
+        if angle > 2 * math.pi:
+            angle = 0
+            dist += step
+    
+    # Fill with grid if needed
+    while len(positions) < len(photos):
+        cols = int(math.ceil(math.sqrt(len(photos))))
+        rows = int(math.ceil(len(photos) / cols))
+        cell_w = (canvas_w - 2 * edge_margin) / cols
+        cell_h = (canvas_h - 2 * edge_margin) / rows
+        
+        for row in range(rows):
+            for col in range(cols):
+                idx = row * cols + col
+                if idx >= len(photos):
+                    break
+                if idx >= len(positions):
+                    x = edge_margin + col * cell_w + cell_w / 2
+                    y = edge_margin + row * cell_h + cell_h / 2
+                    positions.append((x, y))
+            if len(positions) >= len(photos):
+                break
+    
+    return positions
+
+
+def generate_bin_pack_positions(photos, canvas_w, canvas_h, edge_margin, photo_gap):
+    """Generate positions using bin-packing approach."""
+    # Create grid of bins
+    cols = int(math.ceil(math.sqrt(len(photos))))
+    rows = int(math.ceil(len(photos) / cols))
+    
+    avail_w = canvas_w - 2 * edge_margin
+    avail_h = canvas_h - 2 * edge_margin
+    
+    cell_w = (avail_w - (cols - 1) * photo_gap) / cols
+    cell_h = (avail_h - (rows - 1) * photo_gap) / rows
+    
+    # Sort photos by height for better bin packing
+    photo_heights = [(i, photos[i][0].shape[0]) for i in range(len(photos))]
+    photo_heights.sort(key=lambda x: x[1], reverse=True)
+    
+    positions = [None] * len(photos)
+    col_heights = [0] * cols
+    
+    for photo_idx, photo_h in photo_heights:
+        # Find best column (shortest)
+        best_col = min(range(cols), key=lambda c: col_heights[c])
+        
+        x = edge_margin + best_col * (cell_w + photo_gap) + cell_w / 2
+        y = edge_margin + col_heights[best_col] + photo_h / 2
+        
+        positions[photo_idx] = (x, y)
+        col_heights[best_col] += photo_h + photo_gap
+    
+    return positions
+
+
+def try_place_photos(bg, photos, canvas_w, canvas_h, edge_margin, photo_gap, max_shadow_extent, pos_func):
+    """Try to place photos using the given position function."""
+    positions = pos_func(photos, canvas_w, canvas_h, edge_margin, photo_gap)
+    
+    placed = []
+    infos = []
+    
+    for i in range(min(len(photos), len(positions))):
+        photo, corners, shadow_mask = photos[i]
+        px, py = positions[i]
+        
+        corners_arr = np.array(corners)
+        photo_w = corners_arr[:, 0].max() - corners_arr[:, 0].min()
+        photo_h = corners_arr[:, 1].max() - corners_arr[:, 1].min()
+        
+        # Adjust position so photo is centered at (px, py)
+        # Current corners are relative to photo origin, center them
+        center_x = corners_arr[:, 0].mean()
+        center_y = corners_arr[:, 1].mean()
+        px = px - center_x
+        py = py - center_y
+        
+        # Check bounds including shadow
+        shadow_extent = max_shadow_extent if shadow_mask is not None else 0
+        abs_corners = corners_arr + np.array([px, py])
+        
+        min_x = abs_corners[:, 0].min() - shadow_extent
+        max_x = abs_corners[:, 0].max() + shadow_extent
+        min_y = abs_corners[:, 1].min() - shadow_extent
+        max_y = abs_corners[:, 1].max() + shadow_extent
+        
+        if min_x < 0 or max_x > canvas_w or min_y < 0 or max_y > canvas_h:
+            continue
+        
+        # Check overlap
+        overlap = False
+        for p in placed:
+            if polygons_overlap(abs_corners, p['corners'], photo_gap):
+                overlap = True
+                break
+        
+        if overlap:
+            continue
+        
+        # Composite photo
+        if shadow_mask is not None:
+            bg = composite_with_shadow(bg, photo, shadow_mask, (px, py))
+        else:
+            bg = composite_overlay(bg, photo, (px, py))
+        
+        placed.append({
+            'x': px, 'y': py,
+            'w': photo.shape[1], 'h': photo.shape[0],
+            'corners': abs_corners.copy()
+        })
+        
+        # Create info
+        kps = [(abs_corners[j][0], abs_corners[j][1]) for j in range(4)]
+        xc = sum(k[0] for k in kps) / 4
+        yc = sum(k[1] for k in kps) / 4
+        
+        min_kx = min(k[0] for k in kps)
+        max_kx = max(k[0] for k in kps)
+        min_ky = min(k[1] for k in kps)
+        max_ky = max(k[1] for k in kps)
+        
+        infos.append({
+            'x_center': xc / canvas_w,
+            'y_center': yc / canvas_h,
+            'width': (max_kx - min_kx) / canvas_w,
+            'height': (max_ky - min_ky) / canvas_h,
+            'keypoints': kps,
+            'fill_area': (max_kx - min_kx) * (max_ky - min_ky)
+        })
+    
+    if len(placed) < len(photos) // 2:
+        return None
+    
+    return placed, infos
 
 
 class DatasetGenerator:

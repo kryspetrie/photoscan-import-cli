@@ -64,23 +64,29 @@ for num_photos, name in test_cases:
     else:
         print(f"  ✗ Only placed {len(infos)}/{num_photos} photos")
     
-    # Calculate content fill
+    # Calculate content fill using actual photo bounding boxes
     if infos:
-        # Get bounding box of all photos
-        all_x = []
-        all_y = []
+        # Sum the actual area of each photo's bounding box
+        total_photo_area = 0
         for info in infos:
-            for kx, ky in info['keypoints']:
-                all_x.append(kx)
-                all_y.append(ky)
+            # Area of this photo's bounding box
+            photo_area = info.get('fill_area', 0)
+            if photo_area == 0:
+                # Fallback: calculate from keypoints
+                kps = info['keypoints']
+                min_x = min(k[0] for k in kps)
+                max_x = max(k[0] for k in kps)
+                min_y = min(k[1] for k in kps)
+                max_y = max(k[1] for k in kps)
+                photo_area = (max_x - min_x) * (max_y - min_y)
+            total_photo_area += photo_area
         
-        min_x, max_x = min(all_x), max(all_x)
-        min_y, max_y = min(all_y), max(all_y)
-        content_area = (max_x - min_x) * (max_y - min_y)
         canvas_area = canvas_w * canvas_h
-        fill_percent = content_area / canvas_area * 100
+        fill_percent = total_photo_area / canvas_area * 100
         
-        print(f"  Content fill: {fill_percent:.1f}%")
+        print(f"  Total photo area: {total_photo_area:,} px²")
+        print(f"  Canvas area: {canvas_area:,} px²")
+        print(f"  Fill Percentage: {fill_percent:.1f}%")
         if fill_percent > 30:
             print(f"  ✓ Good fill")
         else:
