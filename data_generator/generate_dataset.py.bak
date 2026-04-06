@@ -580,49 +580,17 @@ def process_photo(img_path, min_size, max_size):
     return warped, corners, shadow_mask
 
 
-def find_position_with_corners(photo_w, photo_h, placed_list, local_corners, margin=8):
-    """Find non-overlapping position using actual warped corner coordinates.
-    
-    Args:
-        photo_w, photo_h: Photo dimensions (fallback bounds)
-        placed_list: List of placed photos as dicts with 'corners' key
-        local_corners: 4 corner points in photo-local coordinates (numpy array or list)
-        margin: Minimum gap between photos in pixels
-    
-    Returns:
-        (x, y) tuple if position found, None otherwise
-    """
+def find_position(w, h, placed, margin=8):
+    """Find non-overlapping position."""
     candidates = []
-    max_attempts = 2000
     
-    # Precompute corner bounds for quick reject
-    corners = np.array(local_corners)
-    cx, cy = corners[:, 0], corners[:, 1]
-    corner_min_x, corner_max_x = cx.min(), cx.max()
-    corner_min_y, corner_max_y = cy.min(), cy.max()
-    corner_w = corner_max_x - corner_min_x
-    corner_h = corner_max_y - corner_min_y
-    
-    for attempt in range(max_attempts):
-        # Random position
-        x = random.randint(margin, 1920 - int(corner_w) - margin)
-        y = random.randint(margin, 1080 - int(corner_h) - margin)
+    for _ in range(100):
+        x = random.randint(margin, 1920 - w - margin)
+        y = random.randint(margin, 1080 - h - margin)
         
-        # Compute absolute corners for this position
-        abs_corners = corners + np.array([x, y])
-        
-        # Check for overlap with all placed photos
-        overlaps = False
-        for placed in placed_list:
-            placed_corners = placed['corners']  # Already in absolute coords
-            if polygons_overlap(abs_corners, placed_corners, margin):
-                overlaps = True
-                break
-        
-        if not overlaps:
-            # Prefer positions closer to edges for denser packing
-            edge_dist = min(x, y, 1920 - x - corner_w, 1080 - y - corner_h)
-            candidates.append((x, y, edge_dist))
+        if not _overlaps(x, y, w, h, placed, margin):
+            edge_score = min(x, y, 1920 - x - w, 1080 - y - h)
+            candidates.append((x, y, edge_score))
     
     if candidates:
         candidates.sort(key=lambda c: c[2])
@@ -631,51 +599,13 @@ def find_position_with_corners(photo_w, photo_h, placed_list, local_corners, mar
     return None
 
 
-def polygons_overlap(poly1, poly2, margin=0):
-    """Check if two convex polygons overlap using separating axis theorem.
-    
-    Args:
-        poly1, poly2: Nx2 numpy arrays of polygon vertices in absolute coords
-        margin: Extra buffer space
-    Returns:
-        True if polygons overlap, False otherwise
-    """
-    # Quick bounding box reject
-    min1_x, max1_x = poly1[:, 0].min(), poly1[:, 0].max()
-    min1_y, max1_y = poly1[:, 1].min(), poly1[:, 1].max()
-    min2_x, max2_x = poly2[:, 0].min(), poly2[:, 0].max()
-    min2_y, max2_y = poly2[:, 1].min(), poly2[:, 1].max()
-    
-    # Expand by margin
-    if max1_x + margin < min2_x or min1_x - margin > max2_x:
-        return False
-    if max1_y + margin < min2_y or min1_y - margin > max2_y:
-        return False
-    
-    # SAT with all edge normals from both polygons
-    for poly in [poly1, poly2]:
-        for i in range(len(poly)):
-            p1 = poly[i]
-            p2 = poly[(i + 1) % len(poly)]
-            
-            # Edge vector
-            edge = p2 - p1
-            if np.abs(edge).sum() < 0.001:  # Skip degenerate edges
-                continue
-            
-            # Normal (perpendicular to edge)
-            normal = np.array([-edge[1], edge[0]])
-            normal = normal / (np.linalg.norm(normal) + 1e-10)
-            
-            # Project both polygons onto normal
-            proj1 = poly1 @ normal
-            proj2 = poly2 @ normal
-            
-            # Check for gap
-            if proj1.max() + margin < proj2.min() or proj2.max() + margin < proj1.min():
-                return False  # Separating axis found
-    
-    return True  # No separating axis found, polygons overlap
+def _overlaps(x, y, w, h, placed, margin):
+    for px, py, pw, ph in placed:
+        if (x < px + pw + margin and x + w + margin > px and
+            y < py + ph + margin and y + h + margin > py):
+            return True
+    return False
+
 
 def composite_overlay(bg, overlay, pos):
     """Composite overlay onto background - PIXEL PERFECT alpha compositing."""
@@ -773,8 +703,10 @@ def render_scene(config, sources):
     infos = []
     
     for photo, corners, shadow_mask in photos:
-        # Use tight bounding box from warped corners for collision detection
-        pos = find_position_with_corners(photo.shape[1], photo.shape[0], placed, corners, margin=4)
+        ph, pw = photo.shape[:2]
+        
+        # Use photo size for collision detection
+        pos = find_position(pw, ph, placed, margin=6)
         if pos is None:
             continue
         
@@ -786,8 +718,7 @@ def render_scene(config, sources):
         else:
             bg = composite_overlay(bg, photo, (px, py))
         
-        # Store with corners for accurate collision detection
-        placed.append({'x': px, 'y': py, 'w': photo.shape[1], 'h': photo.shape[0]})
+        placed.append((px, py, pw, ph))
         
         # Keypoints at actual warped corners (corners are in local coords)
         # corners order: [TL, TR, BR, BL]
