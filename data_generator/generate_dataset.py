@@ -591,34 +591,66 @@ def convert_bgra_to_rgba(img):
     return img
 
 
-def find_position_with_corners(photo_w, photo_h, placed_list, local_corners, margin=8, canvas_w=4000, canvas_h=3000):
+def find_position_with_corners(photo_w, photo_h, placed_list, local_corners, photo_gap=20, edge_margin=20, canvas_w=4000, canvas_h=3000):
     """Find non-overlapping position using actual warped corner coordinates.
     
     Args:
         photo_w, photo_h: Photo dimensions (fallback bounds)
         placed_list: List of placed photos as dicts with 'corners' key
         local_corners: 4 corner points in photo-local coordinates (numpy array or list)
-        margin: Minimum gap between photos in pixels
+        photo_gap: Minimum gap between photos (default 20px)
+        edge_margin: Minimum distance from canvas edge (default 20px)
         canvas_w, canvas_h: Canvas dimensions
     
     Returns:
         (x, y) tuple if position found, None otherwise
     """
     candidates = []
-    max_attempts = 2000
+    max_attempts = 5000
     
-    # Precompute corner bounds for quick reject
+    # Use actual photo canvas dimensions for positioning bounds
+    # The warped corners are within the photo canvas
     corners = np.array(local_corners)
-    cx, cy = corners[:, 0], corners[:, 1]
-    corner_min_x, corner_max_x = cx.min(), cx.max()
-    corner_min_y, corner_max_y = cy.min(), cy.max()
-    corner_w = corner_max_x - corner_min_x
-    corner_h = corner_max_y - corner_min_y
+    corners_min_x, corners_max_x = corners[:, 0].min(), corners[:, 0].max()
+    corners_min_y, corners_max_y = corners[:, 1].min(), corners[:, 1].max()
+    
+    # Use the actual photo dimensions for positioning
+    bounds_w = corners_max_x - corners_min_x
+    bounds_h = corners_max_y - corners_min_y
     
     for attempt in range(max_attempts):
-        # Random position within canvas bounds
-        x = random.randint(margin, canvas_w - int(corner_w) - margin)
-        y = random.randint(margin, canvas_h - int(corner_h) - margin)
+        # Calculate valid position range within canvas
+        x_min = edge_margin
+        x_max = canvas_w - int(bounds_w) - edge_margin
+        y_min = edge_margin
+        y_max = canvas_h - int(bounds_h) - edge_margin
+        
+        # Check if photo can fit
+        if x_max <= x_min or y_max <= y_min:
+            return None
+        
+        # Try different positions based on attempt number
+        if attempt < 500:
+            # Systematic grid-like search in quadrants
+            quadrant = attempt // 125
+            offset = attempt % 125
+            
+            if quadrant == 0:  # Top-left
+                x = x_min + (offset % 16) * ((x_max - x_min) // 16)
+                y = y_min + (offset // 16) * ((y_max - y_min) // 16)
+            elif quadrant == 1:  # Top-right
+                x = x_min + ((x_max - x_min) // 2) + (offset % 16) * ((x_max - x_min) // 32)
+                y = y_min + (offset // 16) * ((y_max - y_min) // 16)
+            elif quadrant == 2:  # Bottom-left
+                x = x_min + (offset % 16) * ((x_max - x_min) // 16)
+                y = y_min + ((y_max - y_min) // 2) + (offset // 16) * ((y_max - y_min) // 32)
+            else:  # Bottom-right and spread
+                x = x_min + (offset % 20) * ((x_max - x_min) // 20)
+                y = y_min + (offset // 20) * ((y_max - y_min) // 25)
+        else:
+            # Random search
+            x = random.randint(x_min, x_max)
+            y = random.randint(y_min, y_max)
         
         # Compute absolute corners for this position
         abs_corners = corners + np.array([x, y])
@@ -626,14 +658,14 @@ def find_position_with_corners(photo_w, photo_h, placed_list, local_corners, mar
         # Check for overlap with all placed photos
         overlaps = False
         for placed in placed_list:
-            placed_corners = placed['corners']  # Already in absolute coords
-            if polygons_overlap(abs_corners, placed_corners, margin):
+            placed_corners = placed['corners']
+            if polygons_overlap(abs_corners, placed_corners, photo_gap):
                 overlaps = True
                 break
         
         if not overlaps:
             # Prefer positions closer to edges for denser packing
-            edge_dist = min(x, y, canvas_w - x - corner_w, canvas_h - y - corner_h)
+            edge_dist = min(x, y, canvas_w - x - bounds_w, canvas_h - y - bounds_h)
             candidates.append((x, y, edge_dist))
     
     if candidates:
@@ -787,36 +819,42 @@ def render_scene(config, sources, requested_photos=None):
     
     # Calculate photo sizes based on number of photos
     # Goal: fill canvas well with appropriate photo sizes
-    edge_margin = 15
-    photo_gap = 8
+    edge_margin = 20
+    photo_gap = 20
+    
+    # Available space after margins and gaps
+    avail_w = canvas_w - 2 * edge_margin
+    avail_h = canvas_h - 2 * edge_margin
     
     if num_photos == 1:
         # Single photo: fill most of the canvas
-        # Target: fill ~70% of the smaller dimension
-        target_size = min(canvas_w, canvas_h) * 0.7
-        min_size = int(target_size * 0.8)
+        # Target: fill ~85% of the available space (allow for some margin)
+        target_size = min(avail_w, avail_h) * 0.85
+        min_size = int(target_size * 0.9)
         max_size = int(target_size * 1.1)
     elif num_photos <= 3:
         # 2-3 photos: fill width with 1-2 rows
         cols = num_photos
         rows = 1
-        avail_w = canvas_w - 2 * edge_margin - (cols - 1) * photo_gap
-        target_size = avail_w // cols
-        min_size = int(target_size * 0.8)
-        max_size = int(target_size * 1.1)
+        total_gaps_w = (cols - 1) * photo_gap
+        target_size = (avail_w - total_gaps_w) // cols
+        min_size = int(target_size * 0.75)
+        max_size = int(target_size * 1.15)
     else:
         # 4+ photos: use grid layout
         cols = int(math.ceil(math.sqrt(num_photos)))
         rows = int(math.ceil(num_photos / cols))
-        avail_w = canvas_w - 2 * edge_margin - (cols - 1) * photo_gap
-        avail_h = canvas_h - 2 * edge_margin - (rows - 1) * photo_gap
-        target_size = min(avail_w // cols, avail_h // rows)
-        min_size = int(target_size * 0.8)
-        max_size = int(target_size * 1.1)
+        total_gaps_w = (cols - 1) * photo_gap
+        total_gaps_h = (rows - 1) * photo_gap
+        avail_for_photos_w = avail_w - total_gaps_w
+        avail_for_photos_h = avail_h - total_gaps_h
+        target_size = min(avail_for_photos_w // cols, avail_for_photos_h // rows)
+        min_size = int(target_size * 0.7)
+        max_size = int(target_size * 1.2)
     
     # Clamp to reasonable range
-    min_size = max(200, min(min_size, 2000))
-    max_size = max(min_size + 50, min(max_size, 2500))
+    min_size = max(200, min(min_size, 2800))
+    max_size = max(min_size + 50, min(max_size, 3000))
     
     # Process photos - convert from BGR to RGB for consistent color space
     photos = []
@@ -841,9 +879,10 @@ def render_scene(config, sources, requested_photos=None):
         
         for photo, corners, shadow_mask in photos:
             # Use tight bounding box from warped corners for collision detection
+            # 20px gap between photos, 20px from canvas edge
             pos = find_position_with_corners(
                 photo.shape[1], photo.shape[0], placed, corners, 
-                margin=8, canvas_w=canvas_w, canvas_h=canvas_h
+                photo_gap=20, edge_margin=20, canvas_w=canvas_w, canvas_h=canvas_h
             )
             if pos is None:
                 continue
