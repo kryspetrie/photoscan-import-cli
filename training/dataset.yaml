@@ -1,5 +1,5 @@
 # YOLO Pose Dataset
-path: /Users/krys.petrie/dev/photo-pose-detector/data_generator/../data
+path: /tmp/examples
 train: images/train
 val: images/val
 

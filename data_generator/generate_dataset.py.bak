@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Photo Pose Detector - Synthetic Training Data Generator (v12)
+Photo Pose Detector - Synthetic Training Data Generator (v14)
 
 Uses OpenCV for proper image transformations with alpha channel support.
 Keypoints are placed at actual warped corners, not bounding box.
+Implements binary search for optimal fill percentage.
 """
 
 import random
@@ -38,13 +39,15 @@ class Config:
 def cv2_perspective_warp(img_rgba, strength=0.1):
     """Apply perspective warp with alpha based on warped quadrilateral.
     
-    Both RGB and alpha are warped through the perspective transform.
-    Output canvas is sized to contain all warped corners.
-    Returns: (warped_image, corners) where corners are the 4 corner positions
+    Returns:
+        warped_rgba: The warped image
+        corners: Corner coordinates relative to warped image
+        M: The perspective transform matrix (for reverse mapping)
+        src: Source points
+        dst: Destination points (before offset)
     """
     h, w = img_rgba.shape[:2]
     
-    # Source corners (image rectangle)
     src = np.array([
         [0.0, 0.0],
         [w - 1.0, 0.0],
@@ -52,7 +55,6 @@ def cv2_perspective_warp(img_rgba, strength=0.1):
         [0.0, h - 1.0]
     ], dtype=np.float32)
     
-    # Random corner displacements
     tl = random.uniform(-w * strength, w * strength)
     tr = random.uniform(-w * strength, w * strength)
     bl = random.uniform(-w * strength, w * strength)
@@ -60,7 +62,6 @@ def cv2_perspective_warp(img_rgba, strength=0.1):
     ty_top = random.uniform(-h * strength * 0.5, h * strength * 0.5)
     ty_bottom = random.uniform(-h * strength * 0.5, h * strength * 0.5)
     
-    # Destination corners (warped quadrilateral)
     dst = np.array([
         [tl, ty_top],
         [w - 1.0 + tr, ty_top],
@@ -68,45 +69,26 @@ def cv2_perspective_warp(img_rgba, strength=0.1):
         [bl, h - 1.0 + ty_bottom]
     ], dtype=np.float32)
     
-    # Calculate bounding box of warped corners
     min_x = min(c[0] for c in dst)
     max_x = max(c[0] for c in dst)
     min_y = min(c[1] for c in dst)
     max_y = max(c[1] for c in dst)
     
-    # Add margin for anti-aliasing
     margin = 5
-    
-    # Output size must fit the warped corners
     out_w = int(max_x - min_x) + 1 + margin * 2
     out_h = int(max_y - min_y) + 1 + margin * 2
     
-    # Offset to shift corners to positive coordinates
     offset_x = -min_x + margin
     offset_y = -min_y + margin
     
-    # Adjusted destination corners (all positive)
     dst_offset = dst.copy()
     dst_offset[:, 0] += offset_x
     dst_offset[:, 1] += offset_y
     
-    # Get perspective transform
     M = cv2.getPerspectiveTransform(src, dst_offset)
     
-    # Warp RGB channels
     warped_rgb = cv2.warpPerspective(
         img_rgba[:, :, :3],
-        M,
-        (out_w, out_h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0)
-    )
-    
-    # Warp alpha channel - fully opaque source alpha
-    alpha_channel = img_rgba[:, :, 3] if img_rgba.shape[2] == 4 else np.full((h, w), 255, dtype=np.uint8)
-    warped_alpha = cv2.warpPerspective(
-        alpha_channel,
         M,
         (out_w, out_h),
         flags=cv2.INTER_LINEAR,
@@ -114,573 +96,1665 @@ def cv2_perspective_warp(img_rgba, strength=0.1):
         borderValue=0
     )
     
-    # Combine RGB and alpha
-    warped = np.dstack([warped_rgb, warped_alpha])
+    warped_alpha = cv2.warpPerspective(
+        img_rgba[:, :, 3],
+        M,
+        (out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0
+    )
     
-    # Return corners in new local coordinates (all positive, within warped bounds)
+    warped_rgba = np.dstack([warped_rgb, warped_alpha])
+    
+    # Return corners relative to warped image, plus transform info
     corners = dst_offset.copy()
     
-    return warped, corners
+    return warped_rgba, corners, M, src, dst
+
+
+def find_actual_visual_bounds(img_rgba):
+    """Find the actual quadrilateral corners of visible pixels after perspective warp.
+    
+    Returns the 4 corner points of the visible photo region, ordered as:
+    0=top-left, 1=top-right, 2=bottom-right, 3=bottom-left
+    """
+    if img_rgba.shape[2] == 4:
+        alpha = img_rgba[:, :, 3]
+    else:
+        alpha = np.ones(img_rgba.shape[:2], dtype=np.uint8) * 255
+    
+    # Threshold alpha to find visible pixels
+    _, thresh = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
+    
+    # Find contours of the visible region
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        # No visible pixels
+        return np.array([[0, 0], [img_rgba.shape[2]-1, 0], 
+                        [img_rgba.shape[2]-1, img_rgba.shape[0]-1], [0, img_rgba.shape[0]-1]], dtype=np.float32)
+    
+    # Get the largest contour
+    largest_contour = max(contours, key=cv2.contourArea)
+    
+    # Approximate to a polygon with 4 points
+    epsilon = 0.02 * cv2.arcLength(largest_contour, True)
+    approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+    
+    if len(approx) >= 4:
+        points = approx.reshape(-1, 2).astype(np.float32)
+    else:
+        # Fallback to convex hull
+        hull = cv2.convexHull(largest_contour)
+        points = hull.reshape(-1, 2).astype(np.float32)
+        
+        # If we have more than 4 points, we need to find the 4 extreme corners
+        if len(points) > 4:
+            # Simple approach: find bounding box corners
+            min_x_idx = np.argmin(points[:, 0])
+            max_x_idx = np.argmax(points[:, 0])
+            min_y_idx = np.argmin(points[:, 1])
+            max_y_idx = np.argmax(points[:, 1])
+            
+            # Get these 4 points
+            candidates = [points[min_x_idx], points[max_x_idx], 
+                         points[min_y_idx], points[max_y_idx]]
+            # Remove duplicates
+            unique_points = []
+            for p in candidates:
+                is_dup = False
+                for up in unique_points:
+                    if np.allclose(p, up, atol=5):
+                        is_dup = True
+                        break
+                if not is_dup:
+                    unique_points.append(p)
+            points = np.array(unique_points, dtype=np.float32)
+    
+    if len(points) < 4:
+        # Fallback to bounding box
+        rows = np.any(thresh > 0, axis=1)
+        cols = np.any(thresh > 0, axis=0)
+        if not rows.any() or not cols.any():
+            return np.array([[0, 0], [img_rgba.shape[2]-1, 0], 
+                            [img_rgba.shape[2]-1, img_rgba.shape[0]-1], [0, img_rgba.shape[0]-1]], dtype=np.float32)
+        rmin, rmax = np.where(rows)[0][[0, -1]]
+        cmin, cmax = np.where(cols)[0][[0, -1]]
+        return np.array([[cmin, rmin], [cmax, rmin], [cmax, rmax], [cmin, rmax]], dtype=np.float32)
+    
+    # Now order the points: TL, TR, BR, BL
+    # Top-left has minimum x+y
+    # Bottom-right has maximum x+y
+    # Top-right has minimum x-y (most negative)
+    # Bottom-left has maximum x-y (most positive)
+    
+    sums = points[:, 0] + points[:, 1]
+    diffs = points[:, 0] - points[:, 1]
+    
+    tl_idx = np.argmin(sums)
+    br_idx = np.argmax(sums)
+    tr_idx = np.argmin(diffs)
+    bl_idx = np.argmax(diffs)
+    
+    # Handle case where some indices are the same
+    indices = [tl_idx, tr_idx, br_idx, bl_idx]
+    unique_indices = []
+    for idx in indices:
+        if idx not in unique_indices:
+            unique_indices.append(idx)
+        else:
+            # Find another point
+            for i, p in enumerate(points):
+                if i not in unique_indices:
+                    unique_indices.append(i)
+                    break
+    
+    while len(unique_indices) < 4:
+        for i in range(len(points)):
+            if i not in unique_indices:
+                unique_indices.append(i)
+                break
+    
+    corners = np.array([
+        points[unique_indices[0]],  # TL
+        points[unique_indices[1]],  # TR
+        points[unique_indices[2]],  # BR
+        points[unique_indices[3]],  # BL
+    ], dtype=np.float32)
+    
+    return corners
 
 
 def add_drop_shadow(img_rgba, corners, offset=2, spread=25, opacity=0.5):
-    """Add a realistic drop shadow for photos lying flat.
-    
-    Creates a soft, spread shadow around the photo - the shadow will be
-    composited onto the background when placed on the scene.
-    
-    Args:
-        img_rgba: Warped photo with alpha channel
-        corners: 4 corner positions of the warped photo
-        offset: How far shadow starts from photo edge (default 2px)
-        spread: How wide the shadow spreads (default 25px)
-        opacity: Shadow intensity (default 0.5)
-    
-    Returns:
-        (photo_with_shadow_canvas, new_corners, shadow_mask)
-        The shadow_mask should be composited onto background, then photo on top.
-    """
+    """Add a realistic drop shadow."""
     h, w = img_rgba.shape[:2]
     
-    # Calculate bounds with spread
     min_x = min(c[0] for c in corners) - offset - spread
     max_x = max(c[0] for c in corners) + offset + spread
     min_y = min(c[1] for c in corners) - offset - spread
     max_y = max(c[1] for c in corners) + offset + spread
     
-    # Output canvas size
-    out_w = int(max_x - min_x) + 1
-    out_h = int(max_y - min_y) + 1
+    out_w = max(1, int(max_x - min_x) + 1)
+    out_h = max(1, int(max_y - min_y) + 1)
     offset_x = -min_x
     offset_y = -min_y
     
-    # Photo corners in output coordinates
     photo_corners = corners.copy().astype(np.float32)
     photo_corners[:, 0] += offset_x
     photo_corners[:, 1] += offset_y
     
-    # Create shadow mask
     shadow_mask = np.zeros((out_h, out_w), dtype=np.float32)
     cv2.fillPoly(shadow_mask, [photo_corners.astype(np.int32)], 255)
     
-    # Dilate for offset + spread
     kernel_size = max(3, (offset + spread) // 2)
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
     expanded = cv2.dilate(shadow_mask.astype(np.uint8), kernel, iterations=1)
-    
-    # Subtract photo to get shadow ring
     shadow_mask = cv2.subtract(expanded, shadow_mask.astype(np.uint8)).astype(np.float32)
     
-    # Blur for soft edges
     blur_size = max(7, (spread // 2) | 1)
     shadow_mask = cv2.GaussianBlur(shadow_mask, (blur_size, blur_size), 0)
-    
-    # Normalize to opacity
     shadow_mask = shadow_mask / 255.0 * opacity
     
-    # Create output canvas with photo placed correctly
     output = np.zeros((out_h, out_w, 4), dtype=np.uint8)
     
-    # Place photo onto output
     px1, py1 = int(offset_x), int(offset_y)
     px2, py2 = int(offset_x + w), int(offset_y + h)
     
-    # Clamp
     ox1, oy1 = max(0, px1), max(0, py1)
     ox2, oy2 = min(out_w, px2), min(out_h, py2)
-    sx1, sy1 = ox1 - px1, oy1 - py1
-    sx2, sy2 = sx1 + (ox2 - ox1), sy1 + (oy2 - oy1)
     
-    # Copy photo to output (no RGB modification)
-    output[oy1:oy2, ox1:ox2] = img_rgba[sy1:sy2, sx1:sx2]
+    dst_h = oy2 - oy1
+    dst_w = ox2 - ox1
+    
+    sx1 = ox1 - px1
+    sy1 = oy1 - py1
+    sx2 = sx1 + dst_w
+    sy2 = sy1 + dst_h
+    
+    if dst_h > 0 and dst_w > 0 and sy1 >= 0 and sx1 >= 0:
+        src = img_rgba[sy1:sy2, sx1:sx2]
+        if src.shape[0] == dst_h and src.shape[1] == dst_w:
+            output[oy1:oy2, ox1:ox2] = src
+        else:
+            output[oy1:oy2, ox1:ox2] = cv2.resize(src, (dst_w, dst_h), interpolation=cv2.INTER_LINEAR)
     
     return output, photo_corners, shadow_mask
 
 
 def add_variable_blur(img_rgba, min_blur=0, max_blur=8, edge_focus=0.5):
-    """Add variable blur simulating wavy/lens out-of-focus effect.
+    """Add variable blur simulating wavy/lens out-of-focus effect."""
+    if min_blur >= max_blur:
+        return img_rgba
     
-    Creates a non-uniform blur where some areas are more blurred than others,
-    with optional focus on edges for realistic curled/warped photo effect.
-    Both RGB and alpha channels are blurred for proper edge blending.
-    
-    Args:
-        img_rgba: Image in BGRA format (with alpha channel)
-        min_blur: Minimum blur kernel size (0 = no blur)
-        max_blur: Maximum blur kernel size
-        edge_focus: How much to focus blur on edges (0 = uniform pattern, 1 = edge-heavy)
-    
-    Returns:
-        Image with variable blur applied (BGRA)
-    """
     h, w = img_rgba.shape[:2]
-    y, x = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+    pil_img = Image.fromarray(cv2.cvtColor(img_rgba, cv2.COLOR_BGRA2RGBA))
     
-    # Create base sine wave pattern for organic variation
-    freq1 = random.uniform(0.005, 0.015)
-    freq2 = random.uniform(0.008, 0.025)
-    phase_x = random.uniform(0, 2 * np.pi)
-    phase_y = random.uniform(0, 2 * np.pi)
-    wave = np.sin(x * freq1 + phase_x) * np.sin(y * freq2 + phase_y)
+    y_coords, x_coords = np.meshgrid(np.linspace(0, 1, h), np.linspace(0, 1, w), indexing='ij')
+    positions = np.sqrt((x_coords - 0.5)**2 + (y_coords - 0.5)**2)
     
-    # Normalize wave to 0-1
-    wave_norm = (wave - wave.min()) / (wave.max() - wave.min())
+    noise = np.random.randn(h, w) * 0.2
+    positions = np.clip(positions + noise * edge_focus, 0, 1)
     
-    # Create edge distance map (normalized 0-1)
-    edge_x = np.minimum(x / w, (w - x) / w)
-    edge_y = np.minimum(y / h, (h - y) / h)
-    edge_dist = np.minimum(edge_x, edge_y) * 2
+    result = pil_img.copy()
     
-    # Combine wave pattern with edge focus
-    pattern = wave_norm * (1 - edge_focus) + edge_dist * edge_focus
+    num_regions = 5
+    for i in range(num_regions):
+        mask = (positions >= i/num_regions) & (positions < (i+1)/num_regions)
+        if not mask.any():
+            continue
+        
+        blur_amt = min_blur + (max_blur - min_blur) * (i / num_regions)
+        if blur_amt > 0.5:
+            region = pil_img.copy()
+            region_pixels = np.array(region)
+            row_mask = np.any(mask, axis=1)
+            col_mask = np.any(mask, axis=0)
+            
+            if row_mask.any() and col_mask.any():
+                r_start = np.argmax(row_mask)
+                r_end = len(row_mask) - np.argmax(row_mask[::-1])
+                c_start = np.argmax(col_mask)
+                c_end = len(col_mask) - np.argmax(col_mask[::-1])
+                
+                region_crop = region_pixels[r_start:r_end, c_start:c_end]
+                if region_crop.size > 0:
+                    blur_size = int(blur_amt * 2) | 1
+                    blurred = cv2.GaussianBlur(region_crop, (blur_size, blur_size), 0)
+                    result_pixels = np.array(result)
+                    result_pixels[r_start:r_end, c_start:c_end] = blurred
+                    result = Image.fromarray(result_pixels)
     
-    # Add some random variation
-    if random.random() < 0.5:
-        pattern = pattern * random.uniform(0.8, 1.2)
-    
-    pattern = np.clip(pattern, 0, 1)
-    
-    # Scale to blur range
-    blur_map = pattern * (max_blur - min_blur) + min_blur
-    blur_map = np.maximum(blur_map, 1)
-    
-    # Create blurred versions of RGB at different levels
-    rgb = img_rgba[:, :, :3]
-    alpha = img_rgba[:, :, 3]
-    
-    levels = [min_blur, (min_blur + max_blur) / 2, max_blur]
-    blurred_rgb = []
-    blurred_alpha = []
-    
-    for level in levels:
-        kernel = max(3, int(level * 2) | 1)
-        if kernel > 1:
-            blurred_rgb.append(cv2.GaussianBlur(rgb, (kernel, kernel), 0))
-            blurred_alpha.append(cv2.GaussianBlur(alpha, (kernel, kernel), 0))
-        else:
-            blurred_rgb.append(rgb.copy())
-            blurred_alpha.append(alpha.copy())
-    
-    # Interpolate based on blur map
-    result_rgb = np.zeros_like(rgb, dtype=np.float32)
-    result_alpha = np.zeros_like(alpha, dtype=np.float32)
-    
-    pattern_norm = (blur_map - min_blur) / (max_blur - min_blur) if max_blur > min_blur else np.zeros_like(blur_map)
-    pattern_norm = np.clip(pattern_norm, 0, 1)
-    
-    # Level transitions
-    mask1 = np.clip(pattern_norm * 2, 0, 1)
-    mask2 = np.clip(pattern_norm * 2 - 1, 0, 1)
-    
-    for c in range(3):
-        result_rgb[:, :, c] = (
-            blurred_rgb[0][:, :, c].astype(np.float32) * (1 - mask1) +
-            blurred_rgb[1][:, :, c].astype(np.float32) * (mask1 * (1 - mask2)) +
-            blurred_rgb[2][:, :, c].astype(np.float32) * mask2
-        )
-    
-    result_alpha = (
-        blurred_alpha[0].astype(np.float32) * (1 - mask1) +
-        blurred_alpha[1].astype(np.float32) * (mask1 * (1 - mask2)) +
-        blurred_alpha[2].astype(np.float32) * mask2
-    )
-    
-    # Combine RGB and alpha
-    result = np.dstack([result_rgb.astype(np.uint8), result_alpha.astype(np.uint8)])
-    
-    return result
+    return cv2.cvtColor(np.array(result), cv2.COLOR_RGBA2BGRA)
 
 
-def add_glare(img_rgb, radius_ratio=0.4, intensity=0.65, cx=None, cy=None):
-    """Add simulated glare using screen blend mode with radial gradient.
+def add_glare(img_rgba, strength=0.3, size_variation=0.3):
+    """Add specular glare to photo surface."""
+    h, w = img_rgba.shape[:2]
     
-    Args:
-        img_rgb: Image in BGR format (no alpha)
-        radius_ratio: Size of glare spot relative to image (0.1-1.5)
-        intensity: Brightness of glare center (0.1-1.0)
-        cx, cy: Position override (None for random)
+    glare = np.zeros((h, w), dtype=np.float32)
     
-    Returns:
-        Image with glare applied
-    """
-    h, w = img_rgb.shape[:2]
+    num_flares = random.randint(1, 3)
     
-    # Random position - can be anywhere including well outside image
-    if cx is None:
-        cx = random.randint(int(w * -0.8), int(w * 1.8))
-    if cy is None:
-        cy = random.randint(int(h * -0.8), int(h * 1.8))
+    for _ in range(num_flares):
+        cx = random.uniform(w * 0.2, w * 0.8)
+        cy = random.uniform(h * 0.2, h * 0.8)
+        rx = random.uniform(w * 0.05, w * 0.15) * (1 + size_variation * random.uniform(-1, 1))
+        ry = random.uniform(h * 0.05, h * 0.15) * (1 + size_variation * random.uniform(-1, 1))
+        angle = random.uniform(0, math.pi)
+        
+        y, x = np.ogrid[:h, :w]
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        
+        xc = x - cx
+        yc = y - cy
+        
+        xr = xc * cos_a - yc * sin_a
+        yr = xc * sin_a + yc * cos_a
+        
+        ellipse_val = (xr / rx)**2 + (yr / ry)**2
+        flare = np.maximum(0, 1 - ellipse_val)
+        flare = cv2.GaussianBlur(flare.astype(np.float32), (31, 31), 0)
+        
+        glare = np.maximum(glare, flare * strength)
     
-    radius = int(min(w, h) * radius_ratio)
+    glare_rgb = np.stack([glare * 255] * 3, axis=-1).astype(np.uint8)
+    alpha = img_rgba[:, :, 3:4] / 255.0
+    img_rgb = img_rgba[:, :, :3].astype(np.float32)
+    img_rgb = np.minimum(255, img_rgb + glare_rgb.astype(np.float32) * alpha)
     
-    # Create radial gradient
-    y, x = np.ogrid[:h, :w]
-    dist = np.sqrt((x - cx)**2 + (y - cy)**2)
-    gradient = np.clip(1 - dist / radius, 0, 1)
-    
-    # Apply falloff shaping (sharper falloff for more realistic glare)
-    gradient = gradient ** 1.5
-    
-    # Screen blend mode: result = 1 - (1-a)*(1-b)
-    gradient_float = (gradient * intensity).astype(np.float32)
-    img_float = img_rgb.astype(np.float32) / 255.0
-    
-    result = 1.0 - (1.0 - img_float) * (1.0 - gradient_float[..., np.newaxis])
-    result = (result * 255).astype(np.uint8)
-    
-    return result
-
-
-def composite_with_shadow(bg, photo, shadow_mask, pos):
-    """Composite photo onto background, applying shadow first.
-    
-    The shadow is applied to the background before the photo is placed.
-    """
-    bx, by = pos
-    bh, bw = bg.shape[:2]
-    ph, pw = photo.shape[:2]
-    sh, sw = shadow_mask.shape[:2]
-    
-    # Calculate output bounds
-    x1 = max(0, bx)
-    y1 = max(0, by)
-    x2 = min(bw, bx + sw)
-    y2 = min(bh, by + sh)
-    
-    if x1 >= x2 or y1 >= y2:
-        return bg
-    
-    # Calculate offsets
-    ox1 = x1 - bx
-    oy1 = y1 - by
-    ox2 = ox1 + (x2 - x1)
-    oy2 = oy1 + (y2 - y1)
-    
-    # Apply shadow to background (darken where shadow exists)
-    shadow_region = shadow_mask[oy1:oy2, ox1:ox2]
-    bg_region = bg[y1:y2, x1:x2].astype(np.float32)
-    
-    # Darken background by shadow amount
-    darkening = np.stack([shadow_region] * 3, axis=-1) * 0.4
-    bg[y1:y2, x1:x2] = np.clip(bg_region - darkening * 255 * 0.5, 0, 255).astype(np.uint8)
-    
-    # Now composite photo on top
-    return composite_overlay(bg, photo, (bx, by))
+    return np.dstack([img_rgb.astype(np.uint8), img_rgba[:, :, 3]])
 
 
 class BackgroundGenerator:
-    """Generates simple backgrounds."""
-    
     def __init__(self):
         self.types = ['wood', 'marble', 'solid', 'fabric', 'laminate']
     
-    def generate(self, width, height):
-        bg_type = random.choice(self.types)
+    def generate(self, w, h):
+        weights = [0.30, 0.15, 0.20, 0.20, 0.15]
+        bg_type = random.choices(self.types, weights=weights)[0]
         
         if bg_type == 'wood':
-            return self._generate_wood(width, height)
+            return self._generate_wood(w, h)
         elif bg_type == 'marble':
-            return self._generate_marble(width, height)
+            return self._generate_marble(w, h)
         elif bg_type == 'solid':
-            return self._generate_solid(width, height)
+            return self._generate_solid(w, h)
         elif bg_type == 'fabric':
-            return self._generate_fabric(width, height)
+            return self._generate_fabric(w, h)
         else:
-            return self._generate_laminate(width, height)
+            return self._generate_laminate(w, h)
     
     def _generate_wood(self, w, h):
-        base_r = random.randint(130, 170)
-        base_g = random.randint(95, 125)
-        base_b = random.randint(65, 90)
+        img = np.zeros((h, w, 3), dtype=np.uint8)
         
-        arr = np.full((h, w, 3), [base_r, base_g, base_b], dtype=np.float32)
+        base_colors = [
+            (139, 90, 43),
+            (160, 110, 65),
+            (120, 75, 35),
+            (180, 130, 80),
+        ]
+        base = random.choice(base_colors)
+        img[:, :] = base
         
-        for y in range(0, h, random.randint(10, 25)):
-            offset = random.randint(-10, 10)
-            arr[y, :] = np.clip(arr[y, :] + offset, 0, 255)
+        num_grains = random.randint(15, 25)
+        for _ in range(num_grains):
+            y = random.randint(0, h - 1)
+            thickness = random.randint(2, 8)
+            intensity = random.randint(-30, 30)
+            color_shift = random.randint(-15, 15)
+            
+            offset = random.uniform(-0.02, 0.02)
+            for i in range(max(0, y - thickness), min(h, y + thickness)):
+                wavy_x = int(math.sin(i * offset) * 20)
+                for j in range(max(0, wavy_x), min(w, wavy_x + w)):
+                    blend = 1 - abs(i - y) / thickness
+                    img[i, j] = np.clip(img[i, j] + (intensity + color_shift) * blend, 0, 255)
         
-        img = Image.fromarray(arr.astype(np.uint8))
-        return np.array(img.filter(ImageFilter.GaussianBlur(radius=2)))
+        noise = np.random.normal(0, 8, (h, w, 3))
+        img = np.clip(img + noise, 0, 255).astype(np.uint8)
+        
+        return cv2.GaussianBlur(img, (3, 3), 0)
     
     def _generate_marble(self, w, h):
-        base = random.randint(200, 230)
-        arr = np.full((h, w, 3), base, dtype=np.float32)
+        img = np.zeros((h, w, 3), dtype=np.uint8)
         
-        for _ in range(random.randint(2, 4)):
-            x0, y0 = random.randint(0, w), random.randint(0, h)
-            length = random.randint(h // 4, h)
-            angle = random.uniform(0, 2 * math.pi)
-            
-            for i in range(0, length, 3):
-                x, y = int(x0 + math.cos(angle) * i), int(y0 + math.sin(angle) * i)
-                if 0 <= x < w and 0 <= y < h:
-                    for dx in range(-1, 2):
-                        for dy in range(-1, 2):
-                            nx, ny = x + dx, y + dy
-                            if 0 <= nx < w and 0 <= ny < h:
-                                arr[ny, nx] = base - 30
+        base_colors = [
+            [(240, 240, 245), (200, 200, 210)],
+            [(245, 240, 235), (210, 180, 160)],
+            [(230, 235, 240), (180, 190, 200)],
+        ]
+        base, vein = random.choice(base_colors)
         
-        img = Image.fromarray(arr.astype(np.uint8))
-        return np.array(img.filter(ImageFilter.GaussianBlur(radius=3)))
+        t = np.linspace(0, 4 * math.pi, w)
+        offset = np.random.uniform(0, 2 * math.pi)
+        
+        for i in range(h):
+            for j in range(w):
+                wave = math.sin(t[j] + i * 0.02 + offset)
+                vein_intensity = (wave + 1) / 2
+                
+                noise = math.sin(i * 0.1 + j * 0.15) * 0.3 + math.sin(i * 0.05 - j * 0.08) * 0.3
+                vein_intensity = np.clip(vein_intensity + noise, 0, 1)
+                
+                color = tuple(int(b * (1 - vein_intensity) + v * vein_intensity) for b, v in zip(base, vein))
+                img[i, j] = color
+        
+        noise = np.random.normal(0, 5, (h, w, 3))
+        img = np.clip(img + noise, 0, 255).astype(np.uint8)
+        
+        return cv2.GaussianBlur(img, (5, 5), 0)
     
     def _generate_solid(self, w, h):
-        c = random.randint(160, 220)
-        return np.full((h, w, 3), [c, c, c], dtype=np.uint8)
+        base_colors = [
+            (180, 175, 170),
+            (160, 165, 160),
+            (190, 185, 180),
+            (170, 168, 165),
+        ]
+        color = random.choice(base_colors)
+        
+        img = np.ones((h, w, 3), dtype=np.uint8) * np.array(color)
+        
+        noise = np.random.normal(0, 5, (h, w, 3))
+        img = np.clip(img + noise, 0, 255).astype(np.uint8)
+        
+        return img
     
     def _generate_fabric(self, w, h):
-        base = random.randint(150, 190)
-        arr = np.full((h, w, 3), base, dtype=np.float32)
-        arr += np.random.randint(-10, 10, (h, w, 3))
-        arr = np.clip(arr, 0, 255)
-        img = Image.fromarray(arr.astype(np.uint8))
-        return np.array(img.filter(ImageFilter.GaussianBlur(radius=1)))
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        base_colors = [
+            (120, 110, 100),
+            (100, 95, 90),
+            (140, 130, 120),
+            (110, 105, 100),
+        ]
+        color = random.choice(base_colors)
+        img[:, :] = color
+        
+        weave_scale = random.choice([3, 4, 5])
+        for i in range(0, h, weave_scale):
+            for j in range(0, w, weave_scale):
+                shade = random.randint(-5, 5)
+                img[i:min(i+weave_scale, h), j:min(j+weave_scale, w)] = np.clip(
+                    np.array(color) + shade, 0, 255)
+        
+        noise = np.random.normal(0, 6, (h, w, 3))
+        img = np.clip(img + noise, 0, 255).astype(np.uint8)
+        
+        return cv2.GaussianBlur(img, (3, 3), 0)
     
     def _generate_laminate(self, w, h):
-        base_r = random.randint(160, 180)
-        base_g = random.randint(130, 150)
-        base_b = random.randint(90, 110)
+        img = np.zeros((h, w, 3), dtype=np.uint8)
         
-        arr = np.full((h, w, 3), [base_r, base_g, base_b], dtype=np.float32)
-        ph = random.randint(70, 100)
-        for y in range(0, h, ph):
-            arr[y, :] = np.clip(arr[y, :] - 15, 0, 255)
+        base_colors = [
+            (180, 160, 140),
+            (160, 145, 125),
+            (190, 175, 155),
+            (170, 155, 135),
+        ]
+        plank_colors = random.choice([
+            [(180, 165, 145), (175, 158, 138)],
+            [(165, 150, 130), (170, 155, 135)],
+            [(185, 170, 150), (180, 162, 142)],
+        ])
         
-        img = Image.fromarray(arr.astype(np.uint8))
-        return np.array(img.filter(ImageFilter.GaussianBlur(radius=1)))
+        plank_h = random.randint(15, 25)
+        plank_idx = 0
+        
+        for i in range(0, h, plank_h):
+            color = plank_colors[plank_idx % len(plank_colors)]
+            plank_idx += 1
+            
+            plank_width = random.randint(80, 150)
+            
+            for j in range(0, w, plank_width):
+                shade = random.randint(-8, 8)
+                this_color = tuple(max(0, min(255, c + shade)) for c in color)
+                
+                end_i = min(i + plank_h, h)
+                end_j = min(j + plank_width, w)
+                img[i:end_i, j:end_j] = this_color
+            
+            gap_shade = random.randint(-15, -5)
+            gap_end = min(i + 2, h)
+            img[i:gap_end, :] = tuple(max(0, min(255, c + gap_shade)) for c in color)
+        
+        noise = np.random.normal(0, 4, (h, w, 3))
+        img = np.clip(img + noise, 0, 255).astype(np.uint8)
+        
+        return cv2.GaussianBlur(img, (3, 3), 0)
 
 
 def apply_luma_gradient(bg_arr):
-    """Apply luma gradient to background."""
-    if random.random() > 0.7:
-        return bg_arr
-    
+    """Apply radial luma gradient to simulate lighting."""
     h, w = bg_arr.shape[:2]
-    grad_type = random.choice(['linear_h', 'linear_v', 'corner', 'radial'])
     
-    overlay = np.zeros((h, w), dtype=np.float32)
+    y_center = h * random.uniform(0.3, 0.7)
+    x_center = w * random.uniform(0.3, 0.7)
     
-    if grad_type == 'linear_h':
-        for x in range(w):
-            overlay[:, x] = (x / w) * random.randint(20, 35)
-    elif grad_type == 'linear_v':
-        for y in range(h):
-            overlay[y, :] = (y / h) * random.randint(20, 35)
-    elif grad_type == 'corner':
-        max_d = math.sqrt(w**2 + h**2)
-        for y in range(h):
-            for x in range(w):
-                d = math.sqrt(x**2 + y**2)
-                overlay[y, x] = (d / max_d) * random.randint(30, 45)
-    else:
-        cx, cy = w // 2, h // 2
-        max_d = math.sqrt(cx**2 + cy**2)
-        for y in range(h):
-            for x in range(w):
-                d = math.sqrt((x - cx)**2 + (y - cy)**2)
-                overlay[y, x] = (d / max_d) * random.randint(25, 40)
+    max_dist = math.sqrt((w/2)**2 + (h/2)**2)
     
-    result = bg_arr.astype(np.float32)
-    result[:, :, 0] = np.clip(result[:, :, 0] - overlay, 0, 255)
-    result[:, :, 1] = np.clip(result[:, :, 1] - overlay, 0, 255)
-    result[:, :, 2] = np.clip(result[:, :, 2] - overlay, 0, 255)
+    y_coords, x_coords = np.ogrid[:h, :w]
+    distances = np.sqrt((x_coords - x_center)**2 + (y_coords - y_center)**2)
     
-    return result.astype(np.uint8)
+    gradient = 1 - (distances / max_dist) * random.uniform(0.15, 0.25)
+    
+    bg_float = bg_arr.astype(np.float32)
+    bg_float = bg_float * gradient[:, :, np.newaxis]
+    
+    return np.clip(bg_float, 0, 255).astype(np.uint8)
 
 
 def process_photo(img_path, min_size, max_size):
-    """Process source image into photo instance with perspective transform.
+    """Load and process a photo (no perspective warp yet).
     
-    Returns: (warped_photo, corners, shadow_mask) 
-        corners are the 4 corner positions
-        shadow_mask is the drop shadow (or None)
+    Perspective warp will be applied during compositing.
+    
+    Returns:
+        photo: BGRA image (rectangular, no warp)
+        corners: Corners of the rectangular photo (for packing)
+        shadow_mask: Shadow mask (or None)
+        original_img: Original BGR/BGRA image (for compositing)
+        img_size: (width, height) of the resized image
     """
     try:
-        # Use cv2 to load consistently in BGR format
-        img_bgr = cv2.imread(str(img_path))
-        if img_bgr is None:
-            return None, None, None
-        # Convert BGR to RGBA
-        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2BGRA)
-    except:
-        return None, None, None
-    
-    # Resize to target size
-    ih, iw = img.shape[:2]
-    if iw > ih:
-        target_w = random.randint(min_size, max_size)
-        target_h = int(ih * (target_w / iw))
-    else:
-        target_h = random.randint(min_size, max_size)
-        target_w = int(iw * (target_h / ih))
-    
-    img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
-    
-    # Extract RGB for processing
-    rgb = img[:, :, :3]
-    
-    # Apply color effects (increase AND decrease variations)
-    # Saturation adjustment
-    if random.random() < 0.5:
-        # Convert to HSV, adjust S channel, convert back
-        hsv = cv2.cvtColor(rgb, cv2.COLOR_BGR2HSV).astype(np.float32)
-        sat_factor = random.uniform(0.5, 1.8)  # 0.5 = half saturation, 1.8 = 80% more
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_factor, 0, 255)
-        rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-    
-    # Contrast adjustment
-    if random.random() < 0.5:
-        contrast_factor = random.uniform(0.7, 1.5)  # 0.7 = less contrast, 1.5 = more
-        rgb = cv2.convertScaleAbs(rgb, alpha=contrast_factor, beta=0)
-    
-    # Brightness adjustment
-    if random.random() < 0.5:
-        brightness_offset = random.uniform(-40, 40)  # Negative = darker, positive = brighter
-        rgb = cv2.convertScaleAbs(rgb, alpha=1.0, beta=brightness_offset)
-    
-    # Gamma curve adjustment
-    if random.random() < 0.4:
-        gamma = random.uniform(0.6, 1.6)  # < 1 = brighten shadows, > 1 = darken shadows
-        inv_gamma = 1.0 / gamma
-        table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype(np.uint8)
-        rgb = cv2.LUT(rgb, table)
-    
-    # Simulated glare (screen blend with radial gradient)
-    if random.random() < 0.3:  # 30% chance
-        radius_ratio = random.uniform(0.1, 1.5)  # Tiny to massive
-        intensity = random.uniform(0.1, 1.0)  # Very subtle to full white
-        rgb = add_glare(rgb, radius_ratio=radius_ratio, intensity=intensity)
-    
-    # Re-add alpha channel (fully opaque)
-    img = np.dstack([rgb, np.full((target_h, target_w), 255, dtype=np.uint8)])
-    
-    # Variable blur (wavy/fluid lens effect) - applied after effects
-    if random.random() < 0.3:  # 30% chance
-        min_blur = random.uniform(0, 2)  # No blur to slight blur
-        max_blur = random.uniform(3, 10)  # Up to quite blurred
-        edge_focus = random.uniform(0.3, 0.8)  # 30-80% edge focus
-        img = add_variable_blur(img, min_blur=min_blur, max_blur=max_blur, edge_focus=edge_focus)
-    
-    # Apply perspective warp - returns corners for keypoint tracking
-    warped, corners = cv2_perspective_warp(img, strength=random.uniform(0.08, 0.16))
-    
-    # Optionally add drop shadow
-    shadow_mask = None
-    if random.random() < 0.7:  # 70% chance of shadow
-        # Parameters for realistic flat photo shadows
-        offset = random.randint(0, 15)  # How far shadow starts from edge (0-15px)
-        spread = random.randint(20, 40)  # How wide the shadow spreads (20-40px)
-        opacity = random.uniform(0.15, 0.50)  # Shadow intensity
-        warped, corners, shadow_mask = add_drop_shadow(
-            warped, corners,
-            offset=offset,
-            spread=spread,
-            opacity=opacity
-        )
-    
-    return warped, corners, shadow_mask
-
-
-def find_position(w, h, placed, margin=8):
-    """Find non-overlapping position."""
-    candidates = []
-    
-    for _ in range(100):
-        x = random.randint(margin, 1920 - w - margin)
-        y = random.randint(margin, 1080 - h - margin)
+        img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None, None, None, None, None
         
-        if not _overlaps(x, y, w, h, placed, margin):
-            edge_score = min(x, y, 1920 - x - w, 1080 - y - h)
-            candidates.append((x, y, edge_score))
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+        elif img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+        
+        if img.shape[0] < 100 or img.shape[1] < 100:
+            return None, None, None, None, None
+        
+        # Keep original for later compositing
+        original_img = img.copy()
+        
+        target_size = random.uniform(min_size, max_size)
+        scale = target_size / max(img.shape[:2])
+        
+        new_w = int(img.shape[1] * scale)
+        new_h = int(img.shape[0] * scale)
+        
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        original_img = cv2.resize(original_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # Rectangular corners (for packing)
+        corners = np.array([
+            [0.0, 0.0],
+            [new_w - 1.0, 0.0],
+            [new_w - 1.0, new_h - 1.0],
+            [0.0, new_h - 1.0]
+        ], dtype=np.float32)
+        
+        # Add shadow if enabled
+        shadow_mask = None
+        if random.random() < 0.85:
+            spread = random.randint(20, 35)
+            offset = random.randint(1, 4)
+            opacity = random.uniform(0.4, 0.6)
+            img, shadow_corners, shadow_mask = add_drop_shadow(
+                img, corners, offset=offset, spread=spread, opacity=opacity
+            )
+        
+        # Add blur
+        if random.random() < 0.3:
+            blur_min = random.uniform(0, 2)
+            blur_max = blur_min + random.uniform(2, 6)
+            edge_focus = random.uniform(0.3, 0.7)
+            img = add_variable_blur(img, blur_min, blur_max, edge_focus)
+        
+        # Add glare
+        if random.random() < 0.4:
+            img = add_glare(img)
+        
+        return img, corners, shadow_mask, original_img, (new_w, new_h)
     
-    if candidates:
-        candidates.sort(key=lambda c: c[2])
-        return candidates[0][0], candidates[0][1]
-    
-    return None
+    except Exception as e:
+        return None, None, None
 
 
-def _overlaps(x, y, w, h, placed, margin):
-    for px, py, pw, ph in placed:
-        if (x < px + pw + margin and x + w + margin > px and
-            y < py + ph + margin and y + h + margin > py):
-            return True
-    return False
+def convert_bgra_to_rgba(img):
+    """Convert BGRA to RGBA for PIL compatibility."""
+    if img.shape[2] == 4:
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def polygons_overlap(poly1, poly2, margin=0):
+    """Check if two polygons overlap using SAT."""
+    gap_half = margin / 2
+    
+    min1_x, max1_x = poly1[:, 0].min(), poly1[:, 0].max()
+    min1_y, max1_y = poly1[:, 1].min(), poly1[:, 1].max()
+    min2_x, max2_x = poly2[:, 0].min(), poly2[:, 0].max()
+    min2_y, max2_y = poly2[:, 1].min(), poly2[:, 1].max()
+    
+    if max1_x + gap_half < min2_x or min1_x - gap_half > max2_x:
+        return False
+    if max1_y + gap_half < min2_y or min1_y - gap_half > max2_y:
+        return False
+    
+    for poly in [poly1, poly2]:
+        for i in range(len(poly)):
+            p1 = poly[i]
+            p2 = poly[(i + 1) % len(poly)]
+            edge = p2 - p1
+            if np.abs(edge).sum() < 0.001:
+                continue
+            normal = np.array([-edge[1], edge[0]])
+            normal = normal / (np.linalg.norm(normal) + 1e-10)
+            proj1 = poly1 @ normal
+            proj2 = poly2 @ normal
+            if proj1.max() + gap_half < proj2.min() or proj2.max() + gap_half < proj1.min():
+                return False
+    
+    return True
 
 
 def composite_overlay(bg, overlay, pos):
-    """Composite overlay onto background - PIXEL PERFECT alpha compositing."""
-    bx, by = pos
+    """Composite overlay onto background using alpha channel.
     
-    # Get bounds
-    bh, bw = bg.shape[:2]
-    oh, ow = overlay.shape[:2]
+    bg: BGR image (OpenCV default)
+    overlay: BGRA image
+    """
+    x, y = pos
     
-    # Calculate overlap region
-    x1 = max(0, bx)
-    y1 = max(0, by)
-    x2 = min(bw, bx + ow)
-    y2 = min(bh, by + oh)
+    h, w = overlay.shape[:2]
     
-    if x1 >= x2 or y1 >= y2:
+    x1, y1 = max(0, int(x)), max(0, int(y))
+    x2, y2 = min(bg.shape[1], int(x) + w), min(bg.shape[0], int(y) + h)
+    
+    ov_x1 = x1 - int(x)
+    ov_y1 = y1 - int(y)
+    ov_x2 = ov_x1 + (x2 - x1)
+    ov_y2 = ov_y1 + (y2 - y1)
+    
+    if ov_x2 <= ov_x1 or ov_y2 <= ov_y1:
         return bg
     
-    # Calculate offset into overlay
-    ox1 = x1 - bx
-    oy1 = y1 - by
-    ox2 = ox1 + (x2 - x1)
-    oy2 = oy1 + (y2 - y1)
+    overlay_slice = overlay[ov_y1:ov_y2, ov_x1:ov_x2]
     
-    # Extract regions
-    bg_region = bg[y1:y2, x1:x2].astype(np.float32)
-    ov_region = overlay[oy1:oy2, ox1:ox2].astype(np.float32)
-    
-    # Get alpha (4th channel)
-    if ov_region.shape[2] == 4:
-        alpha = ov_region[:, :, 3].astype(np.float32) / 255.0
-        ov_rgb = ov_region[:, :, :3]
+    if overlay_slice.shape[2] == 4:
+        alpha = overlay_slice[:, :, 3:4] / 255.0
+        bg_slice = bg[y1:y2, x1:x2].astype(np.float32)
+        # overlay is BGRA, so [:3] gives B, G, R - same as bg
+        overlay_rgb = overlay_slice[:, :, :3].astype(np.float32)
+        result = bg_slice * (1 - alpha) + overlay_rgb * alpha
+        bg[y1:y2, x1:x2] = np.clip(result, 0, 255).astype(np.uint8)
     else:
-        alpha = np.ones((ov_region.shape[0], ov_region.shape[1]), dtype=np.float32)
-        ov_rgb = ov_region[:, :, :3]
-    
-    # Ensure bg is RGB only (strip alpha if present)
-    if bg_region.shape[2] == 4:
-        bg_rgb = bg_region[:, :, :3]
-    else:
-        bg_rgb = bg_region
-    
-    # Reshape for broadcasting
-    h_reg, w_reg = bg_rgb.shape[:2]
-    alpha = alpha.reshape(h_reg, w_reg, 1)
-    
-    # Alpha compositing: result = bg * (1 - alpha) + overlay * alpha
-    result = bg_rgb * (1 - alpha) + ov_rgb * alpha
-    
-    # Write back to bg
-    bg[y1:y2, x1:x2, :3] = result.astype(np.uint8)
+        # No alpha, treat as BGR
+        bg[y1:y2, x1:x2] = overlay_slice
     
     return bg
 
 
-def get_warped_bounds(corners):
-    """Calculate bounding box of warped corners."""
-    min_x = min(c[0] for c in corners)
-    max_x = max(c[0] for c in corners)
-    min_y = min(c[1] for c in corners)
-    max_y = max(c[1] for c in corners)
-    return min_x, min_y, max_x - min_x, max_y - min_y
+    return warped_corners
 
 
-def render_scene(config, sources):
-    """Render scene with densely placed photos."""
-    w, h = 1920, 1080
+def generate_camera_perspective_corners(placed_corners):
+    """
+    Generate perspective-warped destination corners from placed rectangular corners.
+    
+    Simulates camera viewing the photo from above at an angle.
+    Applies subtle rotation and tiny scale variation to create the illusion
+    of perspective without causing quadrilaterals to intersect.
+    
+    Args:
+        placed_corners: 4x2 array of rectangular corners [TL, TR, BR, BL]
+    
+    Returns:
+        warped_corners: 4x2 array of warped quadrilateral corners
+    """
+    # Calculate bounds and center
+    orig_min_x = placed_corners[:, 0].min()
+    orig_max_x = placed_corners[:, 0].max()
+    orig_min_y = placed_corners[:, 1].min()
+    orig_max_y = placed_corners[:, 1].max()
+    
+    cx = (orig_min_x + orig_max_x) / 2
+    cy = (orig_min_y + orig_max_y) / 2
+    width = orig_max_x - orig_min_x
+    height = orig_max_y - orig_min_y
+    
+    # Subtle rotation (-2 to +2 degrees)
+    angle = random.uniform(-0.035, 0.035)
+    cos_a, sin_a = np.cos(angle), np.sin(angle)
+    
+    # Apply rotation around center
+    warped = placed_corners.copy()
+    for i in range(4):
+        dx = warped[i, 0] - cx
+        dy = warped[i, 1] - cy
+        warped[i, 0] = cx + dx * cos_a - dy * sin_a
+        warped[i, 1] = cy + dx * sin_a + dy * cos_a
+    
+    # Tiny scale variation (0.98-1.02) - simulates slight distance change
+    scale = random.uniform(0.985, 1.015)
+    warped[:, 0] = cx + (warped[:, 0] - cx) * scale
+    warped[:, 1] = cy + (warped[:, 1] - cy) * scale
+    
+    # Very subtle corner nudge (1-3 pixels) to simulate keystone
+    # This is so subtle it won't cause intersections
+    nudge = random.uniform(1, 3)
+    direction = random.choice(['tl', 'tr', 'br', 'bl'])
+    corner_idx = {'tl': 0, 'tr': 1, 'br': 2, 'bl': 3}[direction]
+    axis = random.choice(['x', 'y'])
+    sign = random.choice([-1, 1])
+    
+    if axis == 'x':
+        warped[corner_idx, 0] += sign * nudge
+    else:
+        warped[corner_idx, 1] += sign * nudge
+    
+    return warped
+
+
+def apply_perspective_to_placements(placed, infos):
+    """
+    Apply camera perspective warping to all placed photos.
+    
+    Updates placed['corners'] and info['keypoints'] with warped corners.
+    
+    Args:
+        placed: List of placed photo dicts with 'corners' key
+        infos: List of info dicts with 'keypoints' key
+    
+    Returns:
+        placed, infos (modified in place)
+    """
+    for i, photo_info in enumerate(placed):
+        placed_corners = photo_info['corners']
+        
+        # Generate perspective-warped corners
+        warped_corners = generate_camera_perspective_corners(placed_corners)
+        
+        # Store warped corners
+        placed[i]['corners'] = warped_corners
+        
+        # Update keypoints in infos
+        if i < len(infos):
+            infos[i]['keypoints'] = [(warped_corners[j][0], warped_corners[j][1]) for j in range(4)]
+            # Recalculate center
+            kps = infos[i]['keypoints']
+            infos[i]['x_center'] = sum(k[0] for k in kps) / 4
+            infos[i]['y_center'] = sum(k[1] for k in kps) / 4
+    
+    return placed, infos
+
+
+def apply_global_perspective_transform(canvas, placed_info_list, output_w, output_h, canvas_scale):
+    """
+    Apply global perspective transform to simulate camera viewing scene at an angle.
+    
+    Uses proper perspective projection (homography) to create a keystone distortion
+    that simulates viewing the scene from an elevated camera position.
+    
+    Args:
+        canvas: BGR image (high-res flat canvas)
+        placed_info_list: List of dicts with 'corners' for each photo
+        output_w, output_h: Final output dimensions
+        canvas_scale: Scale factor used (e.g., 3 for 3x final size)
+    
+    Returns:
+        transformed: Transformed BGR image (output size)
+        transformed_corners: List of transformed corner arrays (in output coords)
+    """
+    h, w = canvas.shape[:2]
+    
+    # Define source rectangle (full canvas)
+    src_corners = np.array([
+        [0, 0],
+        [w - 1, 0],
+        [w - 1, h - 1],
+        [0, h - 1]
+    ], dtype=np.float32)
+    
+    # Define camera position relative to scene
+    # Camera positioned to look at the scene from above
+    # Use VERY conservative values to ensure content stays within bounds
+    camera_x = random.uniform(0.48, 0.52)  # Camera X position (near center)
+    camera_y = random.uniform(0.47, 0.53)  # Camera Y position (near center vertically)
+    
+    # Calculate keystone distortion based on camera position
+    # Keep distortion VERY minimal to prevent content going out of bounds
+    # The perspective_strength is multiplied by canvas_scale which is 3
+    # So at 12000x9000, max keystone is about 72 pixels
+    perspective_strength = 0.006 * canvas_scale  # Very conservative (about 0.6%)
+    keystone_horizontal = w * perspective_strength * (camera_x - 0.5)
+    keystone_vertical = h * perspective_strength * (camera_y - 0.5)
+    
+    # Destination trapezoid corners - minimal distortion to keep content in bounds
+    # Use 3% vertical margin instead of 10% to prevent corners going out of bounds
+    # This gives slight perspective without pushing corners off the edge
+    vert_margin = h * 0.03
+    dst_corners = np.array([
+        [keystone_horizontal, vert_margin],                          # TL - only 3% from top
+        [w - 1 + keystone_horizontal, vert_margin],                 # TR - only 3% from top
+        [w - 1 - keystone_horizontal * 0.5, h - 1 - vert_margin],  # BR - only 3% from bottom
+        [keystone_horizontal * 0.5, h - 1 - vert_margin]           # BL - only 3% from bottom
+    ], dtype=np.float32)
+    
+    # Add subtle rotation for natural look
+    angle = random.uniform(-2, 2)
+    center = np.array([w / 2, h / 2])
+    rot_rad = np.radians(angle)
+    cos_a, sin_a = np.cos(rot_rad), np.sin(rot_rad)
+    
+    # Rotate destination corners around center
+    for i in range(4):
+        dx = dst_corners[i, 0] - center[0]
+        dy = dst_corners[i, 1] - center[1]
+        dst_corners[i, 0] = center[0] + dx * cos_a - dy * sin_a
+        dst_corners[i, 1] = center[1] + dx * sin_a + dy * cos_a
+    
+    # Get perspective transform matrix
+    M = cv2.getPerspectiveTransform(src_corners, dst_corners)
+    
+    # Apply perspective warp to canvas
+    warped = cv2.warpPerspective(canvas, M, (w, h), 
+                                  flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_CONSTANT,
+                                  borderValue=(0, 0, 0))
+    
+    # Instead of content-based cropping (which can include black warping artifacts),
+    # use center crop: take the middle portion and resize to output
+    # This guarantees no black edges in the final output
+    center_y = h // 2
+    center_x = w // 2
+    
+    # Crop a region centered in the warped image, sized for output + margin
+    crop_margin = max(w, h) // 10  # 10% margin
+    crop_h = h - 2 * crop_margin
+    crop_w = w - 2 * crop_margin
+    
+    y_min = center_y - crop_h // 2
+    y_max = y_min + crop_h
+    x_min = center_x - crop_w // 2
+    x_max = x_min + crop_w
+    
+    # Ensure crop stays within bounds
+    if y_min < 0: y_min = 0
+    if y_max > h: y_max = h
+    if x_min < 0: x_min = 0
+    if x_max > w: x_max = w
+    
+    cropped = warped[y_min:y_max, x_min:x_max]
+    
+    crop_h, crop_w = cropped.shape[:2]
+    
+    # Resize to output dimensions
+    transformed = cv2.resize(cropped, (output_w, output_h), interpolation=cv2.INTER_AREA)
+    
+    # Calculate scale factors
+    scale_x = output_w / crop_w
+    scale_y = output_h / crop_h
+    
+    # Transform all corner keypoints using the perspective matrix
+    transformed_corners = []
+    for info in placed_info_list:
+        corners = info['corners'].copy()
+        
+        # Apply perspective matrix to corners
+        ones = np.ones((4, 1), dtype=np.float64)
+        corners_h = np.hstack([corners.astype(np.float64), ones])
+        warped_pts = M @ corners_h.T
+        
+        # Convert from homogeneous coordinates
+        warped_pts = warped_pts[:2, :] / warped_pts[2, :]
+        warped_pts = warped_pts.T
+        
+        # Apply crop offset and scale to output
+        warped_pts[:, 0] = (warped_pts[:, 0] - x_min) * scale_x
+        warped_pts[:, 1] = (warped_pts[:, 1] - y_min) * scale_y
+        
+        # SAFETY: Ensure no corner goes near the edge after perspective transform
+        # This handles cases where perspective causes some area to be cropped
+        # Use a 5% safety margin from edges to prevent corners going out of bounds
+        safety_margin = 0.05  # 5% margin
+        min_allowed = 0.0 + safety_margin * output_w
+        max_allowed_w = float(output_w - 1) - safety_margin * output_w
+        min_allowed_h = 0.0 + safety_margin * output_h
+        max_allowed_h = float(output_h - 1) - safety_margin * output_h
+        
+        # If any corner is beyond safety margin, clamp it (rare case)
+        if (warped_pts[:, 0].min() < min_allowed or warped_pts[:, 0].max() > max_allowed_w or
+            warped_pts[:, 1].min() < min_allowed_h or warped_pts[:, 1].max() > max_allowed_h):
+            # Clamp to safety bounds
+            warped_pts[:, 0] = np.clip(warped_pts[:, 0], min_allowed, max_allowed_w)
+            warped_pts[:, 1] = np.clip(warped_pts[:, 1], min_allowed_h, max_allowed_h)
+        
+        transformed_corners.append(warped_pts.astype(np.float32))
+    
+    return transformed, transformed_corners
+
+
+def rotate_corners(corners, angle_deg, cx, cy):
+    """Rotate corners around origin, then translate to (cx, cy).
+    
+    This is the correct approach: first rotate around (0,0), then translate.
+    The corners should be centered at origin before calling this function.
+    
+    Args:
+        corners: 4x2 array of corners (centered at origin)
+        angle_deg: Rotation angle in degrees
+        cx, cy: Final center position to translate to
+    
+    Returns:
+        Rotated and translated corners
+    """
+    angle_rad = np.radians(angle_deg)
+    cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+    
+    rotated = corners.copy().astype(np.float64)
+    for i in range(4):
+        # Rotate around origin (0,0)
+        x, y = rotated[i]
+        rotated[i, 0] = x * cos_a - y * sin_a
+        rotated[i, 1] = x * sin_a + y * cos_a
+    
+    # Translate to final position
+    rotated[:, 0] += cx
+    rotated[:, 1] += cy
+    
+    return rotated.astype(np.float32)
+
+
+def rotate_and_place_photo(bbox_corners, center_x, center_y, angle_deg):
+    """
+    Rotate rectangular corners around their center, then translate to position.
+    
+    Args:
+        bbox_corners: Original rectangular corners (4x2 array, centered at origin-ish)
+        center_x, center_y: Final center position
+        angle_deg: Rotation angle in degrees
+    
+    Returns:
+        placed_corners: Rotated and translated corners
+    """
+    # Get center of original bbox
+    orig_cx = bbox_corners[:, 0].mean()
+    orig_cy = bbox_corners[:, 1].mean()
+    
+    # Translate to origin
+    centered = bbox_corners.copy() - np.array([orig_cx, orig_cy])
+    
+    # Rotate around origin
+    angle_rad = np.radians(angle_deg)
+    cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+    rot_mat = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float64)
+    rotated = centered @ rot_mat.T
+    
+    # Translate to final position
+    placed = rotated + np.array([center_x, center_y])
+    
+    return placed.astype(np.float32)
+
+
+def get_rotated_bbox_corners(w, h, angle_deg, center_x, center_y):
+    """Create rotated rectangular corners for a photo."""
+    # Original corners centered at (0,0)
+    orig_corners = np.array([
+        [-w/2, -h/2],
+        [w/2, -h/2],
+        [w/2, h/2],
+        [-w/2, h/2]
+    ], dtype=np.float32)
+    
+    return rotate_and_place_photo(orig_corners, center_x, center_y, angle_deg)
+
+
+def get_bounding_box_from_corners(corners):
+    """Get bounding box from corners (handles any quadrilateral)."""
+    min_x = corners[:, 0].min()
+    max_x = corners[:, 0].max()
+    min_y = corners[:, 1].min()
+    max_y = corners[:, 1].max()
+    return {
+        'min_x': min_x,
+        'max_x': max_x,
+        'min_y': min_y,
+        'max_y': max_y,
+        'w': max_x - min_x,
+        'h': max_y - min_y,
+        'corners': corners
+    }
+
+
+def composite_rotated_photo(bg, original_photo, placed_corners, with_effects=True):
+    """Composite a photo onto background, properly handling rotation.
+    
+    This handles photos that are rotated arbitrarily by applying a rotation
+    transformation around the photo's center point.
+    
+    Args:
+        bg: BGR image (canvas)
+        original_photo: BGRA or BGR image (rectangular source)
+        placed_corners: 4x2 array of rotated corner coordinates on the canvas
+        with_effects: Whether to apply shadow, blur, glare effects
+    
+    Returns:
+        bg: Composited background image
+    """
+    orig_h, orig_w = original_photo.shape[:2]
+    
+    # Calculate the center of the placed corners
+    center_x = placed_corners[:, 0].mean()
+    center_y = placed_corners[:, 1].mean()
+    
+    # Calculate the rotation angle from the placed corners
+    # Use the top edge vector (from TL to TR) to determine rotation
+    tl, tr, br, bl = placed_corners
+    
+    # For a rectangular photo, the top edge vector should be (width, 0) - pointing right
+    src_top_vec = np.array([orig_w, 0.0])
+    
+    # For the placed photo, the top edge is from TL to TR
+    dst_top_vec = np.array([tr[0] - tl[0], tr[1] - tl[1]])
+    
+    # Calculate rotation angle from vectors
+    src_angle = np.arctan2(src_top_vec[1], src_top_vec[0])  # 0 radians
+    dst_angle = np.arctan2(dst_top_vec[1], dst_top_vec[0])
+    rotation_angle = np.degrees(dst_angle - src_angle)
+    
+    # Create rotation matrix
+    M_rot = cv2.getRotationMatrix2D((orig_w/2, orig_h/2), rotation_angle, 1.0)
+    
+    # Add translation to center at placed position
+    M_rot[0, 2] += center_x - orig_w/2
+    M_rot[1, 2] += center_y - orig_h/2
+    
+    # Get output size to cover the rotated photo
+    # Calculate bounding box of rotated image
+    corners_rotated = np.array([
+        [0, 0],
+        [orig_w - 1, 0],
+        [orig_w - 1, orig_h - 1],
+        [0, orig_h - 1]
+    ], dtype=np.float32).reshape(-1, 1, 2)
+    
+    transformed_corners = cv2.transform(corners_rotated, M_rot).reshape(-1, 2)
+    
+    min_x = int(np.floor(transformed_corners[:, 0].min()))
+    min_y = int(np.floor(transformed_corners[:, 1].min()))
+    max_x = int(np.ceil(transformed_corners[:, 0].max()))
+    max_y = int(np.ceil(transformed_corners[:, 1].max()))
+    
+    out_w = max(1, max_x - min_x + 1)
+    out_h = max(1, max_y - min_y + 1)
+    
+    # Adjust matrix to shift output to origin
+    M_out = M_rot.copy()
+    M_out[0, 2] -= min_x
+    M_out[1, 2] -= min_y
+    
+    # Warp the photo
+    warped = cv2.warpAffine(original_photo, M_out, (out_w, out_h),
+                           flags=cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_CONSTANT,
+                           borderValue=0)
+    
+    # Create mask for alpha compositing
+    has_alpha = original_photo.shape[2] == 4
+    if has_alpha:
+        alpha_warped = cv2.warpAffine(original_photo[:, :, 3], M_out, (out_w, out_h),
+                                      flags=cv2.INTER_LINEAR,
+                                      borderMode=cv2.BORDER_CONSTANT,
+                                      borderValue=0)
+        # Normalize alpha to 0-1 range (was 0-255)
+        mask = alpha_warped.astype(np.float32) / 255.0
+    else:
+        mask = np.ones((out_h, out_w), dtype=np.float32)
+    
+    # Apply effects to the warped photo if requested
+    if with_effects:
+        # Add shadow
+        if random.random() < 0.85:
+            spread = random.randint(20, 35)
+            offset = random.randint(1, 4)
+            opacity = random.uniform(0.4, 0.6)
+            warped, _, _ = add_drop_shadow(
+                warped, 
+                np.array([[0, 0], [out_w-1, 0], [out_w-1, out_h-1], [0, out_h-1]], dtype=np.float32),
+                offset=offset, spread=spread, opacity=opacity
+            )
+            # Recalculate mask after shadow (which may have added alpha)
+            if warped.shape[2] == 4:
+                mask = (warped[:, :, 3] > 0).astype(np.float32) / 255.0
+        
+        # Add blur
+        if random.random() < 0.3:
+            blur_min = random.uniform(0, 2)
+            blur_max = blur_min + random.uniform(2, 6)
+            edge_focus = random.uniform(0.3, 0.7)
+            warped = add_variable_blur(warped, blur_min, blur_max, edge_focus)
+        
+        # Add glare
+        if random.random() < 0.4:
+            warped = add_glare(warped)
+    
+    # Composite onto background
+    y_off = min_y
+    x_off = min_x
+    
+    # Ensure we're within bounds
+    if y_off < 0:
+        mask = mask[-y_off:, :]
+        warped = warped[-y_off:, :] if warped.shape[0] > -y_off else warped
+        y_off = 0
+    if x_off < 0:
+        mask = mask[:, -x_off:]
+        warped = warped[:, -x_off:] if warped.shape[1] > -x_off else warped
+        x_off = 0
+    
+    # Get intersection region
+    bg_h, bg_w = bg.shape[:2]
+    y_end = min(y_off + warped.shape[0], bg_h)
+    x_end = min(x_off + warped.shape[1], bg_w)
+    mask_h = y_end - y_off
+    mask_w = x_end - x_off
+    
+    if mask_h <= 0 or mask_w <= 0:
+        return bg  # Nothing to composite
+    
+    mask_region = mask[:mask_h, :mask_w]
+    warped_region = warped[:mask_h, :mask_w]
+    
+    if warped_region.shape[2] == 4:
+        alpha = mask_region[:, :, np.newaxis]
+    else:
+        alpha = mask_region[:, :, np.newaxis]
+    
+    # Blend
+    for c in range(3):
+        bg[y_off:y_end, x_off:x_end, c] = (
+            bg[y_off:y_end, x_off:x_end, c] * (1 - alpha[:, :, 0]) +
+            warped_region[:, :, c].astype(np.float32) * alpha[:, :, 0]
+        ).astype(np.uint8)
+    
+    return bg
+
+
+def composite_scaled_photo(bg, original_photo, placed_corners, with_effects=True, apply_perspective=True):
+    """Composite a photo onto background using perspective warp to placed corners.
+    
+    This warps the original rectangular photo to the placed position, ensuring
+    corners match exactly.
+    
+    bg: BGR image (canvas)
+    original_photo: BGRA or BGR image (rectangular)
+    placed_corners: 4x2 array of corner coordinates on the canvas (TL, TR, BR, BL)
+    with_effects: Whether to apply shadow, blur, glare effects
+    apply_perspective: Whether to apply per-photo perspective warp (for local angle effect)
+    """
+    orig_h, orig_w = original_photo.shape[:2]
+    has_alpha = original_photo.shape[2] == 4
+    
+    # Source corners (rectangular image)
+    src_pts = np.array([
+        [0.0, 0.0],
+        [orig_w - 1.0, 0.0],
+        [orig_w - 1.0, orig_h - 1.0],
+        [0.0, orig_h - 1.0]
+    ], dtype=np.float32)
+    
+    # Destination corners - either warped or rectangular
+    if apply_perspective and with_effects:
+        # Generate perspective-warped destination corners (subtle effect)
+        dst_pts = generate_camera_perspective_corners(placed_corners)
+    else:
+        # Use placed corners as-is (rectangular, rotation handled by placement)
+        dst_pts = placed_corners.copy()
+    
+    # Compute forward perspective transform from source to destination
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    
+    # Get output bounding box (canvas area to cover destination)
+    min_x = int(np.floor(dst_pts[:, 0].min()))
+    min_y = int(np.floor(dst_pts[:, 1].min()))
+    max_x = int(np.ceil(dst_pts[:, 0].max()))
+    max_y = int(np.ceil(dst_pts[:, 1].max()))
+    
+    # Output size should cover the destination region
+    out_w = max(1, max_x + 1)
+    out_h = max(1, max_y + 1)
+    
+    # Warp photo to the placed position
+    warped = cv2.warpPerspective(original_photo, M, (out_w, out_h), 
+                                  flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_CONSTANT, 
+                                  borderValue=0)
+    
+    # Apply effects to the warped photo if requested
+    if with_effects:
+        # Add shadow
+        if random.random() < 0.85:
+            spread = random.randint(20, 35)
+            offset = random.randint(1, 4)
+            opacity = random.uniform(0.4, 0.6)
+            corners = np.array([
+                [0.0, 0.0],
+                [out_w - 1.0, 0.0],
+                [out_w - 1.0, out_h - 1.0],
+                [0.0, out_h - 1.0]
+            ], dtype=np.float32)
+            warped, _, shadow_mask = add_drop_shadow(
+                warped, corners, offset=offset, spread=spread, opacity=opacity
+            )
+        
+        # Add blur
+        if random.random() < 0.3:
+            blur_min = random.uniform(0, 2)
+            blur_max = blur_min + random.uniform(2, 6)
+            edge_focus = random.uniform(0.3, 0.7)
+            warped = add_variable_blur(warped, blur_min, blur_max, edge_focus)
+        
+        # Add glare
+        if random.random() < 0.4:
+            warped = add_glare(warped)
+    
+    # Composite onto canvas
+    canvas_h, canvas_w = bg.shape[:2]
+    
+    # Clamp destination bounds to canvas
+    # min_x, min_y are from the original warped_corners (before shifting)
+    # but warped image starts at (0,0) due to the shift in transform
+    x1 = max(0, min_x)
+    y1 = max(0, min_y)
+    x2 = min(canvas_w, max_x + 1)
+    y2 = min(canvas_h, max_y + 1)
+    
+    # The warped image starts at (0,0), and its content covers the area
+    # from (0,0) to (out_w-1, out_h-1)
+    # We need to copy the portion that falls within [y1:y2, x1:x2] on the canvas
+    warp_y1 = 0
+    warp_x1 = 0
+    warp_y2 = min(out_h, y2 - y1)  # How much of warped to use
+    warp_x2 = min(out_w, x2 - x1)
+    
+    # Only composite if there's valid content
+    if warp_x2 > 0 and warp_y2 > 0 and y2 > y1 and x2 > x1:
+        warp_slice = warped[warp_y1:warp_y2, warp_x1:warp_x2]
+        canvas_slice = bg[y1:y1 + warp_slice.shape[0], x1:x1 + warp_slice.shape[1]]
+        
+        if has_alpha:
+            alpha = warp_slice[:, :, 3:4] / 255.0
+            canvas_slice_float = canvas_slice.astype(np.float32)
+            overlay_rgb = warp_slice[:, :, :3].astype(np.float32)
+            result = canvas_slice_float * (1 - alpha) + overlay_rgb * alpha
+            bg[y1:y1 + warp_slice.shape[0], x1:x1 + warp_slice.shape[1]] = np.clip(result, 0, 255).astype(np.uint8)
+        else:
+            bg[y1:y1 + warp_slice.shape[0], x1:x1 + warp_slice.shape[1]] = warp_slice
+    
+    return bg
+
+
+def get_photo_bbox(corners, shadow_extent=0):
+    """Get bounding box for photo including shadow."""
+    min_x = corners[:, 0].min() - shadow_extent
+    max_x = corners[:, 0].max() + shadow_extent
+    min_y = corners[:, 1].min() - shadow_extent
+    max_y = corners[:, 1].max() + shadow_extent
+    
+    w = max_x - min_x
+    h = max_y - min_y
+    
+    return {
+        'min_x': min_x, 'max_x': max_x,
+        'min_y': min_y, 'max_y': max_y,
+        'w': w, 'h': h,
+        'corners': corners.copy()
+    }
+
+
+def check_bounds(bbox, canvas_w, canvas_h, edge_margin, shadow_extent=0):
+    """Check if bounding box is within canvas bounds."""
+    return (bbox['min_x'] >= edge_margin + shadow_extent and 
+            bbox['max_x'] <= canvas_w - edge_margin - shadow_extent and
+            bbox['min_y'] >= edge_margin + shadow_extent and 
+            bbox['max_y'] <= canvas_h - edge_margin - shadow_extent)
+
+
+def check_no_overlap_corners(corners1, corners2, gap):
+    """Check if two photo corners don't overlap (no overlap = True)."""
+    gap_half = gap / 2
+    
+    min1_x, max1_x = corners1[:, 0].min(), corners1[:, 0].max()
+    min1_y, max1_y = corners1[:, 1].min(), corners1[:, 1].max()
+    min2_x, max2_x = corners2[:, 0].min(), corners2[:, 0].max()
+    min2_y, max2_y = corners2[:, 1].min(), corners2[:, 1].max()
+    
+    if max1_x + gap_half < min2_x or min1_x - gap_half > max2_x:
+        return True
+    if max1_y + gap_half < min2_y or min1_y - gap_half > max2_y:
+        return True
+    
+    for poly in [corners1, corners2]:
+        for i in range(len(poly)):
+            p1 = poly[i]
+            p2 = poly[(i + 1) % len(poly)]
+            edge = p2 - p1
+            if np.abs(edge).sum() < 0.001:
+                continue
+            normal = np.array([-edge[1], edge[0]])
+            normal = normal / (np.linalg.norm(normal) + 1e-10)
+            proj1 = corners1 @ normal
+            proj2 = corners2 @ normal
+            if proj1.max() + gap_half < proj2.min() or proj2.max() + gap_half < proj1.min():
+                return True
+    
+    return False
+
+
+def polygon_area(corners):
+    """Calculate polygon area using shoelace formula."""
+    x = corners[:, 0]
+    y = corners[:, 1]
+    n = len(x)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += x[i] * y[j]
+        area -= y[i] * x[j]
+    return abs(area) / 2.0
+
+
+def place_photo(photo_data, bbox, center_x, center_y, placed_corners, canvas_w, canvas_h):
+    """Create placed photo info."""
+    corners = photo_data['corners']
+    
+    info = {
+        'min_x': center_x - bbox['w']/2,
+        'max_x': center_x + bbox['w']/2,
+        'min_y': center_y - bbox['h']/2,
+        'max_y': center_y + bbox['h']/2,
+        'center_x': center_x,
+        'center_y': center_y,
+        'corners': placed_corners.copy()
+    }
+    
+    kps = [(placed_corners[i][0], placed_corners[i][1]) for i in range(4)]
+    
+    infos = {
+        'x_center': sum(k[0] for k in kps) / 4 / canvas_w,
+        'y_center': sum(k[1] for k in kps) / 4 / canvas_h,
+        'keypoints': kps,
+        'fill_area': polygon_area(placed_corners)
+    }
+    
+    return info, infos
+
+
+def pack_random_greedy(photos, photo_bboxes, canvas_w, canvas_h, edge_margin, photo_gap, max_shadow_extent):
+    """Pack photos using random greedy placement with rotation support."""
+    num_photos = len(photos)
+    if num_photos == 0:
+        return None
+    
+    placed = []
+    infos = []
+    
+    # Generate random positions - use conservative bounds to ensure photos stay well within canvas
+    safe_margin = max(edge_margin, 200)  # At least 200px from edge
+    positions = []
+    for _ in range(1000):
+        x = random.uniform(safe_margin, canvas_w - safe_margin)
+        y = random.uniform(safe_margin, canvas_h - safe_margin)
+        positions.append((x, y))
+    
+    random.shuffle(positions)
+    
+    # Sort photos by size (smaller first)
+    photo_order = sorted(range(num_photos), key=lambda i: photo_bboxes[i]['w'] * photo_bboxes[i]['h'])
+    
+    for photo_idx in photo_order:
+        bbox = photo_bboxes[photo_idx]
+        w = bbox['w']
+        h = bbox['h']
+        
+        # Random rotation angle (-20 to +20 degrees)
+        angle = random.uniform(-20, 20)
+        
+        best_pos = None
+        best_corners = None
+        
+        for x, y in positions:
+            # Create rotated corners for this position
+            test_corners = get_rotated_bbox_corners(w, h, angle, x, y)
+            
+            # Check bounds using actual rotated corners
+            bbox_check = get_bounding_box_from_corners(test_corners)
+            if bbox_check['min_x'] < edge_margin or bbox_check['max_x'] > canvas_w - edge_margin or \
+               bbox_check['min_y'] < edge_margin or bbox_check['max_y'] > canvas_h - edge_margin:
+                continue
+            
+            # Check overlap with all placed photos
+            overlap = False
+            for p in placed:
+                if not check_no_overlap_corners(test_corners, p['corners'], photo_gap):
+                    overlap = True
+                    break
+            
+            if not overlap:
+                best_pos = (x, y)
+                best_corners = test_corners
+                break
+        
+        if best_pos:
+            x, y = best_pos
+            
+            placed.append({
+                'min_x': best_corners[:, 0].min(),
+                'max_x': best_corners[:, 0].max(),
+                'min_y': best_corners[:, 1].min(),
+                'max_y': best_corners[:, 1].max(),
+                'center_x': x,
+                'center_y': y,
+                'corners': best_corners,
+                'rotation': angle
+            })
+            
+            kps = [(best_corners[i][0], best_corners[i][1]) for i in range(4)]
+            infos.append({
+                'x_center': sum(k[0] for k in kps) / 4 / canvas_w,
+                'y_center': sum(k[1] for k in kps) / 4 / canvas_h,
+                'keypoints': kps,
+                'fill_area': polygon_area(best_corners)
+            })
+    
+    if len(placed) == 0:
+        return None
+    
+    return placed, infos
+
+
+def pack_grid(photos, photo_bboxes, canvas_w, canvas_h, edge_margin, photo_gap, max_shadow_extent):
+    """Pack photos in a grid pattern with rotation support.
+    
+    Uses actual rotated corners for all validation to ensure photos
+    stay well within bounds and don't appear to intersect.
+    """
+    num_photos = len(photos)
+    if num_photos == 0:
+        return None
+    
+    # Determine grid dimensions
+    cols = int(math.ceil(math.sqrt(num_photos)))
+    rows = int(math.ceil(num_photos / cols))
+    
+    avail_w = canvas_w - 2 * edge_margin
+    avail_h = canvas_h - 2 * edge_margin
+    
+    # Conservative rotation buffer - photos extend ~6% at 20 degrees
+    rotation_buffer = 1.06
+    
+    # Cell size that accounts for gaps - give substantial space between photos
+    # Key: cell_size + photo_gap should fit within available space
+    cell_w = (avail_w - (cols - 1) * photo_gap) / cols
+    cell_h = (avail_h - (rows - 1) * photo_gap) / rows
+    
+    # Apply rotation buffer conservatively
+    effective_cell_w = cell_w / rotation_buffer
+    effective_cell_h = cell_h / rotation_buffer
+    
+    placed = []
+    infos = []
+    
+    # Sort photos by size (larger first)
+    photo_order = sorted(range(num_photos), key=lambda i: -(photo_bboxes[i]['w'] * photo_bboxes[i]['h']))
+    
+    idx = 0
+    for row in range(rows):
+        for col in range(cols):
+            if idx >= num_photos:
+                break
+            
+            photo_idx = photo_order[idx]
+            bbox = photo_bboxes[photo_idx]
+            w, h = bbox['w'], bbox['h']
+            
+            # Calculate center position
+            x = edge_margin + col * (cell_w + photo_gap) + cell_w / 2
+            y = edge_margin + row * (cell_h + photo_gap) + cell_h / 2
+            
+            # Random rotation (-20 to +20 degrees)
+            angle = random.uniform(-20, 20)
+            
+            # Scale photo to fit within effective cell
+            scale = min(effective_cell_w / w, effective_cell_h / h, 1.0)
+            scaled_w = w * scale
+            scaled_h = h * scale
+            
+            # Get corners for this scaled photo with rotation
+            corners = np.array([
+                [-scaled_w/2, -scaled_h/2],
+                [scaled_w/2, -scaled_h/2],
+                [scaled_w/2, scaled_h/2],
+                [-scaled_w/2, scaled_h/2]
+            ], dtype=np.float32)
+            
+            # Rotate and place
+            placed_corners = rotate_corners(corners, angle, x, y)
+            
+            # Validate placement - check bounds and overlap
+            valid = True
+            bbox_check = get_bounding_box_from_corners(placed_corners)
+            
+            # Check bounds with safety margin
+            safety = photo_gap * 0.5
+            if bbox_check['min_x'] < edge_margin - safety or bbox_check['max_x'] > canvas_w - edge_margin + safety or \
+               bbox_check['min_y'] < edge_margin - safety or bbox_check['max_y'] > canvas_h - edge_margin + safety:
+                valid = False
+            
+            if valid:
+                for p in placed:
+                    if not check_no_overlap_corners(placed_corners, p['corners'], photo_gap):
+                        valid = False
+                        break
+            
+            if valid:
+                placed.append({
+                    'min_x': placed_corners[:, 0].min(),
+                    'max_x': placed_corners[:, 0].max(),
+                    'min_y': placed_corners[:, 1].min(),
+                    'max_y': placed_corners[:, 1].max(),
+                    'center_x': x,
+                    'center_y': y,
+                    'corners': placed_corners,
+                    'rotation': angle
+                })
+                
+                kps = [(placed_corners[i][0], placed_corners[i,1]) for i in range(4)]
+                infos.append({
+                    'x_center': sum(k[0] for k in kps) / 4 / canvas_w,
+                    'y_center': sum(k[1] for k in kps) / 4 / canvas_h,
+                    'keypoints': kps,
+                    'fill_area': polygon_area(placed_corners)
+                })
+            
+            idx += 1
+    
+    # Final validation - ensure all corners are well within bounds
+    validated = []
+    validated_infos = []
+    
+    safe_margin = edge_margin * 0.5  # Photos must stay this far from edge
+    for p, info in zip(placed, infos):
+        corners = p['corners']
+        corners_min_x = corners[:, 0].min()
+        corners_max_x = corners[:, 0].max()
+        corners_min_y = corners[:, 1].min()
+        corners_max_y = corners[:, 1].max()
+        
+        # Check all four corners are within safe bounds
+        if (corners_min_x >= safe_margin and corners_max_x <= canvas_w - safe_margin and
+            corners_min_y >= safe_margin and corners_max_y <= canvas_h - safe_margin):
+            validated.append(p)
+            validated_infos.append(info)
+    
+    return (validated, validated_infos) if validated else None
+
+
+def pack_bottom_up(photos, photo_bboxes, canvas_w, canvas_h, edge_margin, photo_gap, max_shadow_extent):
+    """Pack photos from bottom up, filling rows with maximum fill."""
+    num_photos = len(photos)
+    if num_photos == 0:
+        return None
+    
+    avail_w = canvas_w - 2 * edge_margin
+    avail_h = canvas_h - 2 * edge_margin
+    
+    # Sort photos by aspect ratio (portrait vs landscape)
+    photo_order = sorted(range(num_photos), key=lambda i: photo_bboxes[i]['h'] / max(1, photo_bboxes[i]['w']))
+    
+    # Bin packing into rows
+    rows = []
+    current_row = []
+    current_width = 0
+    
+    for idx in photo_order:
+        bbox = photo_bboxes[idx]
+        w, h = bbox['w'], bbox['h']
+        
+        if not current_row or current_width + photo_gap + w <= avail_w:
+            current_row.append(idx)
+            current_width += w + (photo_gap if len(current_row) > 1 else 0)
+        else:
+            rows.append(current_row)
+            current_row = [idx]
+            current_width = w
+    
+    if current_row:
+        rows.append(current_row)
+    
+    # Calculate scale for each row
+    total_scaled_h = 0
+    row_scales = []
+    row_max_heights = []
+    
+    for row in rows:
+        max_h_in_row = max(photo_bboxes[i]['h'] for i in row)
+        total_w_in_row = sum(photo_bboxes[i]['w'] for i in row) + (len(row) - 1) * photo_gap
+        
+        # Scale to fit width first
+        scale_w = avail_w / total_w_in_row if total_w_in_row > 0 else 1.0
+        
+        # Scale to fit height
+        target_h = avail_h * 0.98 / len(rows)
+        scale_h = target_h / max_h_in_row if max_h_in_row > 0 else 1.0
+        
+        # Use smaller scale to fit both dimensions
+        scale = min(scale_w, scale_h, 1.0)  # Don't upscale beyond original size
+        
+        row_scales.append(scale)
+        row_max_heights.append(max_h_in_row)
+        total_scaled_h += max_h_in_row * scale + photo_gap
+    
+    total_scaled_h -= photo_gap  # Remove last gap
+    
+    # If too tall, scale down proportionally
+    if total_scaled_h > avail_h:
+        height_scale = avail_h / total_scaled_h
+        row_scales = [s * height_scale for s in row_scales]
+    
+    # Place photos
+    y = canvas_h - edge_margin
+    placed = []
+    infos = []
+    
+    for row_idx, row in enumerate(rows):
+        scale = row_scales[row_idx]
+        row_max_h = row_max_heights[row_idx]
+        
+        x = edge_margin
+        scaled_row_max_h = row_max_h * scale
+        
+        for idx in row:
+            bbox = photo_bboxes[idx]
+            corners = bbox['corners'].copy()
+            
+            scaled_w = bbox['w'] * scale
+            scaled_h = bbox['h'] * scale
+            
+            px = x + scaled_w / 2
+            py = y - scaled_row_max_h / 2
+            
+            bbox_min_x = corners[:, 0].min()
+            bbox_min_y = corners[:, 1].min()
+            
+            placed_corners = np.zeros_like(corners)
+            placed_corners[:, 0] = px - scaled_w/2 + (corners[:, 0] - bbox_min_x) * scale
+            placed_corners[:, 1] = py - scaled_h/2 + (corners[:, 1] - bbox_min_y) * scale
+            
+            placed.append({
+                'min_x': placed_corners[:, 0].min(),
+                'max_x': placed_corners[:, 0].max(),
+                'min_y': placed_corners[:, 1].min(),
+                'max_y': placed_corners[:, 1].max(),
+                'center_x': px,
+                'center_y': py,
+                'corners': placed_corners
+            })
+            
+            kps = [(placed_corners[i][0], placed_corners[i][1]) for i in range(4)]
+            infos.append({
+                'x_center': sum(k[0] for k in kps) / 4 / canvas_w,
+                'y_center': sum(k[1] for k in kps) / 4 / canvas_h,
+                'keypoints': kps,
+                'fill_area': polygon_area(placed_corners)
+            })
+            
+            x += scaled_w + photo_gap
+        
+        y -= scaled_row_max_h + photo_gap
+    
+    # Validate placement
+    for p in placed:
+        c = p['corners']
+        if c[:, 0].min() < edge_margin or c[:, 0].max() > canvas_w - edge_margin or \
+           c[:, 1].min() < edge_margin or c[:, 1].max() > canvas_h - edge_margin:
+            return None  # Invalid placement
+    
+    return placed, infos if placed else None
+
+
+def render_scene(config, sources, requested_photos=None):
+    """Render scene with photos placed flat, then apply global perspective transform.
+    
+    Steps:
+    1. Create high-res flat canvas (2x final size for quality)
+    2. Place photos flat (no perspective warping per photo)
+    3. Apply global perspective transform to simulate camera angle
+    4. Downsample to final size
+    5. Calculate keypoints from final transformed positions
+    """
+    # Final output size: 4:3 ratio, at least 2000x3000
+    final_h = 3000
+    final_w = int(final_h * 4 / 3)  # 4000
+    
+    # High-res canvas for better quality and to ensure perspective warp
+    # doesn't crop into valid content. Use 3x resolution to ensure the
+    # warped image can be cropped to final size with no black edges.
+    scale_factor = 3
+    canvas_w = final_w * scale_factor
+    canvas_h = final_h * scale_factor
     
     # Create background
     bg_gen = BackgroundGenerator()
-    bg = bg_gen.generate(w, h)
+    bg = bg_gen.generate(canvas_w, canvas_h)
     bg = apply_luma_gradient(bg)
     
     # Number of photos
-    num_photos = random.randint(config.num_photos_min, config.num_photos_max)
+    if requested_photos is not None:
+        num_photos = requested_photos
+    else:
+        num_photos = random.randint(config.num_photos_min, config.num_photos_max)
+    num_photos = min(num_photos, len(sources))
     
     # Sample sources
     if len(sources) >= num_photos:
@@ -688,69 +1762,189 @@ def render_scene(config, sources):
     else:
         sampled = (sources * (num_photos // len(sources) + 1))[:num_photos]
     
-    # Process photos
+    # Larger margin to prevent photos going off edge after perspective transform
+    # The 3x scale_factor gives us room, but we need safety margin for global warp
+    edge_margin = 120 * scale_factor  # Safe margin from edge
+    photo_gap = 45 * scale_factor  # Larger gap to prevent apparent intersections
+    
+    avail_w = canvas_w - 2 * edge_margin
+    avail_h = canvas_h - 2 * edge_margin
+    
+    # Single photo: maximize fill
+    if num_photos == 1:
+        ideal_size = min(avail_w, avail_h) * 0.98
+        target_size = int(ideal_size)
+        base_min = max(1600, int(target_size * 0.95))
+        base_max = max(base_min + 400, int(target_size * 1.05))
+        
+        photo, corners, shadow_mask, original_photo, img_size = process_photo(str(sampled[0]), base_min, base_max)
+        if photo is None:
+            return bg, [], (final_w, final_h)
+        
+        photo_h, photo_w = photo.shape[:2]
+        
+        # Use much more conservative fill to account for rotation and perspective
+        # At 20 degrees rotation, photos extend ~6% beyond their bounding box
+        # We need room for both rotation AND perspective distortion
+        fill_factor = 0.75  # Conservative to ensure corners stay within bounds
+        scale_x = avail_w * fill_factor / photo_w
+        scale_y = avail_h * fill_factor / photo_h
+        scale = min(scale_x, scale_y)
+        
+        # Random rotation (-20 to +20 degrees)
+        angle = random.uniform(-20, 20)
+        
+        cx, cy = canvas_w / 2, canvas_h / 2
+        
+        # Create scaled corners centered at origin
+        scaled_corners = np.array([
+            [-photo_w * scale / 2, -photo_h * scale / 2],
+            [photo_w * scale / 2, -photo_h * scale / 2],
+            [photo_w * scale / 2, photo_h * scale / 2],
+            [-photo_w * scale / 2, photo_h * scale / 2]
+        ], dtype=np.float32)
+        
+        # Rotate then place
+        new_corners = rotate_corners(scaled_corners, angle, cx, cy)
+        
+        # Final bounds check - ensure rotated corners stay within canvas
+        # Allow substantial margin for perspective transform headroom
+        safety_margin = edge_margin * 1.5
+        
+        if (new_corners[:, 0].min() < safety_margin or new_corners[:, 0].max() > canvas_w - safety_margin or
+            new_corners[:, 1].min() < safety_margin or new_corners[:, 1].max() > canvas_h - safety_margin):
+            # Photo would go off edge after rotation, scale it down
+            # Scale down photo so rotated corners fit safely within canvas
+            # Account for rotation (6% at 20 degrees) with safety margin
+            rotation_extension = 1.08
+            max_allowed_size = (canvas_w - 2 * safety_margin) / rotation_extension
+            
+            # Calculate how much we need to scale
+            current_max_dim = max(new_corners[:, 0].max() - new_corners[:, 0].min(),
+                                  new_corners[:, 1].max() - new_corners[:, 1].min())
+            if current_max_dim > max_allowed_size:
+                scale *= max_allowed_size / current_max_dim
+            
+            # Recalculate corners with adjusted scale
+            scaled_corners = np.array([
+                [-photo_w * scale / 2, -photo_h * scale / 2],
+                [photo_w * scale / 2, -photo_h * scale / 2],
+                [photo_w * scale / 2, photo_h * scale / 2],
+                [-photo_w * scale / 2, photo_h * scale / 2]
+            ], dtype=np.float32)
+            new_corners = rotate_corners(scaled_corners, angle, cx, cy)
+        
+        # Recomposite on fresh background
+        bg = bg_gen.generate(canvas_w, canvas_h)
+        bg = apply_luma_gradient(bg)
+        bg = composite_rotated_photo(bg, original_photo, new_corners, with_effects=False)
+        
+        # Apply global perspective transform
+        # Pass scale_factor so the transform can crop appropriately
+        placed_info_list = [{'corners': new_corners.copy()}]
+        bg, transformed_corners_list = apply_global_perspective_transform(
+            bg, placed_info_list, final_w, final_h, scale_factor
+        )
+        
+        # Keypoints are already in output coordinate space from transform
+        info = {
+            'keypoints': [(transformed_corners_list[0][i, 0], transformed_corners_list[0][i, 1]) for i in range(4)],
+            'fill_area': polygon_area(transformed_corners_list[0])
+        }
+        
+        return bg, [info], (final_w, final_h)
+    
+    # Multiple photos: simple grid placement without binary search
+    cols = int(math.ceil(math.sqrt(num_photos)))
+    rows = int(math.ceil(num_photos / cols))
+    
+    # Optimize grid for different photo counts
+    if num_photos == 2:
+        cols, rows = 2, 1
+    elif num_photos == 3:
+        cols, rows = 3, 1
+    elif num_photos == 5:
+        cols, rows = 3, 2
+    elif num_photos == 6:
+        cols, rows = 3, 2
+    elif num_photos == 7:
+        cols, rows = 4, 2
+    elif num_photos == 8:
+        cols, rows = 4, 2
+    
+    # Simple fixed size based on available space - conservatively sized
+    # Account for rotation (6% at 20 degrees) and gap between photos
+    rotation_safety = 1.10
+    gap_safety = photo_gap * 2  # Extra safety for gaps
+    
+    cell_w = (avail_w - gap_safety - (cols - 1) * photo_gap) / cols / rotation_safety
+    cell_h = (avail_h - gap_safety - (rows - 1) * photo_gap) / rows / rotation_safety
+    target_size = int(min(cell_w, cell_h))
+    base_min = max(1200, int(target_size * 0.85))
+    base_max = max(base_min + 400, int(target_size * 1.15))
+    
     photos = []
     for path in sampled:
-        photo, corners, shadow_mask = process_photo(path, config.min_photo_size, config.max_photo_size)
+        photo, corners, shadow_mask, original_photo, img_size = process_photo(str(path), base_min, base_max)
         if photo is not None and photo.shape[0] > 50 and photo.shape[1] > 50:
-            photos.append((photo, corners, shadow_mask))
+            photos.append({
+                'photo': photo,
+                'corners': corners,
+                'shadow_mask': shadow_mask,
+                'original_photo': original_photo,
+                'img_size': img_size
+            })
     
-    # Sort by area (larger first)
-    photos.sort(key=lambda p: p[0].shape[0] * p[0].shape[1], reverse=True)
+    if len(photos) < num_photos:
+        photos = (photos * (num_photos // len(photos) + 1))[:num_photos]
     
-    # Place photos
-    placed = []
-    infos = []
+    photo_bboxes = []
+    for photo_data in photos:
+        corners = photo_data['corners']
+        bbox = get_photo_bbox(corners, 0)
+        photo_bboxes.append(bbox)
     
-    for photo, corners, shadow_mask in photos:
-        ph, pw = photo.shape[:2]
-        
-        # Use photo size for collision detection
-        pos = find_position(pw, ph, placed, margin=6)
-        if pos is None:
-            continue
-        
-        px, py = pos
-        
-        # Apply shadow first if exists, then composite photo
-        if shadow_mask is not None:
-            bg = composite_with_shadow(bg, photo, shadow_mask, (px, py))
-        else:
-            bg = composite_overlay(bg, photo, (px, py))
-        
-        placed.append((px, py, pw, ph))
-        
-        # Keypoints at actual warped corners (corners are in local coords)
-        # corners order: [TL, TR, BR, BL]
-        kps = [
-            (px + corners[0][0], py + corners[0][1]),  # TL
-            (px + corners[1][0], py + corners[1][1]),  # TR
-            (px + corners[2][0], py + corners[2][1]),  # BR
-            (px + corners[3][0], py + corners[3][1]),  # BL
-        ]
-        
-        # Calculate center from warped corners
-        xc = sum(c[0] for c in kps) / 4 + px
-        yc = sum(c[1] for c in kps) / 4 + py
-        
-        # Calculate bounding box for the box format
-        min_x = min(k[0] for k in kps)
-        max_x = max(k[0] for k in kps)
-        min_y = min(k[1] for k in kps)
-        max_y = max(k[1] for k in kps)
-        
-        bw_box = (max_x - min_x) / 1920
-        bh_box = (max_y - min_y) / 1080
-        
-        infos.append({
-            'x_center': xc / 1920,
-            'y_center': yc / 1080,
-            'width': bw_box,
-            'height': bh_box,
-            'keypoints': kps
-        })
+    result = pack_grid(photos, photo_bboxes, canvas_w, canvas_h, edge_margin, photo_gap, 0)
     
-    return bg, infos
+    if result is None:
+        return bg, [], (final_w, final_h)
+    
+    placed, infos = result
+    
+    # Recomposite photos on fresh background (FLAT - no per-photo perspective)
+    bg = bg_gen.generate(canvas_w, canvas_h)
+    bg = apply_luma_gradient(bg)
+    
+    for i, photo_data in enumerate(photos[:len(placed)]):
+        corners = placed[i]['corners']
+        bg = composite_rotated_photo(bg, photo_data['original_photo'], corners, with_effects=False)
+    
+    # Apply global perspective transform to simulate camera viewing angle
+    # Pass scale_factor so the transform can crop appropriately
+    transformed_corners_list = []
+    placed_info_list = []
+    for i, p in enumerate(placed):
+        placed_info_list.append({'corners': p['corners'].copy()})
+    
+    bg, transformed_corners_list = apply_global_perspective_transform(
+        bg, placed_info_list, final_w, final_h, scale_factor
+    )
+    
+    # Update infos with transformed keypoints (already in output coordinates)
+    for i, info in enumerate(infos):
+        if i < len(transformed_corners_list):
+            tc = transformed_corners_list[i]
+            # Corners are already in output coordinate space
+            info['keypoints'] = [(tc[j, 0], tc[j, 1]) for j in range(4)]
+            info['fill_area'] = polygon_area(tc)
+    
+    # Downsample background to final resolution
+    bg = cv2.resize(bg, (final_w, final_h), interpolation=cv2.INTER_AREA)
+    
+    fill_pct = sum(info['fill_area'] for info in infos) / (final_w * final_h) * 100
+    print(f"  Final: fill={fill_pct:.1f}%, photos={len(placed)}")
+    
+    return bg, infos, (final_w, final_h)
 
 
 class DatasetGenerator:
@@ -788,7 +1982,7 @@ class DatasetGenerator:
     
     def _generate_images(self, img_dir, lbl_dir, num, prefix):
         for i in range(num):
-            bg, infos = render_scene(self.config, self.sources)
+            bg, infos, canvas_size = render_scene(self.config, self.sources)
             
             pil_img = Image.fromarray(cv2.cvtColor(bg, cv2.COLOR_BGR2RGB))
             
@@ -796,17 +1990,24 @@ class DatasetGenerator:
             pil_img.save(img_path, quality=95)
             
             lbl_path = lbl_dir / f"{prefix}_{i:05d}.txt"
-            self._save_labels(lbl_path, infos)
+            self._save_labels(lbl_path, infos, canvas_size)
             
             if (i + 1) % 100 == 0:
                 print(f"  {i + 1}/{num}")
     
-    def _save_labels(self, path, infos):
+    def _save_labels(self, path, infos, canvas_size):
+        canvas_w, canvas_h = canvas_size
         with open(path, 'w') as f:
             for p in infos:
-                line = f"0 {p['x_center']:.6f} {p['y_center']:.6f} {p['width']:.6f} {p['height']:.6f}"
-                for kx, ky in p['keypoints']:
-                    line += f" {kx / 1920:.6f} {ky / 1080:.6f} 2"
+                kps = p['keypoints']
+                x_center = sum(k[0] for k in kps) / 4 / canvas_w
+                y_center = sum(k[1] for k in kps) / 4 / canvas_h
+                width = (max(k[0] for k in kps) - min(k[0] for k in kps)) / canvas_w
+                height = (max(k[1] for k in kps) - min(k[1] for k in kps)) / canvas_h
+                
+                line = f"0 {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
+                for kx, ky in kps:
+                    line += f" {kx / canvas_w:.6f} {ky / canvas_h:.6f} 2"
                 line += "\n"
                 f.write(line)
     
@@ -836,37 +2037,41 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-train", type=int, default=DEFAULT_CONFIG["num_train_images"])
     parser.add_argument("--num-val", type=int, default=DEFAULT_CONFIG["num_val_images"])
-    parser.add_argument("--source-images", type=str, default=DEFAULT_CONFIG["source_images"])
-    parser.add_argument("--output", type=str, default=DEFAULT_CONFIG["output_dir"])
     parser.add_argument("--min-photos", type=int, default=DEFAULT_CONFIG["num_photos_min"])
     parser.add_argument("--max-photos", type=int, default=DEFAULT_CONFIG["num_photos_max"])
+    parser.add_argument("--min-size", type=int, default=DEFAULT_CONFIG["min_photo_size"])
+    parser.add_argument("--max-size", type=int, default=DEFAULT_CONFIG["max_photo_size"])
+    parser.add_argument("--source-dir", type=str, default=DEFAULT_CONFIG["source_images"])
+    parser.add_argument("--output-dir", type=str, default=DEFAULT_CONFIG["output_dir"])
     parser.add_argument("--seed", type=int, default=DEFAULT_CONFIG["seed"])
-    
     args = parser.parse_args()
     
-    src_dir = Path(args.source_images)
-    if not src_dir.exists():
-        print(f"Error: {src_dir} not found")
-        return
-    
-    sources = list(src_dir.glob("*.jpg")) + list(src_dir.glob("*.jpeg")) + \
-              list(src_dir.glob("*.png")) + list(src_dir.glob("*.webp"))
-    
-    print(f"Found {len(sources)} source images")
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     
     config = Config(
         num_train_images=args.num_train,
         num_val_images=args.num_val,
-        output_dir=args.output,
         num_photos_min=args.min_photos,
         num_photos_max=args.max_photos,
+        min_photo_size=args.min_size,
+        max_photo_size=args.max_size,
+        source_images=args.source_dir,
+        output_dir=args.output_dir,
         seed=args.seed,
     )
     
-    random.seed(config.seed)
-    np.random.seed(config.seed)
+    source_dir = Path(args.source_dir)
+    sources = list(source_dir.glob('*.jpg')) + list(source_dir.glob('*.jpeg')) + list(source_dir.glob('*.png')) + list(source_dir.glob('*.webp'))
     
-    DatasetGenerator(config, sources).generate()
+    print(f"Found {len(sources)} source images in {source_dir}")
+    
+    if len(sources) < 5:
+        print("ERROR: Need at least 5 source images")
+        return
+    
+    generator = DatasetGenerator(config, sources)
+    generator.generate()
 
 
 if __name__ == "__main__":
