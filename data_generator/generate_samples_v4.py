@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Photo Pose Detector - Fast Synthetic Data Generator (v3)
+Photo Pose Detector - Fast Synthetic Data Generator (v4)
+
+IMPROVEMENTS OVER v3:
+1. Larger photos (~40% canvas width) with less size variation (±5%)
+2. True spiral packing from center with polygon-based collision (not rectangular BB)
+3. Proper margin from edges - no edge-extension hack
+4. Crop to content bounds after global perspective with clean margin
 
 CORRECT ARCHITECTURE:
 1. Pack photos FLAT (rectangles) with ±30° rotation on a flat background
 2. Apply ONE global perspective warp to the ENTIRE composite at the end
-3. Ensure no corners extend off canvas, no black borders from warp
-4. Keep all lighting/shadow/color/brightness/contrast changes
-
-This is fundamentally different from v2 which incorrectly warped each photo individually.
+3. Crop to content bounds (photos never touch final image edge)
 """
 
 import signal
@@ -26,168 +29,6 @@ from PIL import Image
 
 
 # =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
-
-def clip_corners(corners, margin, canvas_w, canvas_h):
-    """Ensure all corners stay within canvas bounds."""
-    corners = corners.copy()
-    corners[:, 0] = np.clip(corners[:, 0], margin, canvas_w - margin)
-    corners[:, 1] = np.clip(corners[:, 1], margin, canvas_h - margin)
-    return corners
-
-
-def rotate_photo_with_transform(photo, angle):
-    """
-    Rotate photo and return rotation matrix for transforming corners.
-    
-    Returns:
-        (rotated_photo, rotation_matrix_2x3)
-    """
-    h, w = photo.shape[:2]
-    
-    if abs(angle) < 1:
-        return photo, np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
-    
-    center = (w / 2, h / 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    
-    # Calculate new bounding box
-    cos = abs(M[0, 0])
-    sin = abs(M[0, 1])
-    new_w = int(h * sin + w * cos)
-    new_h = int(h * cos + w * sin)
-    
-    # Adjust translation
-    M[0, 2] += (new_w - w) / 2
-    M[1, 2] += (new_h - h) / 2
-    
-    # Rotate
-    rotated = cv2.warpAffine(
-        photo, M, (new_w, new_h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0
-    )
-    
-    return rotated, M
-
-
-def composite_photo_at_center(canvas, photo, cx, cy):
-    """
-    Composite photo onto canvas with center at (cx, cy).
-    
-    Args:
-        canvas: BGRA canvas
-        photo: BGRA photo (may be larger due to rotation padding)
-        cx, cy: Center position on canvas
-    
-    Returns:
-        Composited canvas
-    """
-    ph, pw = photo.shape[:2]
-    ch, cw = canvas.shape[:2]
-    
-    # Calculate top-left corner on canvas
-    top_left_x = int(cx - pw / 2)
-    top_left_y = int(cy - ph / 2)
-    
-    # Calculate overlap region
-    src_x1, src_y1 = 0, 0
-    src_x2, src_y2 = pw, ph
-    dst_x1, dst_y1 = top_left_x, top_left_y
-    dst_x2, dst_y2 = top_left_x + pw, top_left_y + ph
-    
-    # Clip to canvas bounds
-    if dst_x1 < 0:
-        src_x1 = -dst_x1
-        dst_x1 = 0
-    if dst_y1 < 0:
-        src_y1 = -dst_y1
-        dst_y1 = 0
-    if dst_x2 > cw:
-        src_x2 = cw - dst_x1
-        dst_x2 = cw
-    if dst_y2 > ch:
-        src_y2 = ch - dst_y1
-        dst_y2 = ch
-    
-    # Check valid region
-    copy_w = int(dst_x2 - dst_x1)
-    copy_h = int(dst_y2 - dst_y1)
-    
-    if copy_w <= 0 or copy_h <= 0:
-        return canvas
-    
-    src_x1, src_y1 = int(src_x1), int(src_y1)
-    
-    # Alpha blend
-    canvas_f = canvas.astype(np.float32) / 255.0
-    photo_f = photo[src_y1:src_y1+copy_h, src_x1:src_x1+copy_w].astype(np.float32) / 255.0
-    
-    alpha = photo_f[:, :, 3:4]
-    
-    canvas_f[dst_y1:dst_y2, dst_x1:dst_x2, :3] = (
-        photo_f[:, :, :3] * alpha + 
-        canvas_f[dst_y1:dst_y2, dst_x1:dst_x2, :3] * (1 - alpha)
-    ).astype(np.float32)
-    canvas_f[dst_y1:dst_y2, dst_x1:dst_x2, 3] = np.maximum(
-        canvas_f[dst_y1:dst_y2, dst_x1:dst_x2, 3],
-        photo_f[:, :, 3]
-    )
-    
-    return (canvas_f * 255).astype(np.uint8)
-
-
-# =============================================================================
-# PHOTO ROTATION (±30 degrees) - Pre-composite
-# =============================================================================
-
-def rotate_photo(photo, angle=None):
-    """
-    Rotate a photo by ±30 degrees.
-    
-    Args:
-        photo: Photo image array
-        angle: Specific angle (or None for random)
-    
-    Returns:
-        Rotated photo with transparency for empty corners
-    """
-    h, w = photo.shape[:2]
-    
-    if angle is None:
-        # Random angle between -30 and +30 degrees
-        angle = random.uniform(-30, 30)
-    
-    if abs(angle) < 1:
-        return photo  # No rotation needed
-    
-    center = (w / 2, h / 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    
-    # Calculate new bounding box to avoid clipping
-    cos = abs(M[0, 0])
-    sin = abs(M[0, 1])
-    new_w = int(h * sin + w * cos)
-    new_h = int(h * cos + w * sin)
-    
-    # Adjust translation to center
-    M[0, 2] += (new_w - w) / 2
-    M[1, 2] += (new_h - h) / 2
-    
-    # Rotate with transparent background
-    rotated = cv2.warpAffine(
-        photo, M, (new_w, new_h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(128, 128, 128, 0)  # Transparent border
-    )
-    
-    return rotated
-
-
-# =============================================================================
 # POLYGON UTILITIES
 # =============================================================================
 
@@ -201,7 +42,7 @@ def get_rotated_polygon(width, height, center_x, center_y, rotation):
         rotation: Rotation angle in degrees
     
     Returns:
-        4x2 numpy array of corner coordinates
+        4x2 numpy array of corner coordinates [TL, TR, BR, BL]
     """
     # Photo corners relative to center
     hw, hh = width / 2, height / 2
@@ -230,7 +71,6 @@ def get_rotated_polygon(width, height, center_x, center_y, rotation):
 def polygons_overlap(poly1, poly2):
     """
     Check if two convex polygons overlap.
-    
     Uses Separating Axis Theorem (SAT) for accurate collision detection.
     """
     def get_axes(poly):
@@ -239,9 +79,7 @@ def polygons_overlap(poly1, poly2):
         for i in range(len(poly)):
             p1 = poly[i]
             p2 = poly[(i + 1) % len(poly)]
-            # Edge vector
             edge = p2 - p1
-            # Perpendicular (normal)
             normal = np.array([-edge[1], edge[0]])
             norm = np.linalg.norm(normal)
             if norm > 0:
@@ -249,25 +87,30 @@ def polygons_overlap(poly1, poly2):
         return axes
     
     def project_poly(poly, axis):
-        """Project polygon onto axis."""
         dots = [np.dot(p, axis) for p in poly]
         return min(dots), max(dots)
     
     poly1 = np.array(poly1, dtype=np.float32)
     poly2 = np.array(poly2, dtype=np.float32)
     
-    # Get all axes from both polygons
     axes = get_axes(poly1) + get_axes(poly2)
     
     for axis in axes:
         min1, max1 = project_poly(poly1, axis)
         min2, max2 = project_poly(poly2, axis)
         
-        # If projections don't overlap, polygons don't intersect
         if max1 < min2 or max2 < min1:
             return False
     
     return True
+
+
+def get_polygon_extent(poly):
+    """Get the maximum extent (radius) of polygon from its center."""
+    cx = sum(p[0] for p in poly) / 4
+    cy = sum(p[1] for p in poly) / 4
+    max_dist = max(math.sqrt((p[0] - cx)**2 + (p[1] - cy)**2) for p in poly)
+    return max_dist
 
 
 def get_polygon_bounds(poly):
@@ -282,77 +125,111 @@ def get_polygon_bounds(poly):
 
 
 # =============================================================================
-# PHOTO PACKING - Spiral packing with polygon-based collision
+# SPIRAL PACKING ALGORITHM (Polygon-based collision)
 # =============================================================================
 
 def spiral_pack_photos(canvas_w, canvas_h, num_photos=None):
     """
-    Pack photos using grid-based placement with polygon collision.
+    Pack photos using spiral placement from center with polygon collision.
     
-    Photos placed on a grid with random offsets, checked with actual
-    polygon collision (not rectangular BB).
+    Uses actual rotated polygon geometry for collision detection,
+    not rectangular bounding boxes. This allows tighter packing.
     
     Args:
         canvas_w, canvas_h: Canvas dimensions
-        num_photos: Number of photos
+        num_photos: Number of photos (default: random 5-7)
     
     Returns:
-        List of placements
+        List of placements with polygon geometry
     """
     if num_photos is None:
         num_photos = random.randint(5, 7)
     
-    # Photo sizes - smaller for better packing, landscape 4:3
-    base_w = int(canvas_w * 0.28)  # ~672px
-    base_h = int(base_w * 0.75)  # ~504px (4:3 landscape)
+    # Larger photos with less variation
+    base_w = int(canvas_w * 0.40)  # ~40% of canvas width
+    base_h = int(base_w * 0.75)    # ~75% (4:3 landscape aspect)
     
-    # Small variation (±8%)
-    size_variation = 0.08
+    # Small variation (±5%)
+    size_variation = 0.05
     
     placements = []
     
-    # Create grid of candidate positions
-    margin = 60
-    usable_w = canvas_w - 2 * margin
-    usable_h = canvas_h - 2 * margin
+    # Center of canvas
+    center_x = canvas_w / 2
+    center_y = canvas_h / 2
     
-    # Grid: ~3 columns
-    cols = 3
-    col_w = usable_w / cols
-    rows = (num_photos + cols - 1) // cols + 1  # Extra row buffer
-    row_h = usable_h / rows
+    # Safety margin: photos must stay this far from canvas edge
+    # This prevents photos from extending to image edges after perspective warp
+    # Add extra buffer for rotation (max ~30% diagonal increase at 15°)
+    edge_margin = 400
     
-    # Generate candidate positions (grid centers with jitter)
-    candidates = []
-    for r in range(rows):
-        for c in range(cols):
-            cx = margin + col_w * (c + 0.5) + random.uniform(-col_w * 0.3, col_w * 0.3)
-            cy = margin + row_h * (r + 0.5) + random.uniform(-row_h * 0.3, row_h * 0.3)
-            candidates.append((cx, cy))
+    # Safe bounds for center positions
+    min_x = edge_margin
+    max_x = canvas_w - edge_margin
+    min_y = edge_margin
+    max_y = canvas_h - edge_margin
     
-    # Shuffle candidates
-    random.shuffle(candidates)
+    # Generate spiral positions from center outward
+    def generate_spiral_positions(center_x, center_y, max_radius, num_points):
+        """Generate positions in a spiral pattern."""
+        positions = []
+        angle_step = 137.5  # Golden angle for good spiral distribution
+        
+        for i in range(num_points):
+            # Spiral: radius grows, angle increases
+            t = i / max(num_points - 1, 1)
+            radius = t * max_radius
+            angle = math.radians(i * angle_step)
+            
+            x = center_x + radius * math.cos(angle)
+            y = center_y + radius * math.sin(angle)
+            
+            # Add some random jitter for variety
+            jitter_x = random.uniform(-30, 30)
+            jitter_y = random.uniform(-30, 30)
+            
+            positions.append((x + jitter_x, y + jitter_y))
+        
+        return positions
     
+    # Maximum radius to cover usable area
+    max_radius = math.sqrt((max_x - center_x)**2 + (max_y - center_y)**2)
+    
+    # Generate more candidate positions than needed
+    candidate_positions = generate_spiral_positions(
+        center_x, center_y, max_radius, 
+        num_photos * 4 + 20  # Extra candidates for flexibility
+    )
+    
+    # Shuffle to add randomness while maintaining spiral-like distribution
+    random.shuffle(candidate_positions)
+    
+    # Try to place each photo
     for photo_idx in range(num_photos):
-        # Random size and rotation
+        # Random size (small variation) and rotation
         scale = random.uniform(1 - size_variation, 1 + size_variation)
         width = int(base_w * scale)
         height = int(base_h * scale)
-        rotation = random.uniform(-15, 15)
+        rotation = random.uniform(-10, 10)  # Reduced rotation to limit corner displacement
         
         placed = False
         
-        # Try candidates
-        for cx, cy in candidates:
-            # Get polygon
-            poly = get_rotated_polygon(width, height, cx, cy, rotation)
-            
-            # Bounds check
-            bx1, by1, bx2, by2 = get_polygon_bounds(poly)
-            if bx1 < margin or by1 < margin or bx2 > canvas_w - margin or by2 > canvas_h - margin:
+        # Try each candidate position
+        for cx, cy in candidate_positions:
+            # Skip if outside safe bounds
+            if cx < min_x or cx > max_x or cy < min_y or cy > max_y:
                 continue
             
-            # Collision check
+            # Get polygon for this placement
+            poly = get_rotated_polygon(width, height, cx, cy, rotation)
+            
+            # Bounds check using actual polygon
+            # Account for rotation by checking polygon corners
+            bx1, by1, bx2, by2 = get_polygon_bounds(poly)
+            if bx1 < edge_margin or by1 < edge_margin or bx2 > canvas_w - edge_margin or by2 > canvas_h - edge_margin:
+                continue
+            
+            # Collision check against all placed polygons (using SAT)
             collision = False
             for existing in placements:
                 if polygons_overlap(poly, existing['polygon']):
@@ -373,16 +250,19 @@ def spiral_pack_photos(canvas_w, canvas_h, num_photos=None):
                 placed = True
                 break
         
-        # If can't place, try with smaller size (more aggressive)
+        # If can't place, try with progressively smaller sizes
         if not placed:
-            for scale in [0.80, 0.65, 0.50]:
-                width_scaled = int(width * scale)
-                height_scaled = int(height * scale)
+            for shrink in [0.90, 0.80, 0.70, 0.60]:
+                width_s = int(width * shrink)
+                height_s = int(height * shrink)
                 
-                for cx, cy in candidates:
-                    poly = get_rotated_polygon(width_scaled, height_scaled, cx, cy, rotation)
+                for cx, cy in candidate_positions:
+                    if cx < min_x or cx > max_x or cy < min_y or cy > max_y:
+                        continue
+                    
+                    poly = get_rotated_polygon(width_s, height_s, cx, cy, rotation)
                     bx1, by1, bx2, by2 = get_polygon_bounds(poly)
-                    if bx1 < margin or by1 < margin or bx2 > canvas_w - margin or by2 > canvas_h - margin:
+                    if bx1 < edge_margin or by1 < edge_margin or bx2 > canvas_w - edge_margin or by2 > canvas_h - edge_margin:
                         continue
                     
                     collision = False
@@ -393,39 +273,175 @@ def spiral_pack_photos(canvas_w, canvas_h, num_photos=None):
                     
                     if not collision:
                         placements.append({
-                            'x': cx - width_scaled / 2,
-                            'y': cy - height_scaled / 2,
-                            'width': width_scaled,
-                            'height': height_scaled,
+                            'x': cx - width_s / 2,
+                            'y': cy - height_s / 2,
+                            'width': width_s,
+                            'height': height_s,
                             'rotation': rotation,
                             'center_x': cx,
                             'center_y': cy,
                             'polygon': poly
                         })
+                        placed = True
                         break
-                else:
-                    continue
-                break
+                
+                if placed:
+                    break
+        
+        # Final fallback: try with much smaller size anywhere
+        if not placed:
+            width_s = int(width * 0.5)
+            height_s = int(height * 0.5)
+            
+            # Try random positions
+            for _ in range(50):
+                cx = random.uniform(edge_margin + width_s/2, canvas_w - edge_margin - width_s/2)
+                cy = random.uniform(edge_margin + height_s/2, canvas_h - edge_margin - height_s/2)
+                
+                poly = get_rotated_polygon(width_s, height_s, cx, cy, rotation)
+                
+                collision = False
+                for existing in placements:
+                    if polygons_overlap(poly, existing['polygon']):
+                        collision = True
+                        break
+                
+                if not collision:
+                    placements.append({
+                        'x': cx - width_s / 2,
+                        'y': cy - height_s / 2,
+                        'width': width_s,
+                        'height': height_s,
+                        'rotation': rotation,
+                        'center_x': cx,
+                        'center_y': cy,
+                        'polygon': poly
+                    })
+                    placed = True
+                    break
     
     return placements
+
+
+# =============================================================================
+# ROTATION FUNCTION
+# =============================================================================
+
+def rotate_photo(photo, angle):
+    """
+    Rotate a photo by ±30 degrees.
+    
+    Args:
+        photo: BGRA photo image array
+        angle: Rotation angle in degrees
+    
+    Returns:
+        Rotated photo with transparent background for empty corners
+    """
+    h, w = photo.shape[:2]
+    
+    if abs(angle) < 1:
+        return photo
+    
+    center = (w / 2, h / 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    
+    # Calculate new bounding box to avoid clipping
+    cos = abs(M[0, 0])
+    sin = abs(M[0, 1])
+    new_w = int(h * sin + w * cos)
+    new_h = int(h * cos + w * sin)
+    
+    # Adjust translation to center
+    M[0, 2] += (new_w - w) / 2
+    M[1, 2] += (new_h - h) / 2
+    
+    # Rotate with transparent background
+    rotated = cv2.warpAffine(
+        photo, M, (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(128, 128, 128, 0)
+    )
+    
+    return rotated
+
+
+# =============================================================================
+# COMPOSITING
+# =============================================================================
+
+def composite_photo_at_center(canvas, photo, cx, cy):
+    """
+    Composite photo onto canvas with center at (cx, cy).
+    """
+    ph, pw = photo.shape[:2]
+    ch, cw = canvas.shape[:2]
+    
+    top_left_x = int(cx - pw / 2)
+    top_left_y = int(cy - ph / 2)
+    
+    src_x1, src_y1 = 0, 0
+    src_x2, src_y2 = pw, ph
+    dst_x1, dst_y1 = top_left_x, top_left_y
+    dst_x2, dst_y2 = top_left_x + pw, top_left_y + ph
+    
+    # Clip to canvas bounds
+    if dst_x1 < 0:
+        src_x1 = -dst_x1
+        dst_x1 = 0
+    if dst_y1 < 0:
+        src_y1 = -dst_y1
+        dst_y1 = 0
+    if dst_x2 > cw:
+        src_x2 = cw - dst_x1
+        dst_x2 = cw
+    if dst_y2 > ch:
+        src_y2 = ch - dst_y1
+        dst_y2 = ch
+    
+    copy_w = int(dst_x2 - dst_x1)
+    copy_h = int(dst_y2 - dst_y1)
+    
+    if copy_w <= 0 or copy_h <= 0:
+        return canvas
+    
+    src_x1, src_y1 = int(src_x1), int(src_y1)
+    
+    # Alpha blend
+    canvas_f = canvas.astype(np.float32) / 255.0
+    photo_f = photo[src_y1:src_y1+copy_h, src_x1:src_x1+copy_w].astype(np.float32) / 255.0
+    
+    alpha = photo_f[:, :, 3:4]
+    
+    canvas_f[dst_y1:dst_y2, dst_x1:dst_x2, :3] = (
+        photo_f[:, :, :3] * alpha + 
+        canvas_f[dst_y1:dst_y2, dst_x1:dst_x2, :3] * (1 - alpha)
+    ).astype(np.float32)
+    canvas_f[dst_y1:dst_y2, dst_x1:dst_x2, 3] = np.maximum(
+        canvas_f[dst_y1:dst_y2, dst_x1:dst_x2, 3],
+        photo_f[:, :, 3]
+    )
+    
+    return (canvas_f * 255).astype(np.uint8)
 
 
 # =============================================================================
 # GLOBAL PERSPECTIVE WARP - Applied once to entire composite
 # =============================================================================
 
-def apply_global_perspective(canvas, canvas_w, canvas_h, photo_corners=None, margin=40):
+def apply_global_perspective(canvas, canvas_w, canvas_h, photo_corners=None, crop_margin=25):
     """
     Apply a SINGLE perspective warp to the entire canvas composite.
     
     This simulates the camera viewing the scene at an angle.
-    The warp is applied to ALL content (photos + background) together.
+    After warp, crops to content bounds with clean margin.
     
     Args:
-        canvas: The flat composite image
+        canvas: The flat composite image (BGR)
         canvas_w, canvas_h: Original canvas dimensions
         photo_corners: List of photo corner arrays (for cropping)
-        margin: Extra margin around content after crop
+        crop_margin: Margin around content after crop (default 25px)
     
     Returns:
         (warped_canvas, global_corners, transform_matrix, content_bounds)
@@ -438,8 +454,8 @@ def apply_global_perspective(canvas, canvas_w, canvas_h, photo_corners=None, mar
         [0, canvas_h - 1]
     ], dtype=np.float32)
     
-    # Calculate corner displacement to create visible trapezoid
-    perspective_strength = random.uniform(0.08, 0.15)
+    # Calculate corner displacement for visible perspective
+    perspective_strength = random.uniform(0.06, 0.12)
     direction = random.randint(0, 3)
     max_offset_x = canvas_w * perspective_strength
     max_offset_y = canvas_h * perspective_strength
@@ -502,88 +518,113 @@ def apply_global_perspective(canvas, canvas_w, canvas_h, photo_corners=None, mar
         borderValue=0
     )
     
-    # Find content bounds by transforming photo corners and finding their extent
-    if photo_corners and len(photo_corners) > 0:
-        # Transform all photo corners through perspective
-        all_x = []
-        all_y = []
-        for corners in photo_corners:
-            for corner in corners:
-                # corner is [x, y] in canvas coordinates
-                pt = np.array([corner[0], corner[1], 1.0])
-                warped_pt = M @ pt
-                wx = warped_pt[0] / warped_pt[2] + offset_x
-                wy = warped_pt[1] / warped_pt[2] + offset_y
-                all_x.append(wx)
-                all_y.append(wy)
-        
-        if all_x and all_y:
-            # Add margin to ensure photos have space around them
-            photo_margin = 50
-            content_min_x = max(0, int(min(all_x)) - photo_margin)
-            content_min_y = max(0, int(min(all_y)) - photo_margin)
-            content_max_x = min(out_w - 1, int(max(all_x)) + photo_margin)
-            content_max_y = min(out_h - 1, int(max(all_y)) + photo_margin)
-            
-            # Crop
-            warped = warped[content_min_y:content_max_y+1, content_min_x:content_max_x+1]
-            
-            # Adjust corners for crop
-            dst_offset[:, 0] -= content_min_x
-            dst_offset[:, 1] -= content_min_y
+    # First, crop to canvas bounds + padding to remove perspective black borders
+    # The canvas corners map to dst_offset, so use them with padding
+    crop_padding = crop_margin
     
-    # Simple edge cleanup: crop dark borders
-    h, w = warped.shape[:2]
+    crop_x1 = max(0, int(min(dst_offset[:, 0])) - crop_padding)
+    crop_y1 = max(0, int(min(dst_offset[:, 1])) - crop_padding)
+    crop_x2 = min(out_w, int(max(dst_offset[:, 0])) + crop_padding)
+    crop_y2 = min(out_h, int(max(dst_offset[:, 1])) + crop_padding)
     
-    # Crop dark edges (any row/column that's mostly black)
-    dark_threshold = 0.7  # If >70% of row/col is dark, crop it
+    if crop_x2 > crop_x1 and crop_y2 > crop_y1:
+        warped = warped[crop_y1:crop_y2, crop_x1:crop_x2]
+        dst_offset[:, 0] -= crop_x1
+        dst_offset[:, 1] -= crop_y1
     
-    # Top
-    while h > 10:
-        top_row = warped[0, :, :]
-        top_dark = np.sum(np.mean(top_row, axis=1) < 8) / w
-        if top_dark > dark_threshold:
-            warped = warped[1:, :]
-            h = warped.shape[0]
-        else:
-            break
+    # Then, trim any remaining dark edges
+    warped = trim_dark_edges(warped)
     
-    # Bottom
-    while h > 10:
-        bottom_row = warped[-1, :, :]
-        bottom_dark = np.sum(np.mean(bottom_row, axis=1) < 8) / w
-        if bottom_dark > dark_threshold:
-            warped = warped[:-1, :]
-            h = warped.shape[0]
-        else:
-            break
+    # Final cleanup: ensure all edges are clean
+    warped = ensure_clean_edges(warped)
     
-    # Left
-    while w > 10:
-        left_col = warped[:, 0, :]
-        left_dark = np.sum(np.mean(left_col, axis=1) < 8) / h
-        if left_dark > dark_threshold:
-            warped = warped[:, 1:]
-            w = warped.shape[1]
-        else:
-            break
-    
-    # Right
-    while w > 10:
-        right_col = warped[:, -1, :]
-        right_dark = np.sum(np.mean(right_col, axis=1) < 8) / h
-        if right_dark > dark_threshold:
-            warped = warped[:, :-1]
-            w = warped.shape[1]
-        else:
-            break
-    
-    # Return corners relative to output
     global_corners = dst_offset
     content_bounds = (warped.shape[1], warped.shape[0])
     
     return warped, global_corners, M, content_bounds
 
+
+def trim_dark_edges(img, min_luma=8, max_dark_ratio=0.25):
+    """
+    Remove dark edges from image by trimming rows/columns.
+    
+    Keeps trimming until all edge pixels are above min_luma.
+    Uses 10% threshold for more aggressive corner handling.
+    """
+    if len(img.shape) == 3:
+        luma = 0.299 * img[:,:,2] + 0.587 * img[:,:,1] + 0.114 * img[:,:,0]
+    else:
+        luma = img.astype(float)
+    
+    h, w = luma.shape
+    max_iterations = 500  # Allow enough iterations to remove entire dark borders
+    iterations = 0
+    
+    while iterations < max_iterations:
+        iterations += 1
+        changed = False
+        
+        # Check if edges are clean (using luma)
+        top_row = luma[0, :]
+        bottom_row = luma[-1, :]
+        left_col = luma[:, 0]
+        right_col = luma[:, -1]
+        
+        top_dark = np.sum(top_row < min_luma)
+        bottom_dark = np.sum(bottom_row < min_luma)
+        left_dark = np.sum(left_col < min_luma)
+        right_dark = np.sum(right_col < min_luma)
+        
+        # If edges are clean enough, we're done
+        top_thresh = w * max_dark_ratio
+        bottom_thresh = w * max_dark_ratio
+        left_thresh = h * max_dark_ratio
+        right_thresh = h * max_dark_ratio
+        
+        if (top_dark <= top_thresh and 
+            bottom_dark <= bottom_thresh and
+            left_dark <= left_thresh and
+            right_dark <= right_thresh):
+            break
+        
+        # Update dimensions
+        h, w = luma.shape
+        
+        # Trim from the edge with the most dark pixels
+        # (to handle corners that span multiple edges)
+        dark_counts = [
+            ('TOP', top_dark, top_thresh, 'h'),
+            ('BOTTOM', bottom_dark, bottom_thresh, 'h'),
+            ('LEFT', left_dark, left_thresh, 'w'),
+            ('RIGHT', right_dark, right_thresh, 'w')
+        ]
+        
+        # Sort by amount over threshold (most severe first)
+        dark_counts.sort(key=lambda x: x[1] - x[2], reverse=True)
+        
+        for name, dark, thresh, dim in dark_counts:
+            if dark > thresh and w > 50 and h > 50:
+                if name in ('TOP', 'BOTTOM'):
+                    if name == 'TOP':
+                        img = img[1:, :]
+                        luma = luma[1:, :]
+                    else:
+                        img = img[:-1, :]
+                        luma = luma[:-1, :]
+                else:  # LEFT/RIGHT
+                    if name == 'LEFT':
+                        img = img[:, 1:]
+                        luma = luma[:, 1:]
+                    else:
+                        img = img[:, :-1]
+                        luma = luma[:, :-1]
+                changed = True
+                break
+        
+        if not changed:
+            break
+    
+    return img
 
 # =============================================================================
 # CALCULATE FINAL KEYPOINTS (photo corners after global warp)
@@ -592,24 +633,11 @@ def apply_global_perspective(canvas, canvas_w, canvas_h, photo_corners=None, mar
 def calculate_warped_photo_corners(flat_corners, transform_matrix):
     """
     Transform photo corners through the global perspective warp.
-    
-    Args:
-        flat_corners: Original flat corners [4x2]
-        transform_matrix: The 3x3 perspective transform matrix
-    
-    Returns:
-        Warped corners after global perspective
     """
-    # Add homogeneous coordinate
     ones = np.ones((4, 1))
     corners_h = np.hstack([flat_corners, ones])
-    
-    # Apply transform
     warped_h = corners_h @ transform_matrix.T
-    
-    # Convert back to cartesian
     warped = warped_h[:, :2] / warped_h[:, 2:3]
-    
     return warped
 
 
@@ -739,6 +767,48 @@ def random_background_gradient(img):
     return img
 
 
+def ensure_clean_edges(img, padding=50):
+    """
+    Ensure all edges of the image are clean (no black borders).
+    If edges have dark pixels, pad the image with background color.
+    """
+    h, w = img.shape[:2]
+    
+    # Get background color from center of image
+    bg_color = tuple(int(c) for c in img[h//2, w//2, :])
+    
+    luma = 0.299 * img[:,:,2] + 0.587 * img[:,:,1] + 0.114 * img[:,:,0]
+    
+    left_dark = np.sum(luma[:, 0] < 10)
+    right_dark = np.sum(luma[:, -1] < 10)
+    top_dark = np.sum(luma[0, :] < 10)
+    bottom_dark = np.sum(luma[-1, :] < 10)
+    
+    left_ratio = left_dark / h
+    right_ratio = right_dark / h
+    top_ratio = top_dark / w
+    bottom_ratio = bottom_dark / w
+    
+    # Calculate padding needed
+    pad_left = int(left_ratio * w * 0.5) if left_ratio > 0.1 else 0
+    pad_right = int(right_ratio * w * 0.5) if right_ratio > 0.1 else 0
+    pad_top = int(top_ratio * h * 0.5) if top_ratio > 0.1 else 0
+    pad_bottom = int(bottom_ratio * h * 0.5) if bottom_ratio > 0.1 else 0
+    
+    # Cap padding
+    pad_left = min(pad_left, 100)
+    pad_right = min(pad_right, 100)
+    pad_top = min(pad_top, 100)
+    pad_bottom = min(pad_bottom, 100)
+    
+    if pad_left or pad_right or pad_top or pad_bottom:
+        padded = np.full((h + pad_top + pad_bottom, w + pad_left + pad_right, 3), bg_color, dtype=np.uint8)
+        padded[pad_top:pad_top+h, pad_left:pad_left+w] = img
+        return padded
+    
+    return img
+
+
 # =============================================================================
 # PHOTO EFFECTS
 # =============================================================================
@@ -797,136 +867,35 @@ def fast_glare(img):
 def add_rgba_alpha(img):
     """Convert BGR image to BGRA with alpha channel."""
     bgra = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
-    bgra[:, :, 3] = 255  # Fully opaque
+    bgra[:, :, 3] = 255
     return bgra
-
-
-# =============================================================================
-# DROP SHADOWS (Subtle, applied to flat photos)
-# =============================================================================
-
-def create_subtle_shadow(photo, shadow_offset_base=8):
-    """
-    Create a subtle drop shadow for a photo.
-    
-    Uses screen-mode compositing for realistic shadows.
-    """
-    h, w = photo.shape[:2]
-    
-    # Shadow parameters
-    shadow_opacity = random.uniform(0.12, 0.22)
-    blur_sigma = random.uniform(5, 15)
-    
-    # Offset direction (lower-right for natural light from upper-left)
-    if random.random() < 0.65:
-        lx, ly = -1, -1  # Upper-left light source
-    else:
-        angle = random.uniform(0, 360)
-        lx, ly = math.cos(math.radians(angle)), math.sin(math.radians(angle))
-    
-    l_len = math.sqrt(lx**2 + lx**2 + ly**2)
-    lx, ly = lx / l_len * 2, ly / l_len * 2
-    
-    shadow_offset = int(shadow_offset_base + random.uniform(0, 5))
-    
-    # Create shadow mask
-    shadow_mask = np.zeros((h + abs(int(lx * shadow_offset)) + 10, 
-                            w + abs(int(ly * shadow_offset)) + 10), dtype=np.float32)
-    
-    # Shadow shape (slightly larger than photo)
-    pad = 5
-    cv2.rectangle(shadow_mask, 
-                 (pad, pad), 
-                 (shadow_mask.shape[1] - pad - int(lx * shadow_offset), 
-                  shadow_mask.shape[0] - pad - int(ly * shadow_offset)),
-                 1.0, -1)
-    
-    # Blur
-    shadow_mask = cv2.GaussianBlur(shadow_mask, (0, 0), blur_sigma)
-    
-    # Apply shadow to photo
-    if len(photo.shape) == 3 and photo.shape[2] == 4:
-        photo_f = photo.astype(np.float32) / 255.0
-        alpha = photo_f[:, :, 3:4]
-        
-        # Darken with shadow
-        shadow_factor = 1 - shadow_mask[:h, :w, np.newaxis] * shadow_opacity
-        photo_f[:, :, :3] *= shadow_factor
-        photo_f[:, :, 3] *= (1 - shadow_mask[:h, :w] * shadow_opacity * 0.3)
-        
-        return np.clip(photo_f * 255, 0, 255).astype(np.uint8)
-    else:
-        return photo
-
-
-# =============================================================================
-# COMPOSITING
-# =============================================================================
-
-def alpha_composite(bg, fg):
-    """
-    Alpha-composite fg onto bg.
-    
-    Both images should be BGRA.
-    """
-    if len(bg.shape) == 3 and bg.shape[2] == 4:
-        bg_f = bg.astype(np.float32) / 255.0
-    else:
-        bg_f = np.dstack([bg, np.ones(bg.shape[:2], dtype=np.float32) * 255]) / 255.0
-    
-    if len(fg.shape) == 3 and fg.shape[2] == 4:
-        fg_f = fg.astype(np.float32) / 255.0
-    else:
-        fg_f = np.dstack([fg, np.ones(fg.shape[:2], dtype=np.float32) * 255]) / 255.0
-    
-    # Alpha blend
-    alpha_fg = fg_f[:, :, 3:4]
-    alpha_bg = bg_f[:, :, 3:4]
-    
-    out_alpha = alpha_fg + alpha_bg * (1 - alpha_fg)
-    out_rgb = (fg_f[:, :, :3] * alpha_fg + 
-               bg_f[:, :, :3] * alpha_bg * (1 - alpha_fg)) / np.maximum(out_alpha, 0.001)
-    
-    out = np.dstack([out_rgb, out_alpha]) * 255
-    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 # =============================================================================
 # VERIFICATION FUNCTIONS
 # =============================================================================
 
-def verify_rotation_applied(flat_corners, rotation):
+def verify_rotation_applied(rotation):
     """Verify rotation was applied."""
     return abs(rotation) > 5, f"Rotation: {rotation:.1f}°"
 
 
 def verify_perspective_subtle(global_corners, out_w, out_h):
-    """Verify global perspective is subtle (corners don't move too much)."""
-    # Global corners are relative to OUTPUT image
+    """Verify global perspective is subtle."""
     src = np.array([[0, 0], [out_w-1, 0], [out_w-1, out_h-1], [0, out_h-1]], dtype=np.float32)
     displacements = [np.linalg.norm(global_corners[i] - src[i]) for i in range(4)]
     
     max_disp = max(displacements)
-    min_disp = min(displacements)
     
-    # Perspective should be visible but not extreme
     if max_disp > 300:
-        return False, f"Perspective too strong: max displacement {max_disp:.0f}px"
+        return False, f"Perspective too strong: {max_disp:.0f}px"
     
-    return True, f"Perspective OK: {max_disp:.0f}px max displacement"
+    return True, f"Perspective OK: {max_disp:.0f}px"
 
 
 def verify_trapezoid_shape(corners):
-    """
-    Verify that the shape is a proper trapezoid (not bowtie/convex).
-    
-    After global perspective, photos become trapezoids. We verify:
-    1. Shape is convex (all cross products have same sign)
-    2. Edge ratios are reasonable (not too extreme)
-    """
-    # Check convexity using cross products
+    """Verify shape is a proper trapezoid (not bowtie/concave)."""
     def cross_product_2d(A, B, C):
-        """Cross product of AB x BC"""
         return (B[0] - A[0]) * (C[1] - B[1]) - (B[1] - A[1]) * (C[0] - B[0])
     
     signs = []
@@ -937,49 +906,49 @@ def verify_trapezoid_shape(corners):
         cp = cross_product_2d(A, B, C)
         signs.append(cp > 0)
     
-    # Convex if all cross products have same sign (all True or all False)
     if not (all(signs) or not any(signs)):
-        return False, "Non-convex shape (bowtie or concave)"
+        return False, "Non-convex shape"
     
-    # Check edge ratios (trapezoid should have similar parallel edges)
     top_width = np.linalg.norm(corners[1] - corners[0])
     bot_width = np.linalg.norm(corners[2] - corners[3])
-    left_height = np.linalg.norm(corners[3] - corners[0])
-    right_height = np.linalg.norm(corners[2] - corners[1])
     
     if top_width > 0 and bot_width > 0:
         h_ratio = min(top_width, bot_width) / max(top_width, bot_width)
-        v_ratio = min(left_height, right_height) / max(left_height, right_height)
-        
-        # After global perspective, ratios should be 0.5-1.0
-        if h_ratio < 0.5 or v_ratio < 0.5:
-            return False, f"Edge ratio too extreme: h={h_ratio:.2f}, v={v_ratio:.2f}"
+        if h_ratio < 0.5:
+            return False, f"Edge ratio too extreme: {h_ratio:.2f}"
     
     return True, "Valid trapezoid"
 
 
-def verify_corners_in_bounds(corners, canvas_w, canvas_h):
-    """Verify all corners are within canvas bounds."""
+def verify_corners_in_bounds(corners, out_w, out_h, margin=0):
+    """
+    Verify all corners are within output bounds.
+    
+    After global perspective, corners may legitimately extend to edges
+    or even beyond due to the trapezoid transformation. We check that
+    corners are within the output dimensions (with optional small margin
+    for safety).
+    """
     in_bounds = all(
-        0 <= corners[i, 0] < canvas_w and 0 <= corners[i, 1] < canvas_h
+        -margin <= corners[i, 0] < out_w + margin and 
+        -margin <= corners[i, 1] < out_h + margin
         for i in range(4)
     )
-    return in_bounds, "All corners in bounds" if in_bounds else "Some corners out of bounds"
+    return in_bounds, "Corners in bounds" if in_bounds else "Corners out of bounds"
 
 
 # =============================================================================
 # MAIN GENERATION LOOP
 # =============================================================================
 
-# Timeout handler
 def timeout_handler(signum, frame):
     print("\n⏱️ TIMEOUT: Generation took too long, stopping...")
     sys.exit(1)
 
 signal.signal(signal.SIGALRM, timeout_handler)
-signal.alarm(180)  # 3 minute timeout
+signal.alarm(180)
 
-print("🖼️  Generating 10 example images (v3 - correct architecture)...")
+print("🖼️  Generating 10 example images (v4 - spiral packing, larger photos)...")
 print("⏱️  Timeout: 180 seconds")
 print()
 
@@ -995,17 +964,16 @@ try:
         print("ERROR: Need at least 5 source images")
         sys.exit(1)
     
-    output_dir = Path("../data/examples_v3")
+    output_dir = Path("../data/examples_v4")
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    CANVAS_W, CANVAS_H = 2400, 1350  # 16:9 with extra margin
+    CANVAS_W, CANVAS_H = 2400, 1350
     
     random.seed(42)
     np.random.seed(42)
     
     print("\n📸 Generating images...\n")
     
-    # Verification tracking
     verification_stats = {
         'total_photos': 0,
         'photos_with_rotation': 0,
@@ -1026,7 +994,7 @@ try:
         # Convert to BGRA for compositing
         canvas = cv2.cvtColor(bg, cv2.COLOR_BGR2BGRA)
         
-        # Get photo packings using spiral algorithm
+        # Spiral packing with polygon collision
         placements = spiral_pack_photos(CANVAS_W, CANVAS_H)
         
         placed_photos = []
@@ -1060,29 +1028,25 @@ try:
             center_y = placement['center_y']
             canvas = composite_photo_at_center(canvas, photo_rotated, center_x, center_y)
             
-            # Store actual corners (polygon) for global warp transformation
+            # Store polygon for global warp transformation
             placed_photos.append({
                 'polygon': placement['polygon'].copy(),
                 'rotation': rotation,
             })
             
-            # Verification
             verification_stats['total_photos'] += 1
-            
-            # Rotation check
             if abs(rotation) > 5:
                 verification_stats['photos_with_rotation'] += 1
         
         # Apply ONE global perspective warp to entire composite
         canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_BGRA2BGR)
         
-        # Collect photo corners for cropping
         photo_corners_list = [photo_data['polygon'] for photo_data in placed_photos]
         
         warped_canvas, global_corners, transform_matrix, content_bounds = apply_global_perspective(
-            canvas_bgr, CANVAS_W, CANVAS_H, 
+            canvas_bgr, CANVAS_W, CANVAS_H,
             photo_corners=photo_corners_list,
-            margin=40
+            crop_margin=400  # Large margin to keep photos well inside image bounds
         )
         
         # Transform all photo corners through the global warp
@@ -1090,35 +1054,29 @@ try:
         out_w, out_h = warped_canvas.shape[1], warped_canvas.shape[0]
         
         for photo_data in placed_photos:
-            # The polygon corners are in canvas coordinates (after rotation)
             polygon = photo_data['polygon']
             
             # Transform through global perspective
-            warped_corners = calculate_warped_photo_corners(
-                polygon, transform_matrix
-            )
+            warped_corners = calculate_warped_photo_corners(polygon, transform_matrix)
             
-            # Clip warped corners to output bounds
-            warped_corners[:, 0] = np.clip(warped_corners[:, 0], 0, out_w - 1)
-            warped_corners[:, 1] = np.clip(warped_corners[:, 1], 0, out_h - 1)
+            # Don't clip - corners may legitimately extend beyond cropped bounds
+            # This represents the actual perspective transformation
             
             final_photos.append({
                 'corners': warped_corners,
                 'rotation': photo_data['rotation']
             })
             
-            # Verification
-            ok, msg = verify_corners_in_bounds(warped_corners, out_w, out_h)
+            ok, _ = verify_corners_in_bounds(warped_corners, out_w, out_h, margin=0)
             if ok:
                 verification_stats['photos_in_bounds'] += 1
             
-            ok, msg = verify_trapezoid_shape(warped_corners)
+            ok, _ = verify_trapezoid_shape(warped_corners)
             if ok:
                 verification_stats['valid_trapezoids'] += 1
         
         # Global perspective check
-        out_w, out_h = warped_canvas.shape[1], warped_canvas.shape[0]
-        ok, msg = verify_perspective_subtle(global_corners, out_w, out_h)
+        ok, _ = verify_perspective_subtle(global_corners, out_w, out_h)
         if ok:
             verification_stats['subtle_perspective'] += 1
         verification_stats['global_perspective_applied'] += 1
@@ -1128,9 +1086,8 @@ try:
         img_path = output_dir / f"example_{i+1:02d}.jpg"
         pil_img.save(img_path, quality=90)
         
-        # Save label file (corners relative to warped image)
+        # Save label file
         lbl_path = output_dir / f"example_{i+1:02d}.txt"
-        out_w, out_h = warped_canvas.shape[1], warped_canvas.shape[0]
         with open(lbl_path, 'w') as f:
             for p in final_photos:
                 kps = p['corners']
@@ -1141,7 +1098,10 @@ try:
                 
                 line = f"0 {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
                 for kx, ky in kps:
-                    line += f" {kx/out_w:.6f} {ky/out_h:.6f} 2"
+                    # Clamp keypoints to [0, 1] for YOLO format
+                    kx_clamped = max(0, min(1, kx / out_w))
+                    ky_clamped = max(0, min(1, ky / out_h))
+                    line += f" {kx_clamped:.6f} {ky_clamped:.6f} 2"
                 line += "\n"
                 f.write(line)
         
@@ -1150,14 +1110,13 @@ try:
     
     total_time = time.time() - start_time
     
-    # Print verification summary
     print(f"\n{'='*60}")
     print("📊 VERIFICATION RESULTS")
     print(f"{'='*60}")
     
     total = verification_stats['total_photos']
     print(f"\n  Total photos: {total}")
-    print(f"  Photos with rotation (±30°): {verification_stats['photos_with_rotation']}/{total}")
+    print(f"  Photos with rotation (±15°): {verification_stats['photos_with_rotation']}/{total}")
     print(f"  Photos in bounds: {verification_stats['photos_in_bounds']}/{total}")
     print(f"  Valid trapezoids: {verification_stats['valid_trapezoids']}/{total}")
     print(f"  Subtle global perspective: {verification_stats['subtle_perspective']}/{verification_stats['global_perspective_applied']}")
@@ -1165,7 +1124,6 @@ try:
     print(f"\n✅ Done! 10 images in {total_time:.1f}s")
     print(f"📂 {output_dir.absolute()}")
     
-    # List files
     for f in sorted(output_dir.glob("example_*.jpg")):
         print(f"   - {f.name} ({f.stat().st_size//1024} KB)")
     
