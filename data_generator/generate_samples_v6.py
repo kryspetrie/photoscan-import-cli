@@ -68,10 +68,13 @@ def get_rotated_polygon(width, height, center_x, center_y, rotation):
     return rotated
 
 
-def polygons_overlap(poly1, poly2):
+def polygons_overlap(poly1, poly2, buffer_pixels=0):
     """
     Check if two convex polygons overlap.
     Uses Separating Axis Theorem (SAT) for accurate collision detection.
+    
+    Args:
+        buffer_pixels: Extra margin to require gap between polygons (default 0)
     """
     def get_axes(poly):
         """Get potential separating axes from polygon edges."""
@@ -99,7 +102,8 @@ def polygons_overlap(poly1, poly2):
         min1, max1 = project_poly(poly1, axis)
         min2, max2 = project_poly(poly2, axis)
         
-        if max1 < min2 or max2 < min1:
+        # If intervals don't overlap (with buffer), polygons are separated
+        if max1 + buffer_pixels < min2 or max2 + buffer_pixels < min1:
             return False
     
     return True
@@ -124,221 +128,214 @@ def get_polygon_bounds(poly):
     )
 
 
-# =============================================================================
-# SPIRAL PACKING ALGORITHM (Polygon-based collision)
-# =============================================================================
-
-def spiral_pack_photos(canvas_w, canvas_h, num_photos=None):
-    """
-    Pack photos using spiral placement from center with polygon collision.
+def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, edge_margin, size_variation, seed):
+    """Radial packing with pixel-based collision detection."""
+    import random as rnd
+    rnd.seed(seed)
     
-    Uses actual rotated polygon geometry for collision detection,
-    not rectangular bounding boxes. This allows tighter packing.
+    # 1-bit occupancy mask (0=background, 255=photo placed)
+    occupancy = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
     
-    Args:
-        canvas_w, canvas_h: Canvas dimensions
-        num_photos: Number of photos (default: random 5-7)
+    cx, cy = canvas_w / 2, canvas_h / 2
     
-    Returns:
-        List of placements with polygon geometry
-    """
-    if num_photos is None:
-        num_photos = random.randint(5, 8)  # Reduced from 8-12 to prevent overlaps
+    # Generate candidates in spiral from center
+    candidates = []
+    golden_angle = 137.508
+    max_radius = min(canvas_w, canvas_h) * 0.8
     
-    # Smaller photos to allow multiple without overlapping
-    base_w = int(canvas_w * 0.25)  # ~25% of canvas width
-    base_h = int(base_w * 0.75)    # ~75% (4:3 landscape aspect)
+    for i in range(num_photos * 10 + 50):
+        r = max_radius * (i / (num_photos * 10 + 50)) ** 0.7
+        angle = math.radians(i * golden_angle)
+        x = cx + r * math.cos(angle)
+        y = cy + r * math.sin(angle)
+        candidates.append((float(x), float(y)))
     
-    # Moderate variation (±15%)
-    size_variation = 0.15
+    candidates.sort(key=lambda p: (p[0] - cx)**2 + (p[1] - cy)**2)
+    
+    # Photo configs
+    photo_configs = []
+    for _ in range(num_photos):
+        scale = rnd.uniform(1 - size_variation, 1 + size_variation)
+        width = int(base_w * scale)
+        height = int(base_h * scale)
+        rotation = rnd.uniform(-10, 10)
+        photo_configs.append((width, height, rotation))
+    
+    photo_configs.sort(key=lambda c: c[0] * c[1], reverse=True)
     
     placements = []
     
-    # Center of canvas
-    center_x = canvas_w / 2
-    center_y = canvas_h / 2
-    
-    # Safety margin: photos must stay this far from canvas edge
-    # This prevents photos from extending to image edges after perspective warp
-    # Add extra buffer for rotation (max ~30% diagonal increase at 15°)
-    edge_margin = 250  # Reduced from 400 to fit more photos
-    
-    # Safe bounds for center positions
-    min_x = edge_margin
-    max_x = canvas_w - edge_margin
-    min_y = edge_margin
-    max_y = canvas_h - edge_margin
-    
-    # Generate spiral positions from center outward
-    def generate_spiral_positions(center_x, center_y, max_radius, num_points):
-        """Generate positions in a spiral pattern."""
-        positions = []
-        angle_step = 137.5  # Golden angle for good spiral distribution
+    def create_photo_mask(width, height, center_x, center_y, rotation):
+        """
+        Create 1-bit mask of photo using polygon fill.
+        Returns mask and bounding box for efficient collision checking.
+        """
+        poly = get_rotated_polygon(width, height, center_x, center_y, rotation)
         
-        for i in range(num_points):
-            # Spiral: radius grows, angle increases
-            t = i / max(num_points - 1, 1)
-            radius = t * max_radius
-            angle = math.radians(i * angle_step)
-            
-            x = center_x + radius * math.cos(angle)
-            y = center_y + radius * math.sin(angle)
-            
-            # Add some random jitter for variety
-            jitter_x = random.uniform(-30, 30)
-            jitter_y = random.uniform(-30, 30)
-            
-            positions.append((x + jitter_x, y + jitter_y))
+        # Get bounding box of polygon
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        min_x, max_x = int(min(xs)), int(max(xs)) + 1
+        min_y, max_y = int(min(ys)), int(max(ys)) + 1
         
-        return positions
-    
-    # Maximum radius to cover usable area
-    max_radius = math.sqrt((max_x - center_x)**2 + (max_y - center_y)**2)
-    
-    # Generate more candidate positions than needed
-    candidate_positions = generate_spiral_positions(
-        center_x, center_y, max_radius, 
-        num_photos * 4 + 20  # Extra candidates for flexibility
-    )
-    
-    # Shuffle to add randomness while maintaining spiral-like distribution
-    random.shuffle(candidate_positions)
-    
-    # Try to place each photo
-    for photo_idx in range(num_photos):
-        # Random size (small variation) and rotation
-        scale = random.uniform(1 - size_variation, 1 + size_variation)
-        width = int(base_w * scale)
-        height = int(base_h * scale)
-        rotation = random.uniform(-10, 10)  # Reduced rotation to limit corner displacement
+        # Clamp to canvas
+        min_x = max(0, min_x)
+        min_y = max(0, min_y)
+        max_x = min(canvas_w, max_x)
+        max_y = min(canvas_h, max_y)
         
+        # Create small mask just for the bounding box
+        bb_w = max_x - min_x
+        bb_h = max_y - min_y
+        
+        if bb_w <= 0 or bb_h <= 0:
+            return None, (min_x, min_y, max_x, max_y)
+        
+        small_mask = np.zeros((bb_h, bb_w), dtype=np.uint8)
+        
+        # Translate polygon points to bounding box coordinates
+        pts = np.array([[int(p[0]) - min_x, int(p[1]) - min_y] for p in poly], dtype=np.int32)
+        cv2.fillPoly(small_mask, [pts], 255)
+        
+        return small_mask, (min_x, min_y, max_x, max_y)
+    
+    def check_pixel_collision(bb_x, bb_y, small_mask, overlap_threshold=5):
+        """
+        Check collision using pixel-based overlap detection on bounding box region.
+        
+        overlap_threshold: max number of overlapping pixels allowed (default 50)
+        """
+        if small_mask is None:
+            return True  # Reject if mask invalid
+        
+        bb_h, bb_w = small_mask.shape
+        x2 = min(bb_x + bb_w, canvas_w)
+        y2 = min(bb_y + bb_h, canvas_h)
+        
+        # Get the region of occupancy we need to check
+        occ_region = occupancy[bb_y:y2, bb_x:x2]
+        new_region = small_mask[:y2-bb_y, :x2-bb_x]
+        
+        # Bitwise AND to find overlap
+        overlap = cv2.bitwise_and(occ_region, new_region)
+        overlap_pixels = np.count_nonzero(overlap)
+        
+        return overlap_pixels > overlap_threshold
+    
+    def place_photo_mask(bb_x, bb_y, small_mask):
+        """Add photo to occupancy mask within bounding box region."""
+        if small_mask is None:
+            return
+        bb_h, bb_w = small_mask.shape
+        x2 = min(bb_x + bb_w, canvas_w)
+        y2 = min(bb_y + bb_h, canvas_h)
+        new_region = small_mask[:y2-bb_y, :x2-bb_x]
+        
+        # Use bitwise OR to add to occupancy
+        occupancy[bb_y:y2, bb_x:x2] = cv2.bitwise_or(occupancy[bb_y:y2, bb_x:x2], new_region)
+    
+    for photo_idx, (width, height, rotation) in enumerate(photo_configs):
         placed = False
         
-        # Try each candidate position
-        for cx, cy in candidate_positions:
-            # Skip if outside safe bounds
-            if cx < min_x or cx > max_x or cy < min_y or cy > max_y:
-                continue
-            
-            # Get polygon for this placement
-            poly = get_rotated_polygon(width, height, cx, cy, rotation)
-            
-            # Bounds check using actual polygon
-            # Account for rotation by checking polygon corners
-            bx1, by1, bx2, by2 = get_polygon_bounds(poly)
-            if bx1 < edge_margin or by1 < edge_margin or bx2 > canvas_w - edge_margin or by2 > canvas_h - edge_margin:
-                continue
-            
-            # Collision check against all placed polygons (using SAT)
-            collision = False
-            for existing in placements:
-                if polygons_overlap(poly, existing['polygon']):
-                    collision = True
-                    break
-            
-            if not collision:
-                # Shadow params: smaller, centered under photo with soft blur
-                shadow_params = {
-                    'offset_x': random.randint(15, 40),  # Larger horizontal offset for spread
-                    'offset_y': random.randint(15, 40),  # Larger vertical offset for spread
-                    'blur_sigma': random.uniform(12, 25),  # More blur for soft spread
-                    'opacity': random.uniform(0.35, 0.55)  # Stronger shadow
-                }
-                
-                placements.append({
-                    'x': cx - width / 2,
-                    'y': cy - height / 2,
-                    'width': width,
-                    'height': height,
-                    'rotation': rotation,
-                    'center_x': cx,
-                    'center_y': cy,
-                    'polygon': poly,
-                    'shadow_params': shadow_params
-                })
-                placed = True
-                break
+        # Try rotations
+        if rnd.random() < 0.4:
+            angles_to_try = [rotation, 0, 90, -90]
+        else:
+            angles_to_try = [0, rotation, 90, -90]
         
-        # If can't place, try with progressively smaller sizes
-        if not placed:
-            for shrink in [0.90, 0.80, 0.70, 0.60]:
-                width_s = int(width * shrink)
-                height_s = int(height * shrink)
-                
-                for cx, cy in candidate_positions:
-                    if cx < min_x or cx > max_x or cy < min_y or cy > max_y:
-                        continue
-                    
-                    poly = get_rotated_polygon(width_s, height_s, cx, cy, rotation)
-                    bx1, by1, bx2, by2 = get_polygon_bounds(poly)
-                    if bx1 < edge_margin or by1 < edge_margin or bx2 > canvas_w - edge_margin or by2 > canvas_h - edge_margin:
-                        continue
-                    
-                    collision = False
-                    for existing in placements:
-                        if polygons_overlap(poly, existing['polygon']):
-                            collision = True
-                            break
-                    
-                    if not collision:
-                        shadow_params = {
-                            'offset_x': random.randint(5, 15),
-                            'offset_y': random.randint(5, 15),
-                            'blur_sigma': random.uniform(6, 15),
-                            'opacity': random.uniform(0.25, 0.45)
-                        }
-                        
-                        placements.append({
-                            'x': cx - width_s / 2,
-                            'y': cy - height_s / 2,
-                            'width': width_s,
-                            'height': height_s,
-                            'rotation': rotation,
-                            'center_x': cx,
-                            'center_y': cy,
-                            'polygon': poly,
-                            'shadow_params': shadow_params
-                        })
-                        placed = True
-                        break
-                
+        for angle in angles_to_try:
+            if placed:
+                break
+            for shrink in [1.0, 0.85, 0.70, 0.55, 0.45]:
                 if placed:
                     break
-        
-        # Final fallback: try with much smaller size anywhere
-        if not placed:
-            width_s = int(width * 0.5)
-            height_s = int(height * 0.5)
-            
-            # Try random positions
-            for _ in range(50):
-                cx = random.uniform(edge_margin + width_s/2, canvas_w - edge_margin - width_s/2)
-                cy = random.uniform(edge_margin + height_s/2, canvas_h - edge_margin - height_s/2)
+                w_s = int(width * shrink)
+                h_s = int(height * shrink)
                 
-                poly = get_rotated_polygon(width_s, height_s, cx, cy, rotation)
-                
-                collision = False
-                for existing in placements:
-                    if polygons_overlap(poly, existing['polygon']):
-                        collision = True
-                        break
-                
-                if not collision:
+                for px, py in candidates:
+                    cx_pos, cy_pos = px, py
+                    
+                    # Bounds check using actual polygon corners
+                    poly_test = get_rotated_polygon(w_s, h_s, cx_pos, cy_pos, angle)
+                    bx1 = min(p[0] for p in poly_test)
+                    by1 = min(p[1] for p in poly_test)
+                    bx2 = max(p[0] for p in poly_test)
+                    by2 = max(p[1] for p in poly_test)
+                    
+                    # Strict bounds check - photo must be fully inside
+                    if bx1 < edge_margin or by1 < edge_margin:
+                        continue
+                    if bx2 > canvas_w - edge_margin or by2 > canvas_h - edge_margin:
+                        continue
+                    
+                    # Create 1-bit mask for this photo
+                    new_mask, (bb_x, bb_y, _, _) = create_photo_mask(w_s, h_s, cx_pos, cy_pos, angle)
+                    
+                    # Pixel-based collision check using bitwise AND
+                    if check_pixel_collision(bb_x, bb_y, new_mask):
+                        continue
+                    
+                    # Place photo (add to occupancy)
+                    place_photo_mask(bb_x, bb_y, new_mask)
+                    
+                    shadow_params = {
+                        'offset_x': rnd.choice([-1, 1]) * rnd.randint(0, 20),
+                        'offset_y': rnd.choice([-1, 1]) * rnd.randint(0, 20),
+                        'blur_sigma': rnd.uniform(8, 20),
+                        'opacity': rnd.choice([rnd.uniform(0.15, 0.25), rnd.uniform(0.45, 0.60)])
+                    }
+                    
                     placements.append({
-                        'x': cx - width_s / 2,
-                        'y': cy - height_s / 2,
-                        'width': width_s,
-                        'height': height_s,
-                        'rotation': rotation,
-                        'center_x': cx,
-                        'center_y': cy,
-                        'polygon': poly
+                        'x': cx_pos - w_s / 2,
+                        'y': cy_pos - h_s / 2,
+                        'width': w_s,
+                        'height': h_s,
+                        'rotation': angle,
+                        'center_x': cx_pos,
+                        'center_y': cy_pos,
+                        'polygon': poly_test,
+                        'shadow_params': shadow_params
                     })
                     placed = True
                     break
     
-    return placements
+    # Add circle_radius for compatibility
+    for p in placements:
+        p['circle_radius'] = math.sqrt(p['width']**2 + p['height']**2) / 2 + 5
+    
+    total_area = sum(p['width'] * p['height'] for p in placements)
+    return placements, total_area
 
+
+def spiral_pack_photos(canvas_w, canvas_h, num_photos=None):
+    """
+    Pack photos trying multiple configurations and keeping the best one.
+    Uses radial placement with 20 packing attempts.
+    """
+    if num_photos is None:
+        num_photos = random.randint(5, 8)
+    
+    # Base photo: 30% of canvas width (large photos)
+    base_w = int(canvas_w * 0.30)
+    base_h = int(base_w * 0.75)
+    size_variation = 0.10
+    edge_margin = 160  # Safe margin to prevent photos going outside after perspective
+    
+    # Try 20 different configurations and keep the best (most photo area)
+    best_placements = []
+    best_area = 0
+    
+    for attempt in range(20):
+        placements, total_area = pack_photos_single_attempt(
+            canvas_w, canvas_h, num_photos, base_w, base_h, 
+            edge_margin, size_variation, seed=attempt * 1000 + random.randint(0, 999)
+        )
+        
+        if total_area > best_area:
+            best_area = total_area
+            best_placements = placements
+    
+    return best_placements
 
 # =============================================================================
 # ROTATION FUNCTION
@@ -1087,46 +1084,72 @@ def fast_glare(img):
     return img
 
 
-def apply_photo_shadow(canvas, photo, cx, cy, offset_x, offset_y, blur_sigma, opacity):
+def apply_photo_shadow(canvas, photo, cx, cy, offset_x, offset_y, blur_sigma, opacity, rotation=0):
     """
-    Render a drop shadow directly onto the canvas with spread.
+    Render a drop shadow onto the canvas with spread.
+    Shadow is rotated to match the photo rotation.
     
-    Shadow appears larger and more offset from the photo.
+    Args:
+        rotation: Photo rotation in degrees (shadow will be rotated same amount)
     """
     ph, pw = photo.shape[:2]
     ch, cw = canvas.shape[:2]
     num_channels = canvas.shape[2]
     
-    # Shadow is MORE offset and LARGER than the photo
-    # offset_x and offset_y are the base offset, amplify it for more spread
-    shadow_cx = cx + offset_x * 0.8  # Larger offset (80% of original)
-    shadow_cy = cy + offset_y * 0.8  # More vertical spread
+    # Rotate the offset vector to match photo rotation
+    rot_rad = math.radians(rotation)
+    cos_r = math.cos(rot_rad)
+    sin_r = math.sin(rot_rad)
     
-    # Create shadow mask - make it larger than the photo for spread effect
-    extra_size = int(max(pw, ph) * 0.15)  # 15% larger than photo
-    shadow_mask = np.zeros((ph + extra_size * 2, pw + extra_size * 2), dtype=np.float32)
-    # Fill center with ones (opaque shadow region)
-    shadow_mask[extra_size:extra_size+ph, extra_size:extra_size+pw] = 1.0
+    # Rotate offset (offset_x, offset_y) by rotation angle
+    rotated_offset_x = offset_x * cos_r - offset_y * sin_r
+    rotated_offset_y = offset_x * sin_r + offset_y * cos_r
     
-    # Heavy blur for spread effect
-    blur_actual = blur_sigma * 2  # Double the blur for more spread
-    shadow_mask = cv2.GaussianBlur(shadow_mask, (0, 0), blur_actual)
+    # Shadow center is offset from photo center
+    shadow_cx = cx + rotated_offset_x * 0.5
+    shadow_cy = cy + rotated_offset_y * 0.5
     
-    # Calculate where shadow maps to on canvas
-    shadow_top_left_x = int(shadow_cx - (pw + extra_size * 2) / 2)
-    shadow_top_left_y = int(shadow_cy - (ph + extra_size * 2) / 2)
+    # Create a large enough shadow mask (unrotated)
+    # Extra padding to prevent blur clipping at edges
+    blur_pad = int(blur_sigma * 6) + 10  # Large buffer for blur
+    shadow_w = pw + blur_pad * 2
+    shadow_h = ph + blur_pad * 2
+    shadow_mask = np.zeros((shadow_h, shadow_w), dtype=np.float32)
     
-    # Iterate through shadow pixels and apply to canvas
+    # Fill center rectangle (photo shape, centered in mask)
+    shadow_mask[blur_pad:blur_pad+ph, blur_pad:blur_pad+pw] = 1.0
+    
+    # Apply blur - moderate intensity, not too spread
+    shadow_mask = cv2.GaussianBlur(shadow_mask, (0, 0), sigmaX=blur_sigma)
+    
+    # Rotate the shadow mask to match photo rotation
+    center_rot = (shadow_w / 2, shadow_h / 2)
+    rot_matrix = cv2.getRotationMatrix2D(center_rot, rotation, 1.0)
+    
+    # Rotate with black background for any corners
+    shadow_mask = cv2.warpAffine(shadow_mask, rot_matrix, (shadow_w, shadow_h), 
+                                   borderValue=0, flags=cv2.INTER_LINEAR)
+    
+    # Normalize mask to max of 1.0 (in case rotation spread it)
+    if shadow_mask.max() > 0:
+        shadow_mask = shadow_mask / shadow_mask.max()
+    
+    # Calculate where shadow top-left maps to on canvas
+    shadow_top_left_x = int(shadow_cx - shadow_w / 2)
+    shadow_top_left_y = int(shadow_cy - shadow_h / 2)
+    
+    # Apply shadow using multiply blend
     canvas_f = canvas.astype(np.float32) / 255.0
     
     mask_h, mask_w = shadow_mask.shape
     for dy in range(mask_h):
         for dx in range(mask_w):
+            if shadow_mask[dy, dx] < 0.01:  # Skip transparent pixels
+                continue
             canvas_y = shadow_top_left_y + dy
             canvas_x = shadow_top_left_x + dx
             if 0 <= canvas_y < ch and 0 <= canvas_x < cw:
                 shadow_val = shadow_mask[dy, dx] * opacity
-                # Multiply blend: darken all channels
                 canvas_f[canvas_y, canvas_x, :num_channels] *= (1 - shadow_val)
     
     canvas[:, :, :num_channels] = np.clip(canvas_f * 255, 0, 255).astype(np.uint8)
@@ -1233,7 +1256,7 @@ try:
         print("ERROR: Need at least 5 source images")
         sys.exit(1)
     
-    output_dir = Path("../data/examples_v6")
+    output_dir = Path("../data/examples_v18")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     CANVAS_W, CANVAS_H = 3000, 1800  # Larger canvas to avoid dark corners
@@ -1301,7 +1324,8 @@ try:
                 canvas = apply_photo_shadow(
                     canvas, photo, center_x, center_y,
                     shadow_params['offset_x'], shadow_params['offset_y'],
-                    shadow_params['blur_sigma'], shadow_params['opacity']
+                    shadow_params['blur_sigma'], shadow_params['opacity'],
+                    rotation=placement['rotation']  # Shadow matches photo rotation
                 )
             
             # Then composite the rotated photo on top
