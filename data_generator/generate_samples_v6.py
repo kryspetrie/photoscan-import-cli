@@ -165,83 +165,137 @@ def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, e
     
     placements = []
     
-    def create_photo_mask(width, height, center_x, center_y, rotation):
+
+
+    def create_photo_mask(width, height, center_x, center_y, rotation, margin=20):
         """
-        Create 1-bit mask of photo using polygon fill.
-        Returns mask and bounding box for efficient collision checking.
+        Create dilated 1-bit mask of photo for collision checking.
+        Returns mask expanded by margin and bounding box.
         """
         poly = get_rotated_polygon(width, height, center_x, center_y, rotation)
         
-        # Get bounding box of polygon
         xs = [p[0] for p in poly]
         ys = [p[1] for p in poly]
         min_x, max_x = int(min(xs)), int(max(xs)) + 1
         min_y, max_y = int(min(ys)), int(max(ys)) + 1
         
-        # Clamp to canvas
-        min_x = max(0, min_x)
-        min_y = max(0, min_y)
-        max_x = min(canvas_w, max_x)
-        max_y = min(canvas_h, max_y)
-        
-        # Create small mask just for the bounding box
-        bb_w = max_x - min_x
-        bb_h = max_y - min_y
+        # Expand bounding box by margin
+        bb_x = max(0, min_x - margin)
+        bb_y = max(0, min_y - margin)
+        bb_w = min(canvas_w, max_x + margin) - bb_x
+        bb_h = min(canvas_h, max_y + margin) - bb_y
         
         if bb_w <= 0 or bb_h <= 0:
-            return None, (min_x, min_y, max_x, max_y)
+            return None, (bb_x, bb_y, bb_w, bb_h)
         
-        small_mask = np.zeros((bb_h, bb_w), dtype=np.uint8)
+        mask = np.zeros((bb_h, bb_w), dtype=np.uint8)
+        pts = np.array([[int(p[0]) - bb_x, int(p[1]) - bb_y] for p in poly], dtype=np.int32)
+        cv2.fillPoly(mask, [pts], 255)
         
-        # Translate polygon points to bounding box coordinates
-        pts = np.array([[int(p[0]) - min_x, int(p[1]) - min_y] for p in poly], dtype=np.int32)
-        cv2.fillPoly(small_mask, [pts], 255)
+        # Dilate mask
+        kernel = np.ones((margin*2+1, margin*2+1), np.uint8)
+        dilated = cv2.dilate(mask, kernel)
         
-        return small_mask, (min_x, min_y, max_x, max_y)
+        return dilated, (bb_x, bb_y, bb_w, bb_h)
     
-    def check_pixel_collision(bb_x, bb_y, small_mask, overlap_threshold=5):
-        """
-        Check collision using pixel-based overlap detection on bounding box region.
-        Masks are expanded by 5px (dilated) to create ~10px margin between photos.
+    def check_pixel_collision(dilated_mask, bb_x, bb_y, overlap_threshold=5):
+        """Check collision against dilated occupancy mask."""
+        if dilated_mask is None:
+            return True
         
-        overlap_threshold: max number of overlapping pixels allowed (default 5)
-        """
-        if small_mask is None:
-            return True  # Reject if mask invalid
-        
-        # Dilate both masks by 5 pixels to create margin
-        kernel = np.ones((11, 11), np.uint8)  # 11x11 kernel = 5px radius dilation
-        dilated_occ = cv2.dilate(occupancy, kernel, iterations=1)
-        dilated_new = cv2.dilate(small_mask, kernel, iterations=1)
-        
-        bb_h, bb_w = small_mask.shape
+        bb_h, bb_w = dilated_mask.shape
         x2 = min(bb_x + bb_w, canvas_w)
         y2 = min(bb_y + bb_h, canvas_h)
         
-        # Get the region of occupancy we need to check
-        occ_region = dilated_occ[bb_y:y2, bb_x:x2]
-        new_region = dilated_new[:y2-bb_y, :x2-bb_x]
+        # Dilate occupancy once
+        kernel = np.ones((20*2+1, 20*2+1), np.uint8)
+        occ_dilated = cv2.dilate(occupancy, kernel)
         
-        # Bitwise AND to find overlap
-        overlap = cv2.bitwise_and(occ_region, new_region)
-        overlap_pixels = np.count_nonzero(overlap)
+        # Extract region from dilated occupancy that matches dilated_mask position
+        occ_region = occ_dilated[bb_y:y2, bb_x:x2]
+        mask_region = dilated_mask[:y2-bb_y, :x2-bb_x]
         
-        return overlap_pixels > overlap_threshold
-        
-        return overlap_pixels > overlap_threshold
+        overlap = cv2.bitwise_and(occ_region, mask_region)
+        return np.count_nonzero(overlap) > overlap_threshold
     
-    def place_photo_mask(bb_x, bb_y, small_mask):
-        """Add photo to occupancy mask within bounding box region."""
-        if small_mask is None:
+    def place_photo_mask(dilated_mask, bb_x, bb_y):
+        """Add dilated photo to occupancy."""
+        if dilated_mask is None:
             return
-        bb_h, bb_w = small_mask.shape
+        bb_h, bb_w = dilated_mask.shape
         x2 = min(bb_x + bb_w, canvas_w)
         y2 = min(bb_y + bb_h, canvas_h)
-        new_region = small_mask[:y2-bb_y, :x2-bb_x]
-        
-        # Use bitwise OR to add to occupancy
-        occupancy[bb_y:y2, bb_x:x2] = cv2.bitwise_or(occupancy[bb_y:y2, bb_x:x2], new_region)
+        occupancy[bb_y:y2, bb_x:x2] = cv2.bitwise_or(
+            occupancy[bb_y:y2, bb_x:x2], 
+            dilated_mask[:y2-bb_y, :x2-bb_x]
+        )
     
+    for photo_idx, (width, height, rotation) in enumerate(photo_configs):
+        placed = False
+        
+        if rnd.random() < 0.4:
+            angles_to_try = [rotation, 0, 90, -90]
+        else:
+            angles_to_try = [0, rotation, 90, -90]
+        
+        for angle in angles_to_try:
+            if placed:
+                break
+            for shrink in [1.0, 0.85, 0.70, 0.55, 0.45]:
+                if placed:
+                    break
+                w_s = int(width * shrink)
+                h_s = int(height * shrink)
+                
+                for px, py in candidates:
+                    cx_pos, cy_pos = px, py
+                    
+                    poly_test = get_rotated_polygon(w_s, h_s, cx_pos, cy_pos, angle)
+                    bx1 = min(p[0] for p in poly_test)
+                    by1 = min(p[1] for p in poly_test)
+                    bx2 = max(p[0] for p in poly_test)
+                    by2 = max(p[1] for p in poly_test)
+                    
+                    if bx1 < edge_margin or by1 < edge_margin:
+                        continue
+                    if bx2 > canvas_w - edge_margin or by2 > canvas_h - edge_margin:
+                        continue
+                    
+                    dilated_mask, (bb_x, bb_y, _, _) = create_photo_mask(w_s, h_s, cx_pos, cy_pos, angle)
+                    
+                    if check_pixel_collision(dilated_mask, bb_x, bb_y):
+                        continue
+                    
+                    place_photo_mask(dilated_mask, bb_x, bb_y)
+                    
+                    shadow_params = {
+                        'offset_x': rnd.choice([-1, 1]) * rnd.randint(0, 20),
+                        'offset_y': rnd.choice([-1, 1]) * rnd.randint(0, 20),
+                        'blur_sigma': rnd.uniform(8, 20),
+                        'opacity': rnd.choice([rnd.uniform(0.15, 0.25), rnd.uniform(0.45, 0.60)])
+                    }
+                    
+                    placements.append({
+                        'x': cx_pos - w_s / 2,
+                        'y': cy_pos - h_s / 2,
+                        'width': w_s,
+                        'height': h_s,
+                        'rotation': angle,
+                        'center_x': cx_pos,
+                        'center_y': cy_pos,
+                        'polygon': poly_test,
+                        'shadow_params': shadow_params
+                    })
+                    placed = True
+                    break
+    
+    for p in placements:
+        p['circle_radius'] = math.sqrt(p['width']**2 + p['height']**2) / 2 + 5
+    
+    total_area = sum(p['width'] * p['height'] for p in placements)
+    return placements, total_area
+
+
     for photo_idx, (width, height, rotation) in enumerate(photo_configs):
         placed = False
         
@@ -333,7 +387,7 @@ def spiral_pack_photos(canvas_w, canvas_h, num_photos=None):
     best_placements = []
     best_area = 0
     
-    for attempt in range(20):
+    for attempt in range(10):
         placements, total_area = pack_photos_single_attempt(
             canvas_w, canvas_h, num_photos, base_w, base_h, 
             edge_margin, size_variation, seed=attempt * 1000 + random.randint(0, 999)
@@ -1264,7 +1318,7 @@ try:
         print("ERROR: Need at least 5 source images")
         sys.exit(1)
     
-    output_dir = Path("../data/examples_v18")
+    output_dir = Path("../data/examples_v19")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     CANVAS_W, CANVAS_H = 3000, 1800  # Larger canvas to avoid dark corners
