@@ -202,23 +202,31 @@ def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, e
     def check_pixel_collision(bb_x, bb_y, small_mask, overlap_threshold=5):
         """
         Check collision using pixel-based overlap detection on bounding box region.
+        Masks are expanded by 5px (dilated) to create ~10px margin between photos.
         
-        overlap_threshold: max number of overlapping pixels allowed (default 50)
+        overlap_threshold: max number of overlapping pixels allowed (default 5)
         """
         if small_mask is None:
             return True  # Reject if mask invalid
+        
+        # Dilate both masks by 5 pixels to create margin
+        kernel = np.ones((11, 11), np.uint8)  # 11x11 kernel = 5px radius dilation
+        dilated_occ = cv2.dilate(occupancy, kernel, iterations=1)
+        dilated_new = cv2.dilate(small_mask, kernel, iterations=1)
         
         bb_h, bb_w = small_mask.shape
         x2 = min(bb_x + bb_w, canvas_w)
         y2 = min(bb_y + bb_h, canvas_h)
         
         # Get the region of occupancy we need to check
-        occ_region = occupancy[bb_y:y2, bb_x:x2]
-        new_region = small_mask[:y2-bb_y, :x2-bb_x]
+        occ_region = dilated_occ[bb_y:y2, bb_x:x2]
+        new_region = dilated_new[:y2-bb_y, :x2-bb_x]
         
         # Bitwise AND to find overlap
         overlap = cv2.bitwise_and(occ_region, new_region)
         overlap_pixels = np.count_nonzero(overlap)
+        
+        return overlap_pixels > overlap_threshold
         
         return overlap_pixels > overlap_threshold
     
