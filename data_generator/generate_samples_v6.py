@@ -1303,7 +1303,71 @@ def add_rgba_alpha(img):
     return bgra
 
 
-# =============================================================================
+def blur_alpha_edges(photo, edge_effect=None):
+    """
+    Create soft/blurred edges on ALL photo edges (top, bottom, left, right, corners).
+    
+    1. Create a distance-from-edge map (min distance to any edge)
+    2. Create soft alpha that fades near ALL edges
+    3. Blend original with blurred version at edges
+    4. Fade alpha at the edges
+    
+    Args:
+        photo: BGRA photo image
+        edge_effect: If None, randomly 5-30 pixels
+    
+    Returns:
+        BGRA photo with soft/blurred edges on all sides
+    """
+    if photo.shape[2] != 4:
+        return photo
+    
+    h, w = photo.shape[:2]
+    
+    # Random edge effect if not specified (0-5 pixels)
+    if edge_effect is None:
+        edge_effect = random.uniform(0, 5)
+    
+    if edge_effect < 1:
+        return photo
+    
+    alpha = photo[:, :, 3].astype(np.float32) / 255.0
+    rgb = photo[:, :, :3].astype(np.float32)
+    
+    # Step 1: Create distance-to-edge map for ALL edges (not just corners)
+    # Distance to top/bottom edges
+    y_dist = np.minimum(np.arange(h)[:, np.newaxis], np.arange(h)[::-1, np.newaxis])
+    # Distance to left/right edges
+    x_dist = np.minimum(np.arange(w), np.arange(w)[::-1])
+    
+    # Use MIN distance to any edge (creates uniform band around ALL edges)
+    edge_dist = np.minimum(y_dist, x_dist)
+    
+    # Step 2: Create soft alpha mask based on distance
+    # Center = 1.0 (opaque), edges = fade based on edge_effect
+    fade_dist = edge_effect * 2.5  # How far the fade extends
+    soft_alpha = np.clip(edge_dist / fade_dist, 0, 1)
+    
+    # Step 3: Create blurred version of photo (simulates focus blur at edges)
+    blur_size = int(edge_effect * 2) * 2 + 1
+    blur_size = max(blur_size, 5)
+    rgb_blurred = cv2.GaussianBlur(rgb, (blur_size, blur_size), 0)
+    
+    # Step 4: Blend original with blurred based on soft alpha
+    # Near edges (low soft_alpha) = more blurred, center (high soft_alpha) = original
+    blend_factor = 1.0 - soft_alpha
+    rgb_soft = rgb * (1 - blend_factor)[:, :, np.newaxis] + rgb_blurred * blend_factor[:, :, np.newaxis]
+    
+    # Step 5: Apply soft alpha (multiply by original alpha for clean center)
+    soft_alpha_final = alpha * soft_alpha
+    
+    # Apply
+    photo[:, :, :3] = np.clip(rgb_soft, 0, 255).astype(np.uint8)
+    photo[:, :, 3] = np.clip(soft_alpha_final * 255, 0, 255).astype(np.uint8)
+    
+    return photo
+
+
 # VERIFICATION FUNCTIONS
 # =============================================================================
 
@@ -1396,7 +1460,7 @@ try:
         print("ERROR: Need at least 5 source images")
         sys.exit(1)
     
-    output_dir = Path("../data/examples_v27")
+    output_dir = Path("../data/examples_v30")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     CANVAS_W, CANVAS_H = 3000, 1800  # Larger canvas to avoid dark corners
@@ -1449,6 +1513,9 @@ try:
             
             # Add alpha channel
             photo = add_rgba_alpha(photo)
+            
+            # Blur alpha edges to simulate imperfect focus (0-10% of image size, max 20px)
+            photo = blur_alpha_edges(photo)
             
             # CRITICAL: Apply rotation BEFORE compositing!
             photo = rotate_photo(photo, placement['rotation'])
