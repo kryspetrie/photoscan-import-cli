@@ -799,21 +799,37 @@ def calculate_warped_photo_corners(flat_corners, transform_matrix):
 def random_base_background(w, h):
     """Generate a plain background with random color and brightness.
     
-    - Random hue with random saturation (0-100%)
-    - Random brightness (40-240) - both dark AND light backgrounds
-    - 3 random linear gradients with screen overlay (0-20% opacity)
-    - Subtle noise
+    Background distribution:
+    - 30% dark-grey to black (hue saturation very low: 0-4%)
+    - 30% light-grey to white (hue saturation very low: 0-4%)
+    - 40% full color variety with 50% reduced saturation (4-40%)
+    
+    Brightness range: 10-245 out of 255
+    Saturation reduced by 20% across all categories
+    
+    Plus 3 random linear gradients with screen overlay (0-20% opacity)
+    and subtle noise.
     """
     import colorsys
     
+    # Categorize background type
+    rand_val = random.random()
+    
+    if rand_val < 0.30:
+        # 30% dark-grey to black (very low saturation)
+        lightness = random.uniform(0.04, 0.28)  # Dark: 10-72 out of 255
+        saturation = random.uniform(0, 0.04)     # Very low saturation: 0-4%
+    elif rand_val < 0.60:
+        # 30% light-grey to white (very low saturation)
+        lightness = random.uniform(0.69, 0.96)  # Light: 176-245 out of 255
+        saturation = random.uniform(0, 0.04)   # Very low saturation: 0-4%
+    else:
+        # 40% full color variety with 50% reduced saturation, 20% overall reduction
+        lightness = random.uniform(0.19, 0.86)  # Full range: 48-219 out of 255
+        saturation = random.uniform(0.04, 0.40)  # 20% reduced max: 4-40%
+    
     # Random hue (0-1)
     hue = random.uniform(0, 1)
-    
-    # Random saturation (0-100% for variety, some muted, some vibrant)
-    saturation = random.uniform(0, 1.0)
-    
-    # Random lightness/brightness (40-240 converted to 0-1)
-    lightness = random.uniform(0.15, 0.95)
     
     # Convert HLS to RGB (colorsys uses HLS order: Hue, Lightness, Saturation)
     r, g, b = colorsys.hls_to_rgb(hue, lightness, saturation)
@@ -1380,7 +1396,7 @@ try:
         print("ERROR: Need at least 5 source images")
         sys.exit(1)
     
-    output_dir = Path("../data/examples_v26")
+    output_dir = Path("../data/examples_v27")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     CANVAS_W, CANVAS_H = 3000, 1800  # Larger canvas to avoid dark corners
