@@ -128,8 +128,10 @@ def get_polygon_bounds(poly):
     )
 
 
+
+
 def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, edge_margin, size_variation, seed):
-    """Radial packing with pixel-based collision detection."""
+    """Radial packing with pixel-based collision detection and 20px margin."""
     import random as rnd
     rnd.seed(seed)
     
@@ -165,13 +167,12 @@ def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, e
     
     placements = []
     
-
-
-    def create_photo_mask(width, height, center_x, center_y, rotation, margin=20):
-        """
-        Create dilated 1-bit mask of photo for collision checking.
-        Returns mask expanded by margin and bounding box.
-        """
+    # Collision margin and kernel
+    margin = 20
+    kernel = np.ones((margin*2+1, margin*2+1), np.uint8)
+    
+    def create_dilated_mask(width, height, center_x, center_y, rotation):
+        """Create mask dilated by 20px for collision checking."""
         poly = get_rotated_polygon(width, height, center_x, center_y, rotation)
         
         xs = [p[0] for p in poly]
@@ -179,7 +180,6 @@ def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, e
         min_x, max_x = int(min(xs)), int(max(xs)) + 1
         min_y, max_y = int(min(ys)), int(max(ys)) + 1
         
-        # Expand bounding box by margin
         bb_x = max(0, min_x - margin)
         bb_y = max(0, min_y - margin)
         bb_w = min(canvas_w, max_x + margin) - bb_x
@@ -192,14 +192,11 @@ def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, e
         pts = np.array([[int(p[0]) - bb_x, int(p[1]) - bb_y] for p in poly], dtype=np.int32)
         cv2.fillPoly(mask, [pts], 255)
         
-        # Dilate mask
-        kernel = np.ones((margin*2+1, margin*2+1), np.uint8)
         dilated = cv2.dilate(mask, kernel)
-        
         return dilated, (bb_x, bb_y, bb_w, bb_h)
     
-    def check_pixel_collision(dilated_mask, bb_x, bb_y, overlap_threshold=5):
-        """Check collision against dilated occupancy mask."""
+    def check_collision(dilated_mask, bb_x, bb_y, occ_dilated, threshold=5):
+        """Check if dilated mask overlaps with dilated occupancy."""
         if dilated_mask is None:
             return True
         
@@ -207,28 +204,22 @@ def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, e
         x2 = min(bb_x + bb_w, canvas_w)
         y2 = min(bb_y + bb_h, canvas_h)
         
-        # Dilate occupancy once
-        kernel = np.ones((20*2+1, 20*2+1), np.uint8)
-        occ_dilated = cv2.dilate(occupancy, kernel)
-        
-        # Extract region from dilated occupancy that matches dilated_mask position
         occ_region = occ_dilated[bb_y:y2, bb_x:x2]
         mask_region = dilated_mask[:y2-bb_y, :x2-bb_x]
         
         overlap = cv2.bitwise_and(occ_region, mask_region)
-        return np.count_nonzero(overlap) > overlap_threshold
+        return np.count_nonzero(overlap) > threshold
     
-    def place_photo_mask(dilated_mask, bb_x, bb_y):
-        """Add dilated photo to occupancy."""
+    def place_photo(dilated_mask, bb_x, bb_y, occ_dilated):
+        """Add dilated mask to occupancy and pre-dilated occupancy."""
         if dilated_mask is None:
             return
         bb_h, bb_w = dilated_mask.shape
         x2 = min(bb_x + bb_w, canvas_w)
         y2 = min(bb_y + bb_h, canvas_h)
-        occupancy[bb_y:y2, bb_x:x2] = cv2.bitwise_or(
-            occupancy[bb_y:y2, bb_x:x2], 
-            dilated_mask[:y2-bb_y, :x2-bb_x]
-        )
+        region = dilated_mask[:y2-bb_y, :x2-bb_x]
+        occupancy[bb_y:y2, bb_x:x2] = cv2.bitwise_or(occupancy[bb_y:y2, bb_x:x2], region)
+        occ_dilated[bb_y:y2, bb_x:x2] = cv2.bitwise_or(occ_dilated[bb_y:y2, bb_x:x2], region)
     
     for photo_idx, (width, height, rotation) in enumerate(photo_configs):
         placed = False
@@ -247,6 +238,9 @@ def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, e
                 w_s = int(width * shrink)
                 h_s = int(height * shrink)
                 
+                # Pre-dilate occupancy once per shrink iteration
+                occ_dilated = cv2.dilate(occupancy, kernel) if np.any(occupancy) else occupancy.copy()
+                
                 for px, py in candidates:
                     cx_pos, cy_pos = px, py
                     
@@ -261,12 +255,12 @@ def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, e
                     if bx2 > canvas_w - edge_margin or by2 > canvas_h - edge_margin:
                         continue
                     
-                    dilated_mask, (bb_x, bb_y, _, _) = create_photo_mask(w_s, h_s, cx_pos, cy_pos, angle)
+                    dilated_mask, (bb_x, bb_y, _, _) = create_dilated_mask(w_s, h_s, cx_pos, cy_pos, angle)
                     
-                    if check_pixel_collision(dilated_mask, bb_x, bb_y):
+                    if check_collision(dilated_mask, bb_x, bb_y, occ_dilated):
                         continue
                     
-                    place_photo_mask(dilated_mask, bb_x, bb_y)
+                    place_photo(dilated_mask, bb_x, bb_y, occ_dilated)
                     
                     shadow_params = {
                         'offset_x': rnd.choice([-1, 1]) * rnd.randint(0, 20),
@@ -289,79 +283,6 @@ def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, e
                     placed = True
                     break
     
-    for p in placements:
-        p['circle_radius'] = math.sqrt(p['width']**2 + p['height']**2) / 2 + 5
-    
-    total_area = sum(p['width'] * p['height'] for p in placements)
-    return placements, total_area
-
-
-    for photo_idx, (width, height, rotation) in enumerate(photo_configs):
-        placed = False
-        
-        # Try rotations
-        if rnd.random() < 0.4:
-            angles_to_try = [rotation, 0, 90, -90]
-        else:
-            angles_to_try = [0, rotation, 90, -90]
-        
-        for angle in angles_to_try:
-            if placed:
-                break
-            for shrink in [1.0, 0.85, 0.70, 0.55, 0.45]:
-                if placed:
-                    break
-                w_s = int(width * shrink)
-                h_s = int(height * shrink)
-                
-                for px, py in candidates:
-                    cx_pos, cy_pos = px, py
-                    
-                    # Bounds check using actual polygon corners
-                    poly_test = get_rotated_polygon(w_s, h_s, cx_pos, cy_pos, angle)
-                    bx1 = min(p[0] for p in poly_test)
-                    by1 = min(p[1] for p in poly_test)
-                    bx2 = max(p[0] for p in poly_test)
-                    by2 = max(p[1] for p in poly_test)
-                    
-                    # Strict bounds check - photo must be fully inside
-                    if bx1 < edge_margin or by1 < edge_margin:
-                        continue
-                    if bx2 > canvas_w - edge_margin or by2 > canvas_h - edge_margin:
-                        continue
-                    
-                    # Create 1-bit mask for this photo
-                    new_mask, (bb_x, bb_y, _, _) = create_photo_mask(w_s, h_s, cx_pos, cy_pos, angle)
-                    
-                    # Pixel-based collision check using bitwise AND
-                    if check_pixel_collision(bb_x, bb_y, new_mask):
-                        continue
-                    
-                    # Place photo (add to occupancy)
-                    place_photo_mask(bb_x, bb_y, new_mask)
-                    
-                    shadow_params = {
-                        'offset_x': rnd.choice([-1, 1]) * rnd.randint(0, 20),
-                        'offset_y': rnd.choice([-1, 1]) * rnd.randint(0, 20),
-                        'blur_sigma': rnd.uniform(8, 20),
-                        'opacity': rnd.choice([rnd.uniform(0.15, 0.25), rnd.uniform(0.45, 0.60)])
-                    }
-                    
-                    placements.append({
-                        'x': cx_pos - w_s / 2,
-                        'y': cy_pos - h_s / 2,
-                        'width': w_s,
-                        'height': h_s,
-                        'rotation': angle,
-                        'center_x': cx_pos,
-                        'center_y': cy_pos,
-                        'polygon': poly_test,
-                        'shadow_params': shadow_params
-                    })
-                    placed = True
-                    break
-    
-    # Add circle_radius for compatibility
     for p in placements:
         p['circle_radius'] = math.sqrt(p['width']**2 + p['height']**2) / 2 + 5
     
@@ -875,6 +796,147 @@ def calculate_warped_photo_corners(flat_corners, transform_matrix):
 # BACKGROUND GENERATION
 # =============================================================================
 
+def random_base_background(w, h):
+    """Generate a plain background with random color and brightness.
+    
+    - Random hue with random saturation (0-100%)
+    - Random brightness (40-240) - both dark AND light backgrounds
+    - 3 random linear gradients with screen overlay (0-20% opacity)
+    - Subtle noise
+    """
+    import colorsys
+    
+    # Random hue (0-1)
+    hue = random.uniform(0, 1)
+    
+    # Random saturation (0-100% for variety, some muted, some vibrant)
+    saturation = random.uniform(0, 1.0)
+    
+    # Random lightness/brightness (40-240 converted to 0-1)
+    lightness = random.uniform(0.15, 0.95)
+    
+    # Convert HLS to RGB (colorsys uses HLS order: Hue, Lightness, Saturation)
+    r, g, b = colorsys.hls_to_rgb(hue, lightness, saturation)
+    color = (int(r * 255), int(g * 255), int(b * 255))
+    
+    # Create solid color background
+    img = np.ones((h, w, 3), dtype=np.float32) * np.array(color, dtype=np.float32)
+    
+    # Add subtle noise
+    noise_sigma = random.uniform(1, 4)
+    noise = np.random.normal(0, noise_sigma, (h, w, 3))
+    img = np.clip(img + noise, 0, 255).astype(np.uint8)
+    
+    # Apply 3 random linear gradients with screen overlay
+    img = apply_3_linear_gradients(img)
+    
+    return img
+
+
+def apply_3_linear_gradients(img):
+    """Apply 3 random linear gradients with screen blend (0-20% opacity).
+    
+    Gradients go from transparent to white, creating subtle light overlays.
+    """
+    h, w = img.shape[:2]
+    img_f = img.astype(np.float32) / 255.0
+    
+    for _ in range(3):
+        # Random gradient direction
+        direction = random.choice(['horizontal', 'vertical', 'diagonal_tl', 'diagonal_tr'])
+        
+        # Create gradient mask using meshgrid for efficiency
+        if direction == 'horizontal':
+            x = np.linspace(0, 1, w)
+            gradient = np.tile(x, (h, 1))
+        elif direction == 'vertical':
+            y = np.linspace(0, 1, h)[:, np.newaxis]
+            gradient = np.tile(y, (1, w))
+        elif direction == 'diagonal_tl':
+            x = np.linspace(0, 1, w)
+            y = np.linspace(0, 1, h)[:, np.newaxis]
+            gradient = x + y  # Diagonal from top-left
+            gradient = gradient / gradient.max()
+        else:  # diagonal_tr
+            x = np.linspace(1, 0, w)
+            y = np.linspace(0, 1, h)[:, np.newaxis]
+            gradient = x + y  # Diagonal from top-right
+            gradient = gradient / gradient.max()
+        
+        # Gradient goes from 0 (no overlay) to 1 (full white overlay)
+        # Random opacity (0-20%)
+        opacity = random.uniform(0, 0.20)
+        
+        # Screen blend: result = 1 - (1 - base) * (1 - overlay)
+        # The overlay is white (1,1,1) at varying intensities
+        overlay = gradient[:, :, np.newaxis] * opacity
+        
+        # Screen blend
+        result = 1.0 - (1.0 - img_f) * (1.0 - overlay)
+        
+        img_f = result
+    
+    return np.clip(img_f * 255, 0, 255).astype(np.uint8)
+
+
+def apply_texture_overlay(canvas):
+    """Apply a random texture overlay to the background.
+    
+    - Load random texture from textures folder
+    - Stretch to canvas size
+    - Apply with random opacity (0-40%)
+    - Multiply blend for light backgrounds, Screen blend for dark backgrounds
+    - Random flip (horizontal, vertical, both)
+    """
+    textures_dir = Path(__file__).parent.parent / "textures"
+    
+    if not textures_dir.exists():
+        return canvas
+    
+    textures = list(textures_dir.glob("*.jpg")) + list(textures_dir.glob("*.png"))
+    if not textures:
+        return canvas
+    
+    # Pick random texture
+    texture_path = random.choice(textures)
+    texture = cv2.imread(str(texture_path))
+    
+    if texture is None:
+        return canvas
+    
+    # Resize to canvas
+    texture = cv2.resize(texture, (canvas.shape[1], canvas.shape[0]))
+    
+    # Random flip
+    flip_code = random.choice([-1, 0, 1, None])  # None=no flip, -1=both, 0=vertical, 1=horizontal
+    if flip_code is not None:
+        texture = cv2.flip(texture, flip_code)
+    
+    # Random opacity 0-40%
+    opacity = random.uniform(0, 0.40)
+    
+    # Choose blend mode randomly (50/50 screen vs multiply)
+    use_screen = random.choice([True, False])
+    
+    # Convert canvas to float for blending
+    canvas_f = canvas.astype(np.float32) / 255.0
+    texture_f = texture.astype(np.float32) / 255.0
+    
+    if use_screen:
+        # Screen blend: result = 1 - (1 - canvas) * (1 - texture)
+        # This lightens the image
+        blended = 1.0 - (1.0 - canvas_f) * (1.0 - texture_f)
+    else:
+        # Multiply blend: result = canvas * texture
+        # This darkens/adds texture
+        blended = canvas_f * texture_f
+    
+    # Mix original and blended based on opacity
+    result = canvas_f * (1 - opacity) + blended * opacity
+    
+    return np.clip(result * 255, 0, 255).astype(np.uint8)
+
+
 def fast_background(w, h):
     """Generate background in ~0.1s."""
     from numpy.random import randint, uniform, normal
@@ -1318,7 +1380,7 @@ try:
         print("ERROR: Need at least 5 source images")
         sys.exit(1)
     
-    output_dir = Path("../data/examples_v19")
+    output_dir = Path("../data/examples_v26")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     CANVAS_W, CANVAS_H = 3000, 1800  # Larger canvas to avoid dark corners
@@ -1340,10 +1402,9 @@ try:
     for i in range(10):
         img_start = time.time()
         
-        # Generate background
-        bg = fast_background(CANVAS_W, CANVAS_H)
-        bg = fast_luma_gradient(bg)
-        bg = random_background_gradient(bg)
+        # Generate background with random colors, brightness, gradients, noise, texture
+        bg = random_base_background(CANVAS_W, CANVAS_H)
+        bg = apply_texture_overlay(bg)
         
         # Convert to BGRA for compositing
         canvas = cv2.cvtColor(bg, cv2.COLOR_BGR2BGRA)
