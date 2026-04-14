@@ -263,9 +263,9 @@ def pack_photos_single_attempt(canvas_w, canvas_h, num_photos, base_w, base_h, e
                     place_photo(dilated_mask, bb_x, bb_y, occ_dilated)
                     
                     shadow_params = {
-                        'offset_x': rnd.choice([-1, 1]) * rnd.randint(0, 20),
-                        'offset_y': rnd.choice([-1, 1]) * rnd.randint(0, 20),
-                        'blur_sigma': rnd.uniform(8, 20),
+                        'offset_x': rnd.choice([-1, 1]) * rnd.randint(0, 15),
+                        'offset_y': rnd.choice([-1, 1]) * rnd.randint(0, 15),
+                        'blur_sigma': rnd.uniform(6, 15),
                         'opacity': rnd.choice([rnd.uniform(0.15, 0.25), rnd.uniform(0.45, 0.60)])
                     }
                     
@@ -1191,31 +1191,31 @@ def fast_glare(img):
     Screen mode: result = 1 - (1-a) * (1-b)
     This ONLY brightens pixels, never darkens.
     """
-    if random.random() < 0.4:
+    if random.random() < 0.5:
         h, w = img.shape[:2]
         
-        num_flares = random.randint(1, 2)
+        num_flares = random.randint(2, 4)
         for _ in range(num_flares):
             img_f = img.astype(np.float32) / 255.0
             
             # Flare positioned anywhere in upper portion
-            cx = random.uniform(w * 0.2, w * 0.8)
-            cy = random.uniform(h * 0.1, h * 0.6)
+            cx = random.uniform(w * 0.15, w * 0.85)
+            cy = random.uniform(h * 0.1, h * 0.7)
             
-            # LARGE flare (15-25% of image dimensions) with lots of spread
-            rx = random.uniform(w * 0.15, w * 0.25)
-            ry = random.uniform(h * 0.15, h * 0.25)
+            # LARGER flare (20-40% of image dimensions) with lots of spread
+            rx = random.uniform(w * 0.20, w * 0.40)
+            ry = random.uniform(h * 0.20, h * 0.40)
             
             y, x = np.ogrid[:h, :w]
             
             # Soft elliptical flare with gradual falloff
             flare = np.maximum(0, 1 - (x - cx)**2 / (rx**2) - (y - cy)**2 / (ry**2))
             # WIDE blur for spread-out glow effect
-            flare = cv2.GaussianBlur(flare.astype(np.float32), (31, 31), 0)
+            flare = cv2.GaussianBlur(flare.astype(np.float32), (51, 51), 0)
             
             # Screen blend: 1 - (1 - base) * (1 - flare * opacity)
             # This ONLY brightens, never darkens
-            opacity = random.uniform(0.5, 0.8)  # Bright and visible
+            opacity = random.uniform(0.6, 1.0)  # Brighter and more intense
             flare_f = flare[:, :, np.newaxis]
             img_f = 1 - (1 - img_f) * (1 - flare_f * opacity)
             
@@ -1460,7 +1460,7 @@ try:
         print("ERROR: Need at least 5 source images")
         sys.exit(1)
     
-    output_dir = Path("../data/examples_v30")
+    output_dir = Path("../data/examples_v31")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     CANVAS_W, CANVAS_H = 3000, 1800  # Larger canvas to avoid dark corners
