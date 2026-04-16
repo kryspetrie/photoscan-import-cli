@@ -1,14 +1,21 @@
-# YOLO Pose Dataset
-path: /tmp/examples
+# Photo Pose Detector Dataset
+# YOLO26-pose configuration for 4-corner keypoint detection
+
+path: ../data
 train: images/train
 val: images/val
 
-kpt_shape: [4, 2]
-flip_idx: [1, 0, 3, 2]
-
+# Number of classes
 nc: 1
-names:
-  0: photo_corner
 
+# Class names
+names:
+  0: photo
+
+# Keypoint configuration (4 corners)
+kpt_shape: [4, 2]  # 4 keypoints, each with x,y coordinates
+flip_idx: [1, 0, 3, 2]  # Horizontal flip: TL<->TR, BR<->BL
+
+# Pose-specific configuration
 pose:
   flip_idx: [1, 0, 3, 2]
