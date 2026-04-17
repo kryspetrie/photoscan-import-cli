@@ -1,7 +1,7 @@
 # Photo Pose Detector Dataset
 # YOLO26-pose configuration for 4-corner keypoint detection
 
-path: ../data
+path: /Users/krys.petrie/dev/photo-pose-detector/data
 train: images/train
 val: images/val
 
@@ -12,7 +12,7 @@ nc: 1
 names:
   0: photo
 
-# Keypoint configuration (4 corners)
+# Keypoint configuration (4 corners: TL, TR, BR, BL)
 kpt_shape: [4, 2]  # 4 keypoints, each with x,y coordinates
 flip_idx: [1, 0, 3, 2]  # Horizontal flip: TL<->TR, BR<->BL
 

@@ -1,0 +1,45 @@
+# YOLO Detection Dataset Configuration
+# ====================================
+# For training the YOLO Detection Model (axis-aligned bounding boxes)
+#
+# This dataset uses the SAME images as the pose dataset, but with
+# DIFFERENT labels that only contain bounding box information.
+#
+# FORMAT: Standard YOLO detection (5 columns per object)
+#   class_id x_center y_center width height
+#
+# Usage:
+#   from ultralytics import YOLO
+#   model = YOLO('yolo11n.pt')  # or yolo26n.pt
+#   results = model.train(data='dataset_detection.yaml', ...)
+
+# Path to dataset root (relative to this file or absolute)
+path: /Users/krys.petrie/dev/photo-pose-detector/data
+
+# Training and validation image directories
+train: images/train
+val: images/val
+
+# Number of classes
+nc: 1
+
+# Class names
+names:
+  0: photo
+
+# -----------------------------------------------------------------------------
+# MODEL PURPOSE
+# -----------------------------------------------------------------------------
+# This model detects axis-aligned bounding boxes around photographs in images.
+# It outputs rectangular boxes that encapsulate all 4 corners of each photo.
+#
+# Use case:
+#   - Initial photo detection in a pipeline
+#   - Filter/reduce search space before pose detection
+#   - Quick approximate localization
+#
+# Training notes:
+#   - Standard YOLO detection (not pose)
+#   - Augmentations like mosaic/mixup are beneficial
+#   - Can train alongside pose model using same images
+# -----------------------------------------------------------------------------

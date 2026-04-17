@@ -1,20 +1,20 @@
-# Photo Pose Detector
+# Photo Pose Detector - Two-Model Architecture
 
-Train a custom YOLO26-pose model to detect the 4 corners of physical photographs within camera-scanned images, enabling extraction and perspective correction of individual photos.
+Train custom YOLO models to detect the corners of physical photographs within camera-scanned images, enabling extraction and perspective correction of individual photos.
 
 ## Overview
 
-This project trains a machine learning model to detect the corners of photographs within scanned images (photos laid out on a table, captured from above). The model outputs 4 keypoints per detected photo:
+This project trains **TWO separate YOLO models** that work together:
 
-- **Keypoint 0:** Top-Left corner
-- **Keypoint 1:** Top-Right corner
-- **Keypoint 2:** Bottom-Right corner
-- **Keypoint 3:** Bottom-Left corner
+| Model | Output | Purpose |
+|-------|--------|---------|
+| **Detection Model** | Axis-aligned bounding box | Find where photos are located |
+| **Pose Model** | 4 corner keypoints (LL, UL, UR, LR) | Detect precise corner locations |
 
-These keypoints enable:
-1. Precise photo extraction with quadrilateral crops
-2. Perspective correction when photos are tilted or skewed
-3. Hybrid pipeline with traditional CV for rough detection + ML for precise corners
+From the detected corners, you can:
+1. Extract the quadrilateral photo region
+2. Apply perspective correction to straighten the photo
+3. Create a hybrid pipeline with traditional CV + ML
 
 ## Architecture
 
@@ -26,22 +26,25 @@ These keypoints enable:
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────┐
-│  Step 1: Traditional CV (Edge detection, Contours)      │
-│  - Rough bounding box detection                          │
+│  Step 1: Detection Model (YOLO)                         │
+│  - Output: Axis-aligned bounding boxes                  │
+│  - Purpose: Find where photos are located              │
 └─────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────┐
-│  Step 2: YOLO26-Pose Corner Detection (ML)              │
-│  - Input: Cropped regions from Step 1                   │
-│  - Output: 4 keypoints per photo (confidence scores)    │
+│  Step 2: Pose Model (YOLO-Pose)                         │
+│  - Output: 4 corner keypoints per photo                  │
+│  - kp0=LL, kp1=UL, kp2=UR, kp3=LR                       │
+│  - Purpose: Precise corner locations for extraction     │
 └─────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────┐
-│  Step 3: Perspective Transform                          │
-│  - Apply perspective correction if skew > threshold      │
-│  - Output: Clean, rectangular cropped images             │
+│  Step 3: Photo Extraction                               │
+│  - Build quadrilateral from corner keypoints            │
+│  - Apply perspective transform                          │
+│  - Output: Clean, rectangular cropped images            │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -52,234 +55,306 @@ These keypoints enable:
 ```bash
 # Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# venv\Scripts\activate     # Windows
+source venv/bin/activate
 
 # Install dependencies
 pip install ultralytics torch torchvision numpy opencv-python pillow
-pip install onnx onnxruntime
 ```
 
 ### 2. Generate Training Data
 
 ```bash
 cd data_generator
-python generate_dataset.py
+python generate_batch.py > generation_log.txt 2>&1 &
 ```
 
-This generates synthetic images with realistic photo arrangements:
-- **5-10 photos per frame** arranged on a table surface
-- **Random backgrounds**: dark grey (30%), light grey (30%), colored (40%)
-- **Random rotations** (±30°) simulating handheld photos
-- **Drop shadows** with blur simulating depth
-- **Glare effects** simulating lighting
-- **Soft edges** simulating imperfect camera focus
-- **Global perspective warp** simulating camera angle
+This generates 5000 images with **BOTH** label formats:
+- Detection labels (5 columns): bounding boxes
+- Pose labels (13 columns): corner keypoints
 
-### 3. Train the Model
+### 3. Train Both Models
 
 ```bash
 cd ../training
-python train.py --epochs 100 --batch 16 --device 0
+
+# Train both models
+python train_both.py --epochs 100 --batch 16 --device 0
+
+# Or train individually
+python train_detection.py --epochs 100 --device 0
+python train_pose.py --epochs 100 --device 0
 ```
 
-### 4. Export to ONNX
+## Two-Model Architecture
 
+### Model 1: Detection Model
+
+**Type:** Standard YOLO Object Detection
+
+**Output Format:** 5 columns per object
+```
+<class_id> <x_center> <y_center> <width> <height>
+```
+
+**Use Cases:**
+- Initial photo detection in a pipeline
+- Fast approximate localization
+- Filter/reduce search space before pose detection
+
+**Training:**
 ```bash
-cd ../export
-python export_onnx.py --model ../runs/pose/weights/best.pt
+python train_detection.py --epochs 100 --batch 16
 ```
+
+---
+
+### Model 2: Pose Model
+
+**Type:** YOLO-Pose Keypoint Detection
+
+**Output Format:** 13 columns per object
+```
+<class_id> <x_center> <y_center> <width> <height> 
+<kx0> <ky0> <kc0> <kx1> <ky1> <kc1> <kx2> <ky2> <kc2> <kx3> <ky3> <kc3>
+```
+
+**Keypoint Order (CRITICAL):**
+| Keypoint | Name | Description |
+|----------|------|-------------|
+| kp0 | LL | Lower-Left (minimum Y, minimum X) |
+| kp1 | UL | Upper-Left (maximum Y, minimum X) |
+| kp2 | UR | Upper-Right (maximum Y, maximum X) |
+| kp3 | LR | Lower-Right (minimum Y, maximum X) |
+
+**Horizontal Flip Augmentation:**
+When the image is horizontally flipped, keypoints are swapped:
+- LL (kp0) ↔ LR (kp3)
+- UL (kp1) ↔ UR (kp2)
+
+This is configured via `flip_idx: [2, 3, 0, 1]` in the dataset YAML.
+
+**Use Cases:**
+- Precise corner detection
+- Photo extraction with quadrilateral crops
+- Perspective correction
+
+**Training:**
+```bash
+python train_pose.py --epochs 100 --batch 16
+```
+
+---
+
+## Data Generation (v32)
+
+### Configuration
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Canvas Size | 640×640 | Matches YOLO input size |
+| Photos per Image | 1-4 | Clean single-image training |
+| Photo Size | 60-90% of canvas | Photos fill most of frame |
+| Perspective | 5-15% | **More extreme than before** |
+| Rotation | ±30° | Random photo rotation |
+| Edge Blur | 0-5px | Soft focus simulation |
+| Shadow Offset | 0-5px | Subtle drop shadows |
+| Background | 30% dark, 30% light, 40% color | Varied environments |
+
+### Key Features
+
+1. **Single Global Perspective Warp**
+   - Applied once to entire composite
+   - Simulates camera viewing table at angle
+   - All photos distorted uniformly
+   - Ground truth corners track correctly
+
+2. **More Extreme Perspective**
+   - 5-15% strength (was 2-5%)
+   - More realistic for handheld captures
+   - Greater corner variation for ML
+
+3. **Soft Photo Edges**
+   - 0-5px Gaussian blur on all edges
+   - Simulates imperfect camera focus
+   - Prevents overfitting to sharp edges
+
+4. **Drop Shadows**
+   - Scaled for 640x640 canvas
+   - Rotates with photo
+   - Adds depth realism
+
+5. **Glare Effects**
+   - Large elliptical flares
+   - Screen blend mode
+   - Simulates lighting
+
+### Output Structure
+
+```
+data/
+├── images/
+│   ├── train/              # 4000 JPEG images (shared)
+│   └── val/                # 1000 JPEG images
+│
+├── detection/              # DETECTION MODEL DATA
+│   └── labels/
+│       ├── train/          # 4000 labels (5 columns)
+│       └── val/            # 1000 labels
+│
+└── pose/                   # POSE MODEL DATA
+    └── labels/
+        ├── train/          # 4000 labels (13 columns)
+        └── val/            # 1000 labels
+```
+
+**Same images, different labels.**
+
+---
+
+## Training
+
+### Dataset YAMLs
+
+**Detection (`dataset_detection.yaml`):**
+```yaml
+path: /path/to/data
+train: images/train
+val: images/val
+nc: 1
+names:
+  0: photo
+```
+
+**Pose (`dataset_pose.yaml`):**
+```yaml
+path: /path/to/data
+train: images/train
+val: images/val
+nc: 1
+names:
+  0: photo
+kpt_number: 4
+kpt_shape: [4, 2]
+flip_idx: [2, 3, 0, 1]
+keypoint_names:
+  - lower_left
+  - upper_left
+  - upper_right
+  - lower_right
+```
+
+### Training Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `train_detection.py` | Train detection model |
+| `train_pose.py` | Train pose model |
+| `train_both.py` | Train both models sequentially |
+
+### Recommended Hyperparameters
+
+| Parameter | Detection | Pose |
+|-----------|-----------|------|
+| Model | yolo11n.pt | yolo26n-pose.pt |
+| Epochs | 100 | 100 |
+| Batch Size | 16 | 16 |
+| Image Size | 640 | 640 |
+| Mosaic | 0.5 | 0.5 |
+| Degrees | 10 | 10 |
+| Scale | 0.5 | 0.3 |
+| Mixup | 0.1 | 0.0 |
+| Copy-paste | 0.1 | 0.0 |
+| Flip LR | 0.5 | 0.5 |
+| Flip UD | 0.0 | 0.0 |
+
+---
+
+## Inference Pipeline
+
+```python
+from ultralytics import YOLO
+import cv2
+import numpy as np
+
+# Load models
+det_model = YOLO('runs/detection/photo-detector/weights/best.pt')
+pose_model = YOLO('runs/pose/photo-corner-detector/weights/best.pt')
+
+# Read image
+image = cv2.imread('scanned_photo.jpg')
+
+# Step 1: Detection
+det_results = det_model.predict(image, verbose=False)
+boxes = det_results[0].boxes
+
+# Step 2: Pose on each detected region
+for box in boxes:
+    x1, y1, x2, y2 = map(int, box.xyxy[0])
+    region = image[y1:y2, x1:x2]
+    
+    pose_results = pose_model.predict(region, verbose=False)
+    keypoints = pose_results[0].keypoints
+    
+    # Get corner coordinates
+    # kp0=LL, kp1=UL, kp2=UR, kp3=LR
+    corners = keypoints.xy[0]  # Shape: (4, 2)
+    
+    # Map back to original image coordinates
+    offset_corners = corners.cpu().numpy()
+    offset_corners[:, 0] += x1
+    offset_corners[:, 1] += y1
+    
+    # Extract photo using perspective transform
+    src_pts = offset_corners.astype(np.float32)
+    # Order: LL, UL, UR, LR
+    width = int(max(np.linalg.norm(src_pts[3] - src_pts[0]),
+                    np.linalg.norm(src_pts[2] - src_pts[1])))
+    height = int(max(np.linalg.norm(src_pts[1] - src_pts[0]),
+                     np.linalg.norm(src_pts[2] - src_pts[3])))
+    
+    dst_pts = np.array([[0, height-1], [0, 0], [width-1, 0], [width-1, height-1]], 
+                       dtype=np.float32)
+    
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    extracted = cv2.warpPerspective(image, M, (width, height))
+    
+    # Save extracted photo
+    cv2.imwrite('extracted_photo.jpg', extracted)
+```
+
+---
 
 ## Project Structure
 
 ```
 photo-pose-detector/
-├── data_generator/              # Synthetic training data generation
-│   ├── generate_dataset.py       # Main data generator (v31)
-│   └── images/                   # Source photos (5000+ images)
-├── training/                    # Model training scripts
-├── export/                      # ONNX export
-├── onnx_inference/              # Python inference testing
-├── kotlin_integration/          # Kotlin/Android integration
-├── docs/                        # Documentation
-├── data/                        # Generated training data
-│   ├── examples_v31/            # Example outputs
-│   └── ...                      # Full datasets
-└── models/                      # Trained models
+├── data_generator/
+│   ├── generate_dataset.py     # Example generator (v32)
+│   ├── generate_batch.py      # Batch dataset generator (v32)
+│   └── images/                # Source photos
+│
+├── training/
+│   ├── dataset_detection.yaml  # Detection dataset config
+│   ├── dataset_pose.yaml       # Pose dataset config
+│   ├── train_detection.py      # Detection training script
+│   ├── train_pose.py          # Pose training script
+│   └── train_both.py          # Train both models
+│
+├── data/
+│   ├── images/                # Generated images
+│   ├── detection/labels/      # Detection labels
+│   └── pose/labels/           # Pose labels
+│
+├── textures/                   # Background textures
+│
+├── runs/
+│   ├── detection/            # Detection training runs
+│   └── pose/                 # Pose training runs
+│
+└── models/                    # Trained models
 ```
 
 ---
-
-## Data Generator Documentation
-
-### Overview
-
-The `generate_dataset.py` script creates synthetic training images that simulate real-world scanned photos. It implements a **single global perspective warp** architecture:
-
-```
-1. Pack FLAT photos on a flat background (with rotation)
-2. Apply ONE perspective warp to the ENTIRE composite
-3. Crop to content bounds
-```
-
-This architecture ensures:
-- Photos start as perfect rectangles (ground truth = 4 corners)
-- Global warp distorts all photos uniformly
-- Ground truth corners track correctly through the warp
-
-### Key Features
-
-#### Background Generation
-- **30% Dark backgrounds**: Very low saturation, brightness 10-72/255
-- **30% Light backgrounds**: Very low saturation, brightness 176-245/255
-- **40% Colored backgrounds**: Reduced saturation (20% lower), full brightness range
-
-Each background includes:
-- Solid base color with subtle noise (σ=1-4)
-- 3 linear gradients with screen blend (0-20% opacity)
-- Real texture overlay (multiply or screen blend)
-
-#### Photo Packing
-- **Spiral packing** from center outward
-- **Pixel-based collision** detection with dilated masks (~20px gap)
-- Photos placed without overlap
-- Random rotation: ±30° (10% of photos)
-
-#### Photo Effects
-- **Soft edges**: 0-5px Gaussian blur on all edges (simulates focus)
-- **Drop shadows**: Offset 0-15px, blur σ=6-15, opacity 15-60%
-- **Glare**: Large elliptical flares (20-40% of photo), opacity 60-100%
-- **Noise**: Subtle photo manipulation (brightness/contrast/colors)
-
-#### Global Perspective
-- Subtle perspective warp (2-5% strength) applied once to entire composite
-- Simulates camera viewing table at an angle
-- All photos distorted uniformly
-
-### Output Format
-
-#### YOLO26-Pose Format
-
-Images: Standard JPEG/PNG (e.g., `image_001.jpg`)
-Labels: One `.txt` file per image with one line per photo:
-
-```
-<class_id> <x_center> <y_center> <width> <height> <kx0> <ky0> <kc0> <kx1> <ky1> <kc1> <kx2> <ky2> <kc2> <kx3> <ky3> <kc3>
-```
-
-Where:
-- `class_id`: 0 (single class for "photo")
-- `x_center, y_center`: Bounding box center (normalized 0-1)
-- `width, height`: Bounding box size (normalized 0-1)
-- `kx0-3, ky0-3`: Keypoint coordinates (normalized 0-1)
-- `kc0-3`: Keypoint confidence (1.0 for synthetic data)
-
-### Configuration
-
-Key parameters in `generate_dataset.py`:
-
-| Parameter | Default | Description |
-|-----------|--------|-------------|
-| `CANVAS_W` | 3000 | Canvas width in pixels |
-| `CANVAS_H` | 1800 | Canvas height in pixels |
-| `NUM_PHOTOS` | 5-10 | Photos per frame |
-| `ROTATION_RANGE` | ±30° | Max rotation angle |
-| `EDGE_BLUR` | 0-5px | Soft edge blur amount |
-| `SHADOW_OFFSET` | 0-15px | Shadow offset range |
-| `SHADOW_BLUR` | 6-15 | Shadow blur sigma |
-| `GLARE_OPACITY` | 60-100% | Glare intensity |
-
-### Running Examples
-
-```bash
-# Generate 10 example images
-python generate_dataset.py
-
-# Images saved to ../data/examples_v31/
-```
-
-### Extending the Generator
-
-#### Adding New Background Types
-
-Edit `random_base_background()` function:
-
-```python
-def random_base_background(w, h):
-    """Generate background with custom distribution."""
-    rand_val = random.random()
-    
-    if rand_val < 0.30:  # Dark
-        lightness = random.uniform(0.04, 0.28)
-        saturation = random.uniform(0, 0.04)
-    elif rand_val < 0.60:  # Light
-        lightness = random.uniform(0.69, 0.96)
-        saturation = random.uniform(0, 0.04)
-    else:  # Colored
-        lightness = random.uniform(0.19, 0.86)
-        saturation = random.uniform(0.04, 0.40)
-```
-
-#### Adding New Photo Effects
-
-Edit `fast_photo_manipulation()` function:
-
-```python
-def fast_photo_manipulation(img):
-    """Add effects to individual photos."""
-    # Brightness/contrast adjustments
-    # Color shifts
-    # Noise
-    # etc.
-```
-
-## Model Training
-
-### YOLO26-Pose Configuration
-
-| Parameter | Value |
-|-----------|-------|
-| Base Model | YOLO26n-pose (nano) |
-| Input Size | 640x640 |
-| Keypoints | 4 (photo corners) |
-| Classes | 1 (photo) |
-
-### Training Hyperparameters
-
-```bash
-python train.py \
-    --epochs 100 \
-    --batch 16 \
-    --imgsz 640 \
-    --device 0 \
-    --lr0 0.001 \
-    --patience 20
-```
-
-### Expected Performance
-
-| Metric | Target |
-|--------|--------|
-| mAP50 | >0.85 |
-| mAP50-95 | >0.65 |
-| Keypoint Accuracy | >95% |
-| Inference Time | <50ms (CPU) |
-
-## Kotlin Integration
-
-```kotlin
-val detector = PhotoCornerDetector("model.onnx")
-val detections = detector.detect(image)
-
-// Get corner coordinates
-val topLeft = detections[0].keypoints[0]
-val topRight = detections[0].keypoints[1]
-val bottomRight = detections[0].keypoints[2]
-val bottomLeft = detections[0].keypoints[3]
-
-// Extract with perspective correction
-val extracted = detector.extractPhoto(image, corners)
-```
 
 ## Troubleshooting
 
@@ -287,31 +362,61 @@ val extracted = detector.extractPhoto(image, corners)
 
 | Problem | Solution |
 |---------|----------|
-| Loss is NaN | Reduce learning rate (--lr0 0.0001) |
+| Loss is NaN | Reduce learning rate (`--lr0 0.0001`) |
 | Overfitting | Reduce augmentation, add more data |
 | Low accuracy | Verify annotations, train longer |
+| Keypoints wrong order | Check `flip_idx` in YAML |
 
 ### Generation Issues
 
 | Problem | Solution |
 |---------|----------|
-| Photos overlapping | Increase collision dilation |
+| Photos overlapping | Increase collision margin |
 | Black borders | Adjust perspective warp strength |
 | Slow generation | Reduce canvas size or photo count |
+| Too extreme perspective | Lower `PERSPECTIVE_STRENGTH_MAX` |
+
+### Label Format Verification
+
+**Detection (5 columns):**
+```
+0 0.501715 0.505848 0.378018 0.590964
+```
+
+**Pose (13 columns + keypoint visibility):**
+```
+0 0.501715 0.505848 0.378018 0.590964 0.312194 0.801330 2 0.690212 0.801330 2 0.689914 0.210366 2 0.314542 0.210366 2
+```
+
+---
+
+## Version History
+
+### v32 (Current)
+- **Two-model architecture**: Detection + Pose
+- **640x640 canvas**: Matches YOLO input
+- **1-4 photos per image**: Cleaner training
+- **More extreme perspective**: 5-15% strength
+- **Fixed keypoint order**: LL, UL, UR, LR
+- **Same images, different labels**
+
+### v31 (Previous)
+- Single YOLO-pose model
+- 1920x1080 canvas
+- 5-10 photos per image
+- Subtle perspective: 2-5%
+- Keypoint order: TL, TR, BR, BL
+
+---
 
 ## Requirements
 
 - Python 3.9+
 - OpenCV 4.x
 - NumPy
-- Ultralytics
-- CUDA (optional, for GPU training)
-
-## References
-
-- [Ultralytics YOLO26 Pose](https://docs.ultralytics.com/tasks/pose/)
-- [YOLO26 Training Recipe](https://docs.ultralytics.com/guides/yolo26-training-recipe/)
-- [ONNX Runtime](https://onnxruntime.ai/)
+- Ultralytics 8.x
+- PyTorch 2.x
+- PIL/Pillow
 
 ## License
 
