@@ -93,53 +93,67 @@ CONFIG = {
 
 def get_rotated_polygon(width, height, center_x, center_y, rotation):
     """
-    Calculate the 4 corner coordinates of a rotated rectangle.
+    Calculate the 4 corner coordinates of a rotated rectangle in CANVAS SPACE.
     
-    This must match where rotate_photo() places corners when the photo
-    is centered at (center_x, center_y) in placement space.
+    This must match where rotate_photo() + composite_photo_at_center() places corners
+    when the photo is centered at (center_x, center_y) in canvas space.
     
-    The correct formula is:
-    polygon = (center_x - width/2, center_y - height/2) + M_raw @ corner
+    CORRECTED v2:
+    1. Use full rotation matrix M (with translation for centering)
+    2. Calculate rotated dimensions to determine top_left position
+    3. Transform corners: top_left + M @ corner
     
-    Where M_raw is cv2.getRotationMatrix2D WITHOUT the canvas expansion offset.
-    The rotate_photo() function adds canvas expansion to M, but when compositing,
-    the canvas top-left is (center_x - new_w/2, center_y - new_h/2), which cancels out
-    the canvas expansion offset.
+    Returns corners in order: [LL, UL, UR, LR]
+    - LL: Lower-Left (bottom-left)
+    - UL: Upper-Left (top-left)
+    - UR: Upper-Right (top-right)
+    - LR: Lower-Right (bottom-right)
     """
     import cv2
     import numpy as np
     
     if abs(rotation) < 1:
-        hw, hh = width / 2, height / 2
         return np.array([
-            [center_x - hw, center_y - hh],
-            [center_x + hw, center_y - hh],
-            [center_x + hw, center_y + hh],
-            [center_x - hw, center_y + hh]
+            [center_x - width/2, center_y + height/2],  # LL
+            [center_x - width/2, center_y - height/2],  # UL
+            [center_x + width/2, center_y - height/2],  # UR
+            [center_x + width/2, center_y + height/2]   # LR
         ], dtype=np.float32)
     
-    # Build rotation matrix around photo center (WITHOUT canvas expansion offset)
+    # Get rotation matrix around photo center
     photo_center = (width / 2, height / 2)
-    M_raw = cv2.getRotationMatrix2D(photo_center, rotation, 1.0)
+    M = cv2.getRotationMatrix2D(photo_center, rotation, 1.0)
     
-    # Canvas offset: this is where the photo center is relative to origin
-    canvas_offset = (center_x - width / 2, center_y - height / 2)
+    # Calculate new dimensions after rotation (same formula as rotate_photo)
+    cos = abs(M[0, 0])
+    sin = abs(M[0, 1])
+    new_w = int(height * sin + width * cos)
+    new_h = int(width * sin + height * cos)
     
-    # Corners in PHOTO SPACE (at the edges of the original photo)
+    # Add translation to center the rotated photo (same as rotate_photo)
+    M[0, 2] += (new_w - width) / 2
+    M[1, 2] += (new_h - height) / 2
+    
+    # Top-left position of rotated photo in canvas
+    top_left_x = center_x - new_w / 2
+    top_left_y = center_y - new_h / 2
+    
+    # Corners in PHOTO SPACE (clockwise from bottom-left)
     corners_photo = np.array([
-        [0, 0],              # TL
-        [width, 0],          # TR
-        [width, height],     # BR
-        [0, height]          # BL
+        [0, height],      # LL - bottom-left
+        [0, 0],            # UL - top-left
+        [width, 0],        # UR - top-right
+        [width, height]    # LR - bottom-right
     ], dtype=np.float32)
     
-    # Transform corners: polygon = canvas_offset + M_raw @ corner
-    corners_final = np.zeros_like(corners_photo)
+    # Transform: M @ corner gives position in rotated photo
+    # Then add top_left for canvas position
+    corners_final = np.zeros((4, 2), dtype=np.float32)
     for i in range(4):
         pt = np.array([corners_photo[i, 0], corners_photo[i, 1], 1])
-        rotated = M_raw @ pt
-        corners_final[i, 0] = canvas_offset[0] + rotated[0]
-        corners_final[i, 1] = canvas_offset[1] + rotated[1]
+        rotated = M @ pt
+        corners_final[i, 0] = top_left_x + rotated[0]
+        corners_final[i, 1] = top_left_y + rotated[1]
     
     return corners_final
 
