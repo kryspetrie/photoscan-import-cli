@@ -19,6 +19,7 @@ from pathlib import Path
 import random
 import sys
 import time
+import colorsys
 
 # Configuration
 CANVAS_SIZE = 640
@@ -160,6 +161,117 @@ def composite_photo_at_center(canvas, photo, cx, cy):
     
     return canvas
 
+
+# =============================================================================
+# BACKGROUND GENERATION WITH GRADIENTS AND TEXTURES
+# =============================================================================
+
+def random_base_background(w, h):
+    """Generate a random background with controlled brightness and saturation."""
+    rand_val = random.random()
+    
+    # 30% dark, 30% light, 40% medium with varying saturation
+    if rand_val < 0.30:
+        lightness = random.uniform(0.04, 0.28)
+        saturation = random.uniform(0, 0.04)
+    elif rand_val < 0.60:
+        lightness = random.uniform(0.69, 0.96)
+        saturation = random.uniform(0, 0.04)
+    else:
+        lightness = random.uniform(0.19, 0.86)
+        saturation = random.uniform(0.04, 0.40)
+    
+    hue = random.uniform(0, 1)
+    r, g, b = colorsys.hls_to_rgb(hue, lightness, saturation)
+    color = (int(r * 255), int(g * 255), int(b * 255))
+    
+    img = np.ones((h, w, 3), dtype=np.float32) * np.array(color, dtype=np.float32)
+    
+    # Add noise
+    noise_sigma = random.uniform(1, 4)
+    noise = np.random.normal(0, noise_sigma, (h, w, 3))
+    img = np.clip(img + noise, 0, 255).astype(np.uint8)
+    
+    img = apply_3_linear_gradients(img)
+    
+    return img
+
+
+def apply_3_linear_gradients(img):
+    """Apply 3 random linear gradients with screen blend."""
+    h, w = img.shape[:2]
+    img_f = img.astype(np.float32) / 255.0
+    
+    for _ in range(3):
+        direction = random.choice(['horizontal', 'vertical', 'diagonal_tl', 'diagonal_tr'])
+        
+        if direction == 'horizontal':
+            x = np.linspace(0, 1, w)
+            gradient = np.tile(x, (h, 1))
+        elif direction == 'vertical':
+            y = np.linspace(0, 1, h)[:, np.newaxis]
+            gradient = np.tile(y, (1, w))
+        elif direction == 'diagonal_tl':
+            x = np.linspace(0, 1, w)
+            y = np.linspace(0, 1, h)[:, np.newaxis]
+            gradient = x + y
+            gradient = gradient / gradient.max()
+        else:
+            x = np.linspace(1, 0, w)
+            y = np.linspace(0, 1, h)[:, np.newaxis]
+            gradient = x + y
+            gradient = gradient / gradient.max()
+        
+        opacity = random.uniform(0, 0.20)
+        overlay = gradient[:, :, np.newaxis] * opacity
+        result = 1.0 - (1.0 - img_f) * (1.0 - overlay)
+        img_f = result
+    
+    return np.clip(img_f * 255, 0, 255).astype(np.uint8)
+
+
+def apply_texture_overlay(canvas):
+    """Apply a random texture overlay to the background."""
+    textures_dir = Path("/Users/krys.petrie/dev/photo-pose-detector/textures")
+    
+    if not textures_dir.exists():
+        return canvas
+    
+    textures = list(textures_dir.glob("*.jpg")) + list(textures_dir.glob("*.png"))
+    if not textures:
+        return canvas
+    
+    texture_path = random.choice(textures)
+    texture = cv2.imread(str(texture_path))
+    
+    if texture is None:
+        return canvas
+    
+    texture = cv2.resize(texture, (canvas.shape[1], canvas.shape[0]))
+    
+    flip_code = random.choice([-1, 0, 1, None])
+    if flip_code is not None:
+        texture = cv2.flip(texture, flip_code)
+    
+    opacity = random.uniform(0, 0.40)
+    use_screen = random.choice([True, False])
+    
+    canvas_f = canvas.astype(np.float32) / 255.0
+    texture_f = texture.astype(np.float32) / 255.0
+    
+    if use_screen:
+        blended = 1.0 - (1.0 - canvas_f) * (1.0 - texture_f)
+    else:
+        blended = canvas_f * texture_f
+    
+    result = canvas_f * (1 - opacity) + blended * opacity
+    
+    return np.clip(result * 255, 0, 255).astype(np.uint8)
+
+
+# =============================================================================
+# SAFE PERSPECTIVE - KEEPS CORNERS IN BOUNDS
+# =============================================================================
 
 def apply_perspective_safe(canvas, corners_list):
     """
@@ -307,16 +419,14 @@ def pack_photos_simple(canvas_size):
 
 
 def generate_image(source_dir):
-    """Generate a single image."""
+    """Generate a single image with textured background."""
     sources = list(Path(source_dir).glob('*.jpg')) + list(Path(source_dir).glob('*.jpeg'))
     if not sources:
         raise ValueError(f"No source images found")
     
-    # Create gradient background
-    canvas = np.zeros((CANVAS_SIZE, CANVAS_SIZE, 3), dtype=np.uint8)
-    for y in range(CANVAS_SIZE):
-        val = int(140 + 60 * y / CANVAS_SIZE)
-        canvas[y, :] = [val, val, val]
+    # Create textured background with gradients and noise
+    canvas = random_base_background(CANVAS_SIZE, CANVAS_SIZE)
+    canvas = apply_texture_overlay(canvas)
     
     # Pack photos
     placements = pack_photos_simple(CANVAS_SIZE)
@@ -412,7 +522,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Generate training data')
     parser.add_argument('--source', default='./images', help='Source images')
-    parser.add_argument('--output', default='./data/examples_v2', help='Output dir')
+    parser.add_argument('--output', default='./data/examples_v2_final', help='Output dir')
     parser.add_argument('--count', type=int, default=10, help='Number of images')
     args = parser.parse_args()
     
