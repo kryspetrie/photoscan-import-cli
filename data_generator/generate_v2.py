@@ -8,6 +8,7 @@ Issues fixed:
 2. Bounding box matches actual corners (computed from corners, not separately)
 3. Photos actually visible in output
 4. Perspective transform keeps corners in bounds
+5. Proper alpha compositing for smooth photo edges
 
 Author: Photo Pose Detector Project
 """
@@ -68,8 +69,13 @@ def get_rotated_polygon(width, height, center_x, center_y, rotation):
 
 
 def rotate_photo(photo, angle):
-    """Rotate photo."""
+    """Rotate photo with alpha channel."""
     h, w = photo.shape[:2]
+    
+    # Add alpha channel if not present
+    if photo.shape[2] == 3:
+        photo = cv2.cvtColor(photo, cv2.COLOR_BGR2BGRA)
+    
     if abs(angle) < 1:
         return photo
     
@@ -85,27 +91,72 @@ def rotate_photo(photo, angle):
     return cv2.warpAffine(photo, M, (new_w, new_h), 
                           flags=cv2.INTER_LINEAR,
                           borderMode=cv2.BORDER_CONSTANT, 
-                          borderValue=(128, 128, 128))
+                          borderValue=(0, 0, 0, 0))  # Transparent border
 
 
 def composite_photo_at_center(canvas, photo, cx, cy):
-    """Composite photo onto canvas."""
+    """
+    Composite BGRA photo onto canvas with alpha compositing.
+    Photo edges with alpha=0 are transparent (show canvas through).
+    """
     ph, pw = photo.shape[:2]
+    ch, cw = canvas.shape[:2]
+    
+    # Ensure canvas has alpha channel
+    if canvas.shape[2] == 3:
+        canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2BGRA)
+        canvas[:, :, 3] = 255  # Opaque canvas
+    
     top_left_x = int(cx - pw / 2)
     top_left_y = int(cy - ph / 2)
     
-    dst_x1 = max(0, top_left_x)
-    dst_y1 = max(0, top_left_y)
-    dst_x2 = min(canvas.shape[1], top_left_x + pw)
-    dst_y2 = min(canvas.shape[0], top_left_y + ph)
+    # Calculate source and destination regions
+    src_x1, src_y1 = 0, 0
+    src_x2, src_y2 = pw, ph
+    dst_x1, dst_y1 = top_left_x, top_left_y
+    dst_x2, dst_y2 = top_left_x + pw, top_left_y + ph
     
-    src_x1 = dst_x1 - top_left_x
-    src_y1 = dst_y1 - top_left_y
-    src_x2 = src_x1 + (dst_x2 - dst_x1)
-    src_y2 = src_y1 + (dst_y2 - dst_y1)
+    # Clip to canvas bounds
+    if dst_x1 < 0:
+        src_x1 = -dst_x1
+        dst_x1 = 0
+    if dst_y1 < 0:
+        src_y1 = -dst_y1
+        dst_y1 = 0
+    if dst_x2 > cw:
+        src_x2 = src_x1 + (cw - dst_x1)
+        dst_x2 = cw
+    if dst_y2 > ch:
+        src_y2 = src_y1 + (ch - dst_y1)
+        dst_y2 = ch
     
-    if dst_x2 > dst_x1 and dst_y2 > dst_y1:
-        canvas[dst_y1:dst_y2, dst_x1:dst_x2] = photo[src_y1:src_y2, src_x1:src_x2]
+    copy_w = int(dst_x2 - dst_x1)
+    copy_h = int(dst_y2 - dst_y1)
+    
+    if copy_w <= 0 or copy_h <= 0:
+        return canvas
+    
+    src_x1, src_y1 = int(src_x1), int(src_y1)
+    
+    # Extract regions
+    canvas_region = canvas[dst_y1:dst_y2, dst_x1:dst_x2].astype(np.float32) / 255.0
+    photo_region = photo[src_y1:src_y1+copy_h, src_x1:src_x1+copy_w].astype(np.float32) / 255.0
+    
+    # Get alpha from photo (4th channel)
+    photo_alpha = photo_region[:, :, 3:4]
+    canvas_alpha = canvas_region[:, :, 3:4]
+    
+    # Alpha compositing: result = photo * photo_alpha + canvas * canvas_alpha * (1 - photo_alpha)
+    # Normalize alpha to [0, 1]
+    alpha = photo_alpha
+    result_rgb = photo_region[:, :, :3] * alpha + canvas_region[:, :, :3] * (1 - alpha)
+    result_alpha = np.maximum(canvas_alpha, alpha)  # Keep max opacity
+    
+    # Convert back to uint8
+    result = np.concatenate([result_rgb, result_alpha], axis=2)
+    result = (np.clip(result, 0, 1) * 255).astype(np.uint8)
+    
+    canvas[dst_y1:dst_y2, dst_x1:dst_x2] = result
     
     return canvas
 
@@ -113,11 +164,17 @@ def composite_photo_at_center(canvas, photo, cx, cy):
 def apply_perspective_safe(canvas, corners_list):
     """
     Apply perspective transform that keeps all corners in bounds.
-    Iteratively reduces strength until corners are within bounds.
+    Returns BGR canvas (alpha flattened).
     """
     h, w = canvas.shape[:2]
     max_strength = 0.05  # Start at 5%
     safety_margin = 15  # Keep corners this many pixels inside bounds
+    
+    # Convert to BGR if BGRA (for warpPerspective)
+    if canvas.shape[2] == 4:
+        canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_BGRA2BGR)
+    else:
+        canvas_bgr = canvas.copy()
     
     for strength in np.linspace(max_strength, 0.0, 25):
         max_disp = int(min(w, h) * strength)
@@ -153,13 +210,13 @@ def apply_perspective_safe(canvas, corners_list):
                     all_in_bounds = False
         
         if all_in_bounds:
-            warped = cv2.warpPerspective(canvas, M, (w, h),
+            warped = cv2.warpPerspective(canvas_bgr, M, (w, h),
                                        borderMode=cv2.BORDER_CONSTANT,
                                        borderValue=(128, 128, 128))
             return warped, M, True
     
     # Fallback: no perspective
-    return canvas.copy(), np.eye(3), False
+    return canvas_bgr, np.eye(3), False
 
 
 def pack_photos_simple(canvas_size):
