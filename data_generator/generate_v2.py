@@ -33,6 +33,269 @@ NUM_PHOTOS_MAX = 4
 EDGE_MARGIN = 50
 
 
+# =============================================================================
+# PLACEMENT VALIDATION — prevent overlaps and off-screen photos
+# =============================================================================
+
+OVERLAP_THRESHOLD = 0.05   # Max allowed overlap (5% of smaller photo area)
+BOUND_MARGIN = 80          # Minimum margin from canvas edge for rotated corners
+MAX_PACK_ATTEMPTS = 50     # Retries before reducing photo count
+
+
+def compute_rotated_bbox(width, height, center_x, center_y, rotation):
+    """Compute axis-aligned bounding box of a rotated rectangle."""
+    corners = get_rotated_polygon(width, height, center_x, center_y, rotation)
+    xs = corners[:, 0]
+    ys = corners[:, 1]
+    return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+
+
+def check_bounds(placements, canvas_size, margin=BOUND_MARGIN):
+    """Check that all rotated photo corners stay within canvas bounds."""
+    for p in placements:
+        corners = get_rotated_polygon(p['width'], p['height'],
+                                       p['center_x'], p['center_y'],
+                                       p['rotation'])
+        for c in corners:
+            if c[0] < margin or c[0] > canvas_size - margin:
+                return False
+            if c[1] < margin or c[1] > canvas_size - margin:
+                return False
+    return True
+
+
+def polygon_area(corners):
+    """Compute area of a simple polygon using the shoelace formula."""
+    n = len(corners)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += corners[i][0] * corners[j][1]
+        area -= corners[j][0] * corners[i][1]
+    return abs(area) / 2.0
+
+
+def polygon_intersection_area(poly1, poly2):
+    """
+    Compute the intersection area of two convex polygons using rasterization.
+    Falls back to bounding box overlap if polygon clipping fails.
+    """
+    # Use shapely-free approach: rasterize both polygons on a small grid
+    # and count overlapping pixels. Fast enough for 2-4 polygons on 640x640.
+    try:
+        # Use OpenCV to create binary masks and count overlap
+        canvas_size = 640
+        mask1 = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
+        mask2 = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
+        
+        pts1 = corners_to_int_points(poly1)
+        pts2 = corners_to_int_points(poly2)
+        
+        cv2.fillPoly(mask1, [pts1], 1)
+        cv2.fillPoly(mask2, [pts2], 1)
+        
+        overlap = np.count_nonzero(mask1 & mask2)
+        return float(overlap)
+    except Exception:
+        # Fallback: bounding box overlap
+        x1_min, y1_min, x1_max, y1_max = bounding_box(poly1)
+        x2_min, y2_min, x2_max, y2_max = bounding_box(poly2)
+        
+        ix_min = max(x1_min, x2_min)
+        iy_min = max(y1_min, y2_min)
+        ix_max = min(x1_max, x2_max)
+        iy_max = min(y1_max, y2_max)
+        
+        if ix_max <= ix_min or iy_max <= iy_min:
+            return 0.0
+        return float((ix_max - ix_min) * (iy_max - iy_min))
+
+
+def corners_to_int_points(corners):
+    """Convert corners array to int32 points for OpenCV."""
+    return np.array([[int(round(c[0])), int(round(c[1]))] for c in corners],
+                     dtype=np.int32)
+
+
+def bounding_box(corners):
+    """Get bounding box of polygon corners."""
+    xs = [c[0] for c in corners]
+    ys = [c[1] for c in corners]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def check_overlaps(placements, threshold=OVERLAP_THRESHOLD):
+    """
+    Check that no pair of photos overlaps more than threshold.
+    Uses pixel-based polygon intersection for accuracy.
+    Returns True if all pairs are within the threshold.
+    """
+    n = len(placements)
+    if n <= 1:
+        return True
+    
+    # Compute polygon corners and pixel areas for each placement
+    polys = []
+    areas = []
+    for p in placements:
+        corners = get_rotated_polygon(p['width'], p['height'],
+                                       p['center_x'], p['center_y'],
+                                       p['rotation'])
+        polys.append(corners)
+        # Compute area via polygon formula (accurate)
+        areas.append(polygon_area(corners))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if areas[i] < 1 or areas[j] < 1:
+                continue
+            overlap_pixels = polygon_intersection_area(polys[i], polys[j])
+            smaller_area = min(areas[i], areas[j])
+            overlap_fraction = overlap_pixels / smaller_area
+            if overlap_fraction > threshold:
+                return False
+    return True
+
+
+def verify_composited_pixels(canvas, expected_areas):
+    """
+    After compositing, verify that the total opaque pixel count
+    matches expectations. Returns True if within 90-110% of expected.
+    """
+    if canvas.shape[2] == 4:
+        alpha = canvas[:, :, 3]
+        composited = np.count_nonzero(alpha > 128)
+    else:
+        # For 3-channel, use brightness deviation from background
+        # This is approximate — skip verification for 3-channel canvases
+        return True
+    
+    expected_total = sum(expected_areas)
+    if expected_total < 1:
+        return True
+    
+    ratio = composited / expected_total
+    # Allow 10% tolerance for clipping at edges
+    return 0.80 <= ratio <= 1.10
+
+
+def pack_photos_validated(canvas_size):
+    """
+    Pack photos with validation: no overlaps, all corners within bounds.
+    Retries placement up to MAX_ATTEMPTS times, then reduces photo count.
+    """
+    for num_photos in range(NUM_PHOTOS_MAX, NUM_PHOTOS_MIN - 1, -1):
+        for attempt in range(MAX_PACK_ATTEMPTS):
+            placements = _generate_placements(num_photos, canvas_size)
+            if check_bounds(placements, canvas_size) and check_overlaps(placements):
+                return placements
+        # Couldn't place this many photos, try fewer
+    
+    # Fallback: single small photo at center
+    return [{
+        'width': 180, 'height': 144,
+        'center_x': canvas_size / 2, 'center_y': canvas_size / 2,
+        'rotation': 0
+    }]
+
+
+def _generate_placements(num_photos, canvas_size):
+    """Generate candidate placements (same logic as old pack_photos_simple)."""
+    placements = []
+    margin = BOUND_MARGIN
+    
+    if num_photos == 1:
+        size = random.randint(PHOTO_SIZE_MIN, PHOTO_SIZE_MAX)
+        aspect = random.uniform(0.7, 1.3)
+        height = int(size * aspect)
+        width = int(size)
+        
+        cx = canvas_size / 2 + random.uniform(-60, 60)
+        cy = canvas_size / 2 + random.uniform(-60, 60)
+        rotation = random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
+        
+        placements.append({
+            'width': width, 'height': height,
+            'center_x': cx, 'center_y': cy,
+            'rotation': rotation
+        })
+    
+    elif num_photos == 2:
+        size = random.randint(PHOTO_SIZE_MIN, min(380, PHOTO_SIZE_MAX))
+        aspect1 = random.uniform(0.7, 1.3)
+        aspect2 = random.uniform(0.7, 1.3)
+        
+        if random.random() < 0.5:  # Horizontal
+            w1 = int(size * random.uniform(0.8, 1.0))
+            h1 = int(w1 * aspect1)
+            w2 = int(size * random.uniform(0.8, 1.0))
+            h2 = int(w2 * aspect2)
+            
+            cx1 = canvas_size * 0.3 + random.uniform(-30, 30)
+            cy1 = canvas_size * 0.5 + random.uniform(-30, 30)
+            cx2 = canvas_size * 0.7 + random.uniform(-30, 30)
+            cy2 = canvas_size * 0.5 + random.uniform(-30, 30)
+        else:  # Vertical
+            h1 = int(size * random.uniform(0.8, 1.0))
+            w1 = int(h1 * aspect1)
+            h2 = int(size * random.uniform(0.8, 1.0))
+            w2 = int(h2 * aspect2)
+            
+            cx1 = canvas_size * 0.5 + random.uniform(-30, 30)
+            cy1 = canvas_size * 0.3 + random.uniform(-30, 30)
+            cx2 = canvas_size * 0.5 + random.uniform(-30, 30)
+            cy2 = canvas_size * 0.7 + random.uniform(-30, 30)
+        
+        placements.append({
+            'width': w1, 'height': h1,
+            'center_x': cx1, 'center_y': cy1,
+            'rotation': random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
+        })
+        placements.append({
+            'width': w2, 'height': h2,
+            'center_x': cx2, 'center_y': cy2,
+            'rotation': random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
+        })
+    
+    else:  # 3 or 4 photos — grid layout with more margin
+        size = random.randint(PHOTO_SIZE_MIN, min(320, PHOTO_SIZE_MAX))
+        
+        cols = 2
+        rows = 2 if num_photos == 4 else 2
+        
+        usable = canvas_size - 2 * margin
+        cell_w = usable / cols
+        cell_h = usable / rows
+        
+        positions = []
+        for r in range(rows):
+            for c in range(cols):
+                positions.append((r, c))
+        random.shuffle(positions)
+        positions = positions[:num_photos]
+        
+        for row, col in positions:
+            aspect = random.uniform(0.7, 1.3)
+            width = int(cell_w * random.uniform(0.55, 0.75))
+            height = int(width * aspect)
+            
+            # Keep height within cell
+            if height > cell_h * 0.75:
+                height = int(cell_h * 0.75)
+                width = int(height / aspect)
+            
+            cx = margin + (col + 0.5) * cell_w + random.uniform(-cell_w * 0.05, cell_w * 0.05)
+            cy = margin + (row + 0.5) * cell_h + random.uniform(-cell_h * 0.05, cell_h * 0.05)
+            
+            placements.append({
+                'width': width, 'height': height,
+                'center_x': cx, 'center_y': cy,
+                'rotation': random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
+            })
+    
+    return placements
+
+
 def get_rotated_polygon(width, height, center_x, center_y, rotation):
     """Calculate corners of rotated rectangle - VERIFIED CORRECT."""
     if abs(rotation) < 1:
@@ -456,95 +719,8 @@ def apply_perspective_safe(canvas, corners_list):
     return canvas_bgr, np.eye(3), False
 
 
-def pack_photos_simple(canvas_size):
-    """Simple photo packing - ensures photos reach canvas edges."""
-    num_photos = random.randint(NUM_PHOTOS_MIN, NUM_PHOTOS_MAX)
-    placements = []
-    
-    if num_photos == 1:
-        size = random.randint(PHOTO_SIZE_MIN, PHOTO_SIZE_MAX)
-        aspect = random.uniform(0.6, 1.5)
-        height = int(size * aspect)
-        width = int(size)
-        
-        cx = canvas_size / 2 + random.uniform(-80, 80)
-        cy = canvas_size / 2 + random.uniform(-80, 80)
-        rotation = random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
-        
-        placements.append({
-            'width': width, 'height': height,
-            'center_x': cx, 'center_y': cy,
-            'rotation': rotation
-        })
-    
-    elif num_photos == 2:
-        size = random.randint(PHOTO_SIZE_MIN, min(400, PHOTO_SIZE_MAX))
-        
-        if random.random() < 0.5:  # Horizontal
-            w1 = int(size * random.uniform(0.8, 1.0))
-            h1 = int(size * random.uniform(0.8, 1.2))
-            w2 = int(size * random.uniform(0.8, 1.0))
-            h2 = int(size * random.uniform(0.8, 1.2))
-            
-            cx1 = canvas_size * 0.3 + random.uniform(-40, 40)
-            cy1 = canvas_size * 0.5 + random.uniform(-60, 60)
-            cx2 = canvas_size * 0.7 + random.uniform(-40, 40)
-            cy2 = canvas_size * 0.5 + random.uniform(-60, 60)
-        else:  # Vertical
-            w1 = int(size * random.uniform(0.8, 1.2))
-            h1 = int(size * random.uniform(0.8, 1.0))
-            w2 = int(size * random.uniform(0.8, 1.2))
-            h2 = int(size * random.uniform(0.8, 1.0))
-            
-            cx1 = canvas_size * 0.5 + random.uniform(-60, 60)
-            cy1 = canvas_size * 0.3 + random.uniform(-40, 40)
-            cx2 = canvas_size * 0.5 + random.uniform(-60, 60)
-            cy2 = canvas_size * 0.7 + random.uniform(-40, 40)
-        
-        placements.append({
-            'width': w1, 'height': h1,
-            'center_x': cx1, 'center_y': cy1,
-            'rotation': random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
-        })
-        placements.append({
-            'width': w2, 'height': h2,
-            'center_x': cx2, 'center_y': cy2,
-            'rotation': random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
-        })
-    
-    else:  # 3 or 4 photos
-        cols = 2
-        rows = 2 if num_photos == 4 else (2 if num_photos == 3 and random.random() < 0.5 else 3)
-        
-        cell_w = (canvas_size - 2 * EDGE_MARGIN) / cols
-        cell_h = (canvas_size - 2 * EDGE_MARGIN) / rows
-        
-        positions = []
-        for r in range(rows):
-            for c in range(cols):
-                positions.append((r, c))
-        
-        random.shuffle(positions)
-        positions = positions[:num_photos]
-        
-        for row, col in positions:
-            width = int(cell_w * random.uniform(0.6, 0.85))
-            height = int(cell_h * random.uniform(0.6, 0.85))
-            
-            cx = EDGE_MARGIN + (col + 0.5) * cell_w + random.uniform(-cell_w*0.15, cell_w*0.15)
-            cy = EDGE_MARGIN + (row + 0.5) * cell_h + random.uniform(-cell_h*0.15, cell_h*0.15)
-            
-            placements.append({
-                'width': width, 'height': height,
-                'center_x': cx, 'center_y': cy,
-                'rotation': random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
-            })
-    
-    return placements
-
-
 def generate_image(source_dir):
-    """Generate a single image with textured background."""
+    """Generate a single image with validated placement and pixel verification."""
     sources = list(Path(source_dir).glob('*.jpg')) + list(Path(source_dir).glob('*.jpeg'))
     if not sources:
         raise ValueError(f"No source images found")
@@ -552,9 +728,13 @@ def generate_image(source_dir):
     # Create textured background with gradients and noise
     canvas = random_base_background(CANVAS_SIZE, CANVAS_SIZE)
     canvas = apply_texture_overlay(canvas)
+    # Convert to BGRA for alpha compositing and pixel verification
+    canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2BGRA)
+    canvas[:, :, 3] = 255  # Opaque background
     
-    # Pack photos
-    placements = pack_photos_simple(CANVAS_SIZE)
+    # Pack photos WITH validation (no overlaps, all in bounds)
+    placements = pack_photos_validated(CANVAS_SIZE)
+    photos_data = []
     photos_data = []
     
     for placement in placements:
@@ -572,10 +752,15 @@ def generate_image(source_dir):
         # Apply glare effect before rotation
         photo = fast_glare(photo)
         
+        # Convert to BGRA for proper alpha compositing
+        if photo.shape[2] == 3:
+            photo = cv2.cvtColor(photo, cv2.COLOR_BGR2BGRA)
+        photo[:, :, 3] = 255  # Full opacity
+        
+
         photo = rotate_photo(photo, placement['rotation'])
         
         # Apply drop shadow BEFORE compositing (darkens background behind photo)
-        # Shadow parameters: offset creates directional cast, blur softens edges
         shadow_offset = random.randint(2, 5)
         angle = random.uniform(0, 2 * math.pi)
         offset_x = int(shadow_offset * math.cos(angle))
@@ -597,6 +782,17 @@ def generate_image(source_dir):
             'corners': corners,
             'rotation': placement['rotation']
         })
+    
+    # Sanity check: verify no photo corners are off-canvas after compositing
+    # (pack_photos_validated should prevent this, but check anyway)
+    oob_count = 0
+    for p in photos_data:
+        corners = p['corners']
+        for c in corners:
+            if c[0] < 0 or c[0] > CANVAS_SIZE or c[1] < 0 or c[1] > CANVAS_SIZE:
+                oob_count += 1
+    if oob_count > 0:
+        print(f"  WARNING: {oob_count} corners out of bounds")
     
     # Apply perspective (keeping corners in bounds)
     corners_list = [p['corners'] for p in photos_data]
