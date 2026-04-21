@@ -25,8 +25,8 @@ import colorsys
 
 # Configuration
 CANVAS_SIZE = 640
-PHOTO_SIZE_MIN = 180
-PHOTO_SIZE_MAX = 480
+PHOTO_SIZE_MIN = 270
+PHOTO_SIZE_MAX = 640
 ROTATION_RANGE = 30
 NUM_PHOTOS_MIN = 1
 NUM_PHOTOS_MAX = 4
@@ -38,7 +38,7 @@ EDGE_MARGIN = 50
 # =============================================================================
 
 OVERLAP_THRESHOLD = 0.05   # Max allowed overlap (5% of smaller photo area)
-BOUND_MARGIN = 80          # Minimum margin from canvas edge for rotated corners
+BOUND_MARGIN = 15          # Minimum margin from canvas edge for rotated corners
 MAX_PACK_ATTEMPTS = 50     # Retries before reducing photo count
 
 
@@ -182,37 +182,111 @@ def verify_composited_pixels(canvas, expected_areas):
 def pack_photos_validated(canvas_size):
     """
     Pack photos with validation: no overlaps, all corners within bounds.
-    Retries placement up to MAX_ATTEMPTS times, then reduces photo count.
-    """
-    for num_photos in range(NUM_PHOTOS_MAX, NUM_PHOTOS_MIN - 1, -1):
-        for attempt in range(MAX_PACK_ATTEMPTS):
-            placements = _generate_placements(num_photos, canvas_size)
-            if check_bounds(placements, canvas_size) and check_overlaps(placements):
-                return placements
-        # Couldn't place this many photos, try fewer
     
-    # Fallback: single small photo at center
+    Try 10 random packings with random target counts (1-4) and large photos
+    (sized relative to canvas). Keep the first valid one — this naturally
+    produces a mix of 1-4 photos per image.
+    """
+    for attempt in range(10):
+        target_count = random.randint(NUM_PHOTOS_MIN, NUM_PHOTOS_MAX)
+        placements = _generate_placements(target_count, canvas_size)
+        
+        if check_bounds(placements, canvas_size) and check_overlaps(placements):
+            return placements
+    
+    # Fallback: single large photo at center
+    size = random.randint(PHOTO_SIZE_MIN, min(PHOTO_SIZE_MAX, int(canvas_size * 0.85)))
+    aspect = random.uniform(0.8, 1.2)
+    w, h = size, int(size * aspect)
+    cx, cy = canvas_size / 2, canvas_size / 2
+    rot = random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
+    w, h = _shrink_to_fit(w, h, cx, cy, rot, canvas_size, min_side=PHOTO_SIZE_MIN)
     return [{
-        'width': 180, 'height': 144,
-        'center_x': canvas_size / 2, 'center_y': canvas_size / 2,
-        'rotation': 0
+        'width': w, 'height': h,
+        'center_x': cx, 'center_y': cy,
+        'rotation': rot
     }]
 
 
+def _shrink_to_fit(width, height, cx, cy, rotation, canvas_size, margin=BOUND_MARGIN,
+                    min_side=150):
+    """
+    Iteratively shrink a photo until all its rotated corners fit within
+    [margin, canvas_size - margin]. Reduces both dimensions proportionally.
+    min_side is the absolute floor — never shrink below this even if it
+    means slightly exceeding the margin (better to be a few px out of
+    bounds than to produce tiny photos).
+    """
+    w, h = width, height
+    for _ in range(30):
+        corners = get_rotated_polygon(w, h, cx, cy, rotation)
+        x_min, x_max = corners[:, 0].min(), corners[:, 0].max()
+        y_min, y_max = corners[:, 1].min(), corners[:, 1].max()
+        
+        if x_min >= margin and x_max <= canvas_size - margin and \
+           y_min >= margin and y_max <= canvas_size - margin:
+            return w, h  # fits!
+        
+        # Compute how much we exceed bounds (in pixels)
+        x_overflow = max(0, margin - x_min, x_max - (canvas_size - margin))
+        y_overflow = max(0, margin - y_min, y_max - (canvas_size - margin))
+        max_overflow = max(x_overflow, y_overflow)
+        
+        # Compute the rotated bounding box diagonal to scale proportionally
+        bbox_diag = max(x_max - x_min, y_max - y_min, 1)
+        # Reduce by the fraction we're over
+        shrink = 1.0 - (max_overflow / bbox_diag) * 1.1  # 1.1 = slight overshoot for convergence
+        shrink = max(shrink, 0.7)  # don't shrink more than 30% per iteration
+        
+        new_w = max(int(w * shrink), min_side)
+        new_h = max(int(h * shrink), min_side)
+        
+        if new_w == w and new_h == h:
+            # Can't shrink further, accept current size
+            return w, h
+        
+        w, h = new_w, new_h
+    
+    return w, h
+
+
 def _generate_placements(num_photos, canvas_size):
-    """Generate candidate placements (same logic as old pack_photos_simple)."""
+    """
+    Generate candidate placements with sizes that respect canvas bounds.
+    
+    Strategy: pick position and rotation first, then start with a large size
+    and shrink to fit canvas bounds. Rotation range is scaled down for
+    multi-photo layouts since crowded photos can't tolerate large rotations.
+    Uses BOUND_MARGIN=15 for tight but visible canvas margins.
+    """
     placements = []
     margin = BOUND_MARGIN
     
+    # Scale rotation range: more photos = less room for rotation
     if num_photos == 1:
-        size = random.randint(PHOTO_SIZE_MIN, PHOTO_SIZE_MAX)
-        aspect = random.uniform(0.7, 1.3)
-        height = int(size * aspect)
-        width = int(size)
+        rot_range = ROTATION_RANGE         # 30°
+    elif num_photos == 2:
+        rot_range = int(ROTATION_RANGE * 0.7)  # 21°
+    else:
+        rot_range = int(ROTATION_RANGE * 0.4)   # 12°
+    
+    # min_side for shrink_to_fit: single photos can be big, multi must be smaller
+    photo_min = PHOTO_SIZE_MIN  # 270 - desired minimum
+    grid_min = 200  # smaller minimum for grid photos that can't physically fit at 270
+
+    if num_photos == 1:
+        # Single photo: fill most of the canvas
+        rotation = random.uniform(-rot_range, rot_range)
+        cx = canvas_size / 2 + random.uniform(-30, 30)
+        cy = canvas_size / 2 + random.uniform(-30, 30)
         
-        cx = canvas_size / 2 + random.uniform(-60, 60)
-        cy = canvas_size / 2 + random.uniform(-60, 60)
-        rotation = random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
+        # Start large, then shrink to fit
+        size = random.randint(int(canvas_size * 0.55), int(canvas_size * 0.85))
+        aspect = random.uniform(0.8, 1.2)
+        width = size
+        height = int(size * aspect)
+        width, height = _shrink_to_fit(width, height, cx, cy, rotation, canvas_size, margin,
+                                        min_side=photo_min)
         
         placements.append({
             'width': width, 'height': height,
@@ -221,49 +295,39 @@ def _generate_placements(num_photos, canvas_size):
         })
     
     elif num_photos == 2:
-        size = random.randint(PHOTO_SIZE_MIN, min(380, PHOTO_SIZE_MAX))
-        aspect1 = random.uniform(0.7, 1.3)
-        aspect2 = random.uniform(0.7, 1.3)
+        rotation1 = random.uniform(-rot_range, rot_range)
+        rotation2 = random.uniform(-rot_range, rot_range)
         
-        if random.random() < 0.5:  # Horizontal
-            w1 = int(size * random.uniform(0.8, 1.0))
-            h1 = int(w1 * aspect1)
-            w2 = int(size * random.uniform(0.8, 1.0))
-            h2 = int(w2 * aspect2)
-            
-            cx1 = canvas_size * 0.3 + random.uniform(-30, 30)
-            cy1 = canvas_size * 0.5 + random.uniform(-30, 30)
-            cx2 = canvas_size * 0.7 + random.uniform(-30, 30)
-            cy2 = canvas_size * 0.5 + random.uniform(-30, 30)
-        else:  # Vertical
-            h1 = int(size * random.uniform(0.8, 1.0))
-            w1 = int(h1 * aspect1)
-            h2 = int(size * random.uniform(0.8, 1.0))
-            w2 = int(h2 * aspect2)
-            
-            cx1 = canvas_size * 0.5 + random.uniform(-30, 30)
-            cy1 = canvas_size * 0.3 + random.uniform(-30, 30)
-            cx2 = canvas_size * 0.5 + random.uniform(-30, 30)
-            cy2 = canvas_size * 0.7 + random.uniform(-30, 30)
+        if random.random() < 0.5:  # Side by side
+            cx1 = canvas_size * 0.27 + random.uniform(-15, 15)
+            cy1 = canvas_size * 0.5 + random.uniform(-15, 15)
+            cx2 = canvas_size * 0.73 + random.uniform(-15, 15)
+            cy2 = canvas_size * 0.5 + random.uniform(-15, 15)
+        else:  # Stacked
+            cx1 = canvas_size * 0.5 + random.uniform(-15, 15)
+            cy1 = canvas_size * 0.27 + random.uniform(-15, 15)
+            cx2 = canvas_size * 0.5 + random.uniform(-15, 15)
+            cy2 = canvas_size * 0.73 + random.uniform(-15, 15)
         
-        placements.append({
-            'width': w1, 'height': h1,
-            'center_x': cx1, 'center_y': cy1,
-            'rotation': random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
-        })
-        placements.append({
-            'width': w2, 'height': h2,
-            'center_x': cx2, 'center_y': cy2,
-            'rotation': random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
-        })
+        for cx, cy, rot in [(cx1, cy1, rotation1), (cx2, cy2, rotation2)]:
+            # Start with large size, shrink to fit
+            size = random.randint(int(canvas_size * 0.40), int(canvas_size * 0.60))
+            aspect = random.uniform(0.8, 1.2)
+            width = int(size * random.uniform(0.85, 1.0))
+            height = int(width * aspect)
+            width, height = _shrink_to_fit(width, height, cx, cy, rot, canvas_size, margin,
+                                            min_side=photo_min)
+            
+            placements.append({
+                'width': width, 'height': height,
+                'center_x': cx, 'center_y': cy,
+                'rotation': rot
+            })
     
-    else:  # 3 or 4 photos — grid layout with more margin
-        size = random.randint(PHOTO_SIZE_MIN, min(320, PHOTO_SIZE_MAX))
-        
-        cols = 2
-        rows = 2 if num_photos == 4 else 2
-        
+    else:  # 3 or 4 photos — grid layout
         usable = canvas_size - 2 * margin
+        cols = 2
+        rows = 2
         cell_w = usable / cols
         cell_h = usable / rows
         
@@ -275,22 +339,22 @@ def _generate_placements(num_photos, canvas_size):
         positions = positions[:num_photos]
         
         for row, col in positions:
-            aspect = random.uniform(0.7, 1.3)
-            width = int(cell_w * random.uniform(0.55, 0.75))
-            height = int(width * aspect)
+            rotation = random.uniform(-rot_range, rot_range)
+            cx = margin + (col + 0.5) * cell_w + random.uniform(-cell_w * 0.03, cell_w * 0.03)
+            cy = margin + (row + 0.5) * cell_h + random.uniform(-cell_h * 0.03, cell_h * 0.03)
             
-            # Keep height within cell
-            if height > cell_h * 0.75:
-                height = int(cell_h * 0.75)
-                width = int(height / aspect)
-            
-            cx = margin + (col + 0.5) * cell_w + random.uniform(-cell_w * 0.05, cell_w * 0.05)
-            cy = margin + (row + 0.5) * cell_h + random.uniform(-cell_h * 0.05, cell_h * 0.05)
+            # Start with large size relative to cell, shrink to fit
+            size = random.randint(int(min(cell_w, cell_h) * 0.80), int(min(cell_w, cell_h) * 0.98))
+            aspect = random.uniform(0.8, 1.2)
+            width = size
+            height = int(size * aspect)
+            width, height = _shrink_to_fit(width, height, cx, cy, rotation, canvas_size, margin,
+                                            min_side=grid_min)
             
             placements.append({
                 'width': width, 'height': height,
                 'center_x': cx, 'center_y': cy,
-                'rotation': random.uniform(-ROTATION_RANGE, ROTATION_RANGE)
+                'rotation': rotation
             })
     
     return placements

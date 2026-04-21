@@ -4,6 +4,7 @@ data_generator/images
 # Generated training data (large, regenerate-able)
 data/
 ../data/
+data_generator/test/
 
 # Python
 __pycache__/
