@@ -19,6 +19,8 @@ from pathlib import Path
 import random
 import sys
 import time
+import math
+import colorsys
 import colorsys
 
 # Configuration
@@ -93,6 +95,100 @@ def rotate_photo(photo, angle):
                           flags=cv2.INTER_LINEAR,
                           borderMode=cv2.BORDER_CONSTANT, 
                           borderValue=(0, 0, 0, 0))  # Transparent border
+
+
+def apply_photo_shadow(canvas, photo, cx, cy, offset_x, offset_y, blur_sigma, opacity, orig_w, orig_h, rotation):
+    """
+    Render a drop shadow beneath the photo onto the canvas.
+    
+    Creates a shadow mask at the ORIGINAL (pre-rotation) photo dimensions,
+    rotates it to match the photo, blurs for soft edges, then darkens
+    the canvas behind the photo with a slight offset.
+    
+    IMPORTANT: We create the mask at orig_w x orig_h (before rotation)
+    and rotate it. The rotated photo has expanded dimensions (the
+    bounding box of the rotated rectangle) — if we used those dimensions,
+    the shadow would be an axis-aligned rectangle that's too large.
+    """
+    ch, cw = canvas.shape[:2]
+    num_channels = canvas.shape[2]
+    
+    # Rotate the offset direction by the photo's rotation so the shadow
+    # always falls in the same physical direction relative to the scene
+    rot_rad = math.radians(rotation)
+    cos_r = math.cos(rot_rad)
+    sin_r = math.sin(rot_rad)
+    rotated_offset_x = offset_x * cos_r - offset_y * sin_r
+    rotated_offset_y = offset_x * sin_r + offset_y * cos_r
+    
+    # Shadow center is slightly offset from photo center
+    shadow_cx = cx + rotated_offset_x * 0.5
+    shadow_cy = cy + rotated_offset_y * 0.5
+    
+    # Create filled rectangle shadow mask at ORIGINAL photo dimensions
+    # (before rotation), then rotate it to match the photo shape.
+    # This produces a rotated-rectangle shadow matching the photo.
+    blur_pad = int(3 * blur_sigma) + 1
+    mask_w = orig_w + blur_pad * 2
+    mask_h = orig_h + blur_pad * 2
+    shadow_mask = np.zeros((mask_h, mask_w), dtype=np.float32)
+    
+    # Fill the original-dimensions rectangle
+    shadow_mask[blur_pad:blur_pad+orig_h, blur_pad:blur_pad+orig_w] = 1.0
+    
+    # Blur BEFORE rotation so the blur is omnidirectional (not stretched along rotation axis)
+    shadow_mask = cv2.GaussianBlur(shadow_mask, (0, 0), sigmaX=blur_sigma)
+    
+    # Rotate the shadow mask to match the photo
+    if abs(rotation) > 0.5:
+        center_rot = (mask_w / 2, mask_h / 2)
+        rot_matrix = cv2.getRotationMatrix2D(center_rot, rotation, 1.0)
+        # Calculate new dimensions (same formula as rotate_photo)
+        cos_a = abs(rot_matrix[0, 0])
+        sin_a = abs(rot_matrix[0, 1])
+        new_w = int(mask_h * sin_a + mask_w * cos_a)
+        new_h = int(mask_w * sin_a + mask_h * cos_a)
+        # Adjust translation to center the rotated mask
+        rot_matrix[0, 2] += (new_w - mask_w) / 2
+        rot_matrix[1, 2] += (new_h - mask_h) / 2
+        shadow_mask = cv2.warpAffine(shadow_mask, rot_matrix, (new_w, new_h),
+                                     borderValue=0, flags=cv2.INTER_LINEAR)
+        mask_w = new_w
+        mask_h = new_h
+    
+    # Normalize so peak is 1.0
+    if shadow_mask.max() > 0:
+        shadow_mask = shadow_mask / shadow_mask.max()
+    
+    # Position the shadow on the canvas centered at (shadow_cx, shadow_cy)
+    shadow_top_left_x = int(shadow_cx - mask_w / 2)
+    shadow_top_left_y = int(shadow_cy - mask_h / 2)
+    
+    # Darken the canvas
+    canvas_f = canvas.astype(np.float32) / 255.0
+    
+    y1, y2 = shadow_top_left_y, shadow_top_left_y + mask_h
+    x1, x2 = shadow_top_left_x, shadow_top_left_x + mask_w
+    
+    clip_y1 = max(0, y1)
+    clip_y2 = min(ch, y2)
+    clip_x1 = max(0, x1)
+    clip_x2 = min(cw, x2)
+    
+    if clip_y2 > clip_y1 and clip_x2 > clip_x1:
+        src_y1 = clip_y1 - y1
+        src_x1 = clip_x1 - x1
+        src_y2 = src_y1 + (clip_y2 - clip_y1)
+        src_x2 = src_x1 + (clip_x2 - clip_x1)
+        
+        shadow_region = shadow_mask[src_y1:src_y2, src_x1:src_x2]
+        shadow_vals = shadow_region * opacity
+        
+        for c in range(num_channels):
+            canvas_f[clip_y1:clip_y2, clip_x1:clip_x2, c] *= (1 - shadow_vals)
+    
+    canvas[:, :, :num_channels] = np.clip(canvas_f * 255, 0, 255).astype(np.uint8)
+    return canvas
 
 
 def composite_photo_at_center(canvas, photo, cx, cy):
@@ -228,6 +324,35 @@ def apply_3_linear_gradients(img):
         img_f = result
     
     return np.clip(img_f * 255, 0, 255).astype(np.uint8)
+
+
+def fast_glare(img):
+    """Add glare highlights using screen blend."""
+    if random.random() < 0.5:
+        h, w = img.shape[:2]
+        
+        num_flares = random.randint(2, 4)
+        for _ in range(num_flares):
+            img_f = img.astype(np.float32) / 255.0
+            
+            cx = random.uniform(w * 0.15, w * 0.85)
+            cy = random.uniform(h * 0.1, h * 0.7)
+            
+            rx = random.uniform(w * 0.20, w * 0.40)
+            ry = random.uniform(h * 0.20, h * 0.40)
+            
+            y, x = np.ogrid[:h, :w]
+            
+            flare = np.maximum(0, 1 - (x - cx)**2 / (rx**2) - (y - cy)**2 / (ry**2))
+            flare = cv2.GaussianBlur(flare.astype(np.float32), (15, 15), 0)
+            
+            opacity = random.uniform(0.60, 1.00)
+            flare_f = flare[:, :, np.newaxis]
+            img_f = 1 - (1 - img_f) * (1 - flare_f * opacity)
+            
+            img = np.clip(img_f * 255, 0, 255).astype(np.uint8)
+    
+    return img
 
 
 def apply_texture_overlay(canvas):
@@ -443,7 +568,26 @@ def generate_image(source_dir):
         new_w = int(w_orig * scale)
         new_h = int(h_orig * scale)
         photo = cv2.resize(photo, (new_w, new_h))
+        
+        # Apply glare effect before rotation
+        photo = fast_glare(photo)
+        
         photo = rotate_photo(photo, placement['rotation'])
+        
+        # Apply drop shadow BEFORE compositing (darkens background behind photo)
+        # Shadow parameters: offset creates directional cast, blur softens edges
+        shadow_offset = random.randint(2, 5)
+        angle = random.uniform(0, 2 * math.pi)
+        offset_x = int(shadow_offset * math.cos(angle))
+        offset_y = int(shadow_offset * math.sin(angle))
+        shadow_opacity = random.uniform(0.15, 0.35)
+        shadow_blur = random.uniform(1.5, 3.0)
+        canvas = apply_photo_shadow(
+            canvas, photo, placement['center_x'], placement['center_y'],
+            offset_x, offset_y, shadow_blur, shadow_opacity,
+            new_w, new_h, placement['rotation']
+        )
+        
         canvas = composite_photo_at_center(canvas, photo, placement['center_x'], placement['center_y'])
         
         # Calculate corners
