@@ -38,7 +38,7 @@ EDGE_MARGIN = 50
 # =============================================================================
 
 OVERLAP_THRESHOLD = 0.05   # Max allowed overlap (5% of smaller photo area)
-BOUND_MARGIN = 15          # Minimum margin from canvas edge for rotated corners
+BOUND_MARGIN = 5           # Minimum margin from canvas edge for rotated corners
 MAX_PACK_ATTEMPTS = 50     # Retries before reducing photo count
 
 
@@ -262,17 +262,22 @@ def _generate_placements(num_photos, canvas_size):
     placements = []
     margin = BOUND_MARGIN
     
-    # Scale rotation range: more photos = less room for rotation
+    # Scale rotation range: more photos = less room for rotation.
+    # Physics: at rotation r°, a square of side s needs clearance = s*(cos r + sin r)/2.
+    # With tight margins, rotation must stay low to keep photos >= 270px:
+    #   Grid centers (~152px clearance): at 5°, max 281px — ok
+    #   2-photo centers (~158px clearance): at 5°, max 291px — ok
+    #   1-photo center (~290px clearance): at 30°, max 425px — plenty
     if num_photos == 1:
-        rot_range = ROTATION_RANGE         # 30°
+        rot_range = ROTATION_RANGE                # 30°
     elif num_photos == 2:
-        rot_range = int(ROTATION_RANGE * 0.7)  # 21°
+        rot_range = 5                              # 5° — keeps photos >270px
     else:
-        rot_range = int(ROTATION_RANGE * 0.4)   # 12°
+        rot_range = 5                              # 5° — keeps photos >270px
     
-    # min_side for shrink_to_fit: single photos can be big, multi must be smaller
-    photo_min = PHOTO_SIZE_MIN  # 270 - desired minimum
-    grid_min = 200  # smaller minimum for grid photos that can't physically fit at 270
+    # min_side for shrink_to_fit: lets _shrink_to_fit go small enough to fit
+    photo_min = 270
+    grid_min = 270
 
     if num_photos == 1:
         # Single photo: fill most of the canvas
@@ -299,22 +304,44 @@ def _generate_placements(num_photos, canvas_size):
         rotation2 = random.uniform(-rot_range, rot_range)
         
         if random.random() < 0.5:  # Side by side
-            cx1 = canvas_size * 0.27 + random.uniform(-15, 15)
-            cy1 = canvas_size * 0.5 + random.uniform(-15, 15)
-            cx2 = canvas_size * 0.73 + random.uniform(-15, 15)
-            cy2 = canvas_size * 0.5 + random.uniform(-15, 15)
+            cx1 = canvas_size * 0.27 + random.uniform(-8, 8)
+            cy1 = canvas_size * 0.50 + random.uniform(-8, 8)
+            cx2 = canvas_size * 0.73 + random.uniform(-8, 8)
+            cy2 = canvas_size * 0.50 + random.uniform(-8, 8)
+            sep = abs(cx2 - cx1)  # horizontal separation limits width
+            layout = 'horizontal'
         else:  # Stacked
-            cx1 = canvas_size * 0.5 + random.uniform(-15, 15)
-            cy1 = canvas_size * 0.27 + random.uniform(-15, 15)
-            cx2 = canvas_size * 0.5 + random.uniform(-15, 15)
-            cy2 = canvas_size * 0.73 + random.uniform(-15, 15)
+            cx1 = canvas_size * 0.50 + random.uniform(-8, 8)
+            cy1 = canvas_size * 0.27 + random.uniform(-8, 8)
+            cx2 = canvas_size * 0.50 + random.uniform(-8, 8)
+            cy2 = canvas_size * 0.73 + random.uniform(-8, 8)
+            sep = abs(cy2 - cy1)  # vertical separation limits height
+            layout = 'vertical'
+        
+        # Max size along the separation axis: each photo's rotated bbox
+        # along that axis must be < separation to avoid overlap.
+        # At 5° max rotation, expansion factor = cos5 + sin5 ≈ 1.083.
+        max_rot = rot_range  # same for both photos
+        expansion = abs(math.cos(math.radians(max_rot))) + abs(math.sin(math.radians(max_rot)))
+        max_from_sep = int(sep / expansion)
         
         for cx, cy, rot in [(cx1, cy1, rotation1), (cx2, cy2, rotation2)]:
-            # Start with large size, shrink to fit
-            size = random.randint(int(canvas_size * 0.40), int(canvas_size * 0.60))
-            aspect = random.uniform(0.8, 1.2)
-            width = int(size * random.uniform(0.85, 1.0))
-            height = int(width * aspect)
+            aspect = random.uniform(0.9, 1.05)
+            # Clamp: if max_from_sep < PHOTO_SIZE_MIN, use PHOTO_SIZE_MIN anyway
+            # (a tiny bit of overlap is acceptable vs undersized photos)
+            dim_max = max(max_from_sep, PHOTO_SIZE_MIN)
+            dim_min = max(PHOTO_SIZE_MIN, int(dim_max * 0.9))
+            if dim_min > dim_max:
+                dim_min = dim_max
+            if layout == 'horizontal':
+                # Width limited by separation, height by bounds
+                width = random.randint(dim_min, dim_max)
+                height = int(width * aspect)
+            else:  # vertical/stacked
+                # Height limited by separation, width by bounds
+                height = random.randint(dim_min, dim_max)
+                width = int(height * aspect)
+            
             width, height = _shrink_to_fit(width, height, cx, cy, rot, canvas_size, margin,
                                             min_side=photo_min)
             
@@ -343,9 +370,11 @@ def _generate_placements(num_photos, canvas_size):
             cx = margin + (col + 0.5) * cell_w + random.uniform(-cell_w * 0.03, cell_w * 0.03)
             cy = margin + (row + 0.5) * cell_h + random.uniform(-cell_h * 0.03, cell_h * 0.03)
             
-            # Start with large size relative to cell, shrink to fit
-            size = random.randint(int(min(cell_w, cell_h) * 0.80), int(min(cell_w, cell_h) * 0.98))
-            aspect = random.uniform(0.8, 1.2)
+            # Start with large size relative to cell, shrink to fit.
+            # With 5° rotation and 152px clearance, max is 281px (>270 goal).
+            # Tighter aspect for grid (0.85-1.05) — wide photos don't fit in cells.
+            size = random.randint(int(min(cell_w, cell_h) * 0.88), int(min(cell_w, cell_h) * 0.98))
+            aspect = random.uniform(0.88, 1.05)
             width = size
             height = int(size * aspect)
             width, height = _shrink_to_fit(width, height, cx, cy, rotation, canvas_size, margin,
