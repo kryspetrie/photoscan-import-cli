@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """
-Simple Data Generator - Fixed Version 2
-========================================
+Photo Pose Detector — Synthetic Training Data Generator
+========================================================
 
-Issues fixed:
-1. No artificial border - photos placed properly within canvas
-2. Bounding box matches actual corners (computed from corners, not separately)
-3. Photos actually visible in output
-4. Perspective transform keeps corners in bounds
-5. Proper alpha compositing for smooth photo edges
+Generates synthetic training images for TWO YOLO models:
+  1. Detection Model — axis-aligned bounding boxes around photos
+  2. Pose Model — 4 corner keypoints per photo (LL, UL, UR, LR)
+
+Each generated image produces:
+  - The composite image (JPEG)
+  - A detection label (class x_center y_center width height)
+  - A pose label      (class x_center y_center width height kp0x kp0y kp0v … kp3x kp3y kp3v)
+  - An optional debug image with corner overlays
+
+Configuration constants are at the top of the file.  Run with:
+
+    python generate.py --count 10 --source ./images --output ./data/examples
+
+For batch dataset generation (train/val split, YAML-friendly output):
+
+    python generate.py --mode batch --total 5000 --source ./images --output ../data
 
 Author: Photo Pose Detector Project
 """
@@ -20,7 +31,6 @@ import random
 import sys
 import time
 import math
-import colorsys
 import colorsys
 
 # Configuration
@@ -828,7 +838,6 @@ def generate_image(source_dir):
     # Pack photos WITH validation (no overlaps, all in bounds)
     placements = pack_photos_validated(CANVAS_SIZE)
     photos_data = []
-    photos_data = []
     
     for placement in placements:
         photo_path = random.choice(sources)
@@ -953,36 +962,122 @@ def create_debug_image(img, photos):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='Generate training data')
-    parser.add_argument('--source', default='./images', help='Source images')
-    parser.add_argument('--output', default='./data/examples_v2_final', help='Output dir')
-    parser.add_argument('--count', type=int, default=10, help='Number of images')
+    parser = argparse.ArgumentParser(
+        description='Generate synthetic training data for photo pose detection')
+    parser.add_argument('--source', default='./images',
+                        help='Directory containing source photos')
+    parser.add_argument('--output', default='./data/examples',
+                        help='Output directory (examples mode) or base directory (batch mode)')
+    parser.add_argument('--count', type=int, default=10,
+                        help='Number of images to generate (examples mode)')
+    parser.add_argument('--mode', choices=['examples', 'batch'], default='examples',
+                        help='Examples: debug images with overlays. '
+                             'Batch: train/val split with YAML-friendly output.')
+    parser.add_argument('--train-count', type=int, default=4000,
+                        help='Number of training images (batch mode)')
+    parser.add_argument('--val-count', type=int, default=1000,
+                        help='Number of validation images (batch mode)')
     args = parser.parse_args()
-    
+
+    if args.mode == 'batch':
+        _batch_generate(args)
+    else:
+        _example_generate(args)
+
+
+def _example_generate(args):
+    """Generate example images with debug overlays."""
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"Generating {args.count} images...")
+
+    print(f"Generating {args.count} example images...")
     start_time = time.time()
-    
     total_photos = 0
-    
+
     for i in range(args.count):
         img, photos, det_labels, pose_labels = generate_image(args.source)
         total_photos += len(photos)
-        
+
         cv2.imwrite(str(output_dir / f"example_{i+1:02d}.jpg"), img)
-        cv2.imwrite(str(output_dir / f"example_{i+1:02d}_debug.jpg"), create_debug_image(img, photos))
-        
+        cv2.imwrite(str(output_dir / f"example_{i+1:02d}_debug.jpg"),
+                    create_debug_image(img, photos))
+
         with open(output_dir / f"example_{i+1:02d}_det.txt", 'w') as f:
             f.write('\n'.join(det_labels))
         with open(output_dir / f"example_{i+1:02d}_pose.txt", 'w') as f:
             f.write('\n'.join(pose_labels))
-        
+
         print(f"  {i+1:2d}/{args.count}: {len(photos)} photos")
-    
-    print(f"\n✅ Done! {total_photos} total photos in {args.count} images (avg: {total_photos/args.count:.1f})")
+
+    elapsed = time.time() - start_time
+    print(f"\n✅ Done! {total_photos} photos in {args.count} images "
+          f"(avg {total_photos/args.count:.1f}) in {elapsed:.1f}s")
     print(f"📂 {output_dir.absolute()}")
+
+
+def _batch_generate(args):
+    """Generate a full dataset with train/val split for both models."""
+    from datetime import datetime
+
+    total = args.train_count + args.val_count
+    base_dir = Path(args.output)
+
+    # Shared images
+    img_train_dir = base_dir / "images" / "train"
+    img_val_dir = base_dir / "images" / "val"
+    # Detection labels
+    det_train_dir = base_dir / "detection" / "labels" / "train"
+    det_val_dir = base_dir / "detection" / "labels" / "val"
+    # Pose labels
+    pose_train_dir = base_dir / "pose" / "labels" / "train"
+    pose_val_dir = base_dir / "pose" / "labels" / "val"
+
+    for d in [img_train_dir, img_val_dir,
+              det_train_dir, det_val_dir,
+              pose_train_dir, pose_val_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print(f"Batch generation: {args.train_count} train + {args.val_count} val = {total}")
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    start_time = time.time()
+    total_photos = 0
+
+    for i in range(total):
+        is_train = i < args.train_count
+        img, photos, det_labels, pose_labels = generate_image(args.source)
+        total_photos += len(photos)
+
+        if is_train:
+            prefix = f"train_{i+1:06d}"
+            img_path = img_train_dir / f"{prefix}.jpg"
+            det_path = det_train_dir / f"{prefix}.txt"
+            pose_path = pose_train_dir / f"{prefix}.txt"
+        else:
+            idx = i - args.train_count + 1
+            prefix = f"val_{idx:06d}"
+            img_path = img_val_dir / f"{prefix}.jpg"
+            det_path = det_val_dir / f"{prefix}.txt"
+            pose_path = pose_val_dir / f"{prefix}.txt"
+
+        cv2.imwrite(str(img_path), img)
+        with open(det_path, 'w') as f:
+            f.write('\n'.join(det_labels))
+        with open(pose_path, 'w') as f:
+            f.write('\n'.join(pose_labels))
+
+        if (i + 1) % 20 == 0 or i == 0:
+            elapsed = time.time() - start_time
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            eta = (total - i - 1) / rate / 3600 if rate > 0 else 0
+            print(f"  [{i+1:5d}/{total}] {elapsed/60:.1f}m | "
+                  f"{rate:.1f}/s | ETA {eta:.1f}h | "
+                  f"photos: {total_photos}")
+
+    elapsed = time.time() - start_time
+    print(f"\n✅ Complete! {total} images ({elapsed/3600:.1f}h)")
+    print(f"   Train: {args.train_count} | Val: {args.val_count}")
+    print(f"   Total photos: {total_photos} (avg {total_photos/total:.1f}/img)")
+    print(f"📂 {base_dir.absolute()}")
 
 
 if __name__ == "__main__":
