@@ -132,11 +132,43 @@ data/
 
 ### Setup
 
+The project includes a `requirements.txt` and a `setup.sh` script for one-command environment creation.
+
 ```bash
-python -m venv venv
-source venv/bin/activate
-pip install ultralytics torch torchvision opencv-python numpy
+# Quick setup — creates .venv with CPU-only PyTorch
+./setup.sh
+
+# With CUDA 11.8 GPU support
+./setup.sh --gpu
+
+# With CUDA 12.1 GPU support
+./setup.sh --cuda12
+
+# Or install into an already-active venv
+source your_env/bin/activate
+./setup.sh --existing
 ```
+
+<details>
+<summary>Manual setup (equivalent)</summary>
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+
+# CPU PyTorch:
+pip install torch==2.2.2 torchvision==0.17.2
+
+# —or— CUDA 11.8 PyTorch:
+# pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu118
+
+pip install -r requirements.txt
+```
+
+</details>
+
+> **Note on existing environments:** The repo currently contains two older virtual environments (`venv/` and `training_env/`) that were created during early development. `venv/` holds the full set of installed packages; `training_env/` is an empty shell that was never populated. Both are gitignored and can be removed once you've migrated to the new `.venv` — but they are preserved for now since active runs may depend on them.
 
 ### Train Both Models
 
@@ -275,7 +307,12 @@ photo-pose-detector/
 │
 ├── textures/                        # 6 background textures
 ├── data/                            # Generated datasets (gitignored)
-└── runs/                            # Training runs (gitignored)
+├── runs/                            # Training runs (gitignored)
+│
+├── requirements.txt                 # Python dependency list
+├── setup.sh                         # One-command environment setup
+├── venv/                            # Legacy venv (gitignored, still in use)
+└── training_env/                    # Legacy empty venv (gitignored)
 ```
 
 ---
@@ -296,11 +333,9 @@ photo-pose-detector/
 
 ## Requirements
 
-- Python 3.9+
-- PyTorch 2.x
-- Ultralytics 8.x
-- OpenCV 4.x
-- NumPy
+- Python 3.9+ (3.12 recommended)
+- See [`requirements.txt`](requirements.txt) for full dependency list
+- Quick install: `./setup.sh` (CPU) or `./setup.sh --gpu` (CUDA)
 
 ## License
 

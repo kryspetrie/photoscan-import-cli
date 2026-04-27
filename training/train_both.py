@@ -32,6 +32,12 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
+# MPS fallback: torchvision::nms is not implemented for MPS device.
+# Setting this env var causes MPS to fall back to CPU for unsupported ops.
+# Must be set before importing torch/ultralytics.
+if sys.platform == "darwin" and "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 # Import the individual training functions
 from train_detection import train as train_detection
 from train_pose import train as train_pose
@@ -84,6 +90,9 @@ def train_both(
         print("PHASE 1: DETECTION MODEL TRAINING")
         print("-" * 70)
         
+        # Note: train_detection() will automatically set data/labels -> detection/labels
+        # This is required because Ultralytics resolves labels via path substitution
+        
         detection_weights = Path("runs/detection/photo-detector/weights/best.pt")
         if skip_if_exists and detection_weights.exists():
             print(f"\n⏭️  Skipping detection training (weights exist)")
@@ -103,6 +112,9 @@ def train_both(
         print("\n" + "-" * 70)
         print("PHASE 2: POSE MODEL TRAINING")
         print("-" * 70)
+        
+        # Note: train_pose() will automatically switch data/labels -> pose/labels
+        # The symlink MUST be switched between detection and pose training!
         
         pose_weights = Path("runs/pose/photo-corner-detector/weights/best.pt")
         if skip_if_exists and pose_weights.exists():

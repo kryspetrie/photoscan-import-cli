@@ -1,0 +1,35 @@
+# Photo Pose Detector — Python Dependencies
+# ============================================
+# Install:  pip install -r requirements.txt
+# Full setup: ./setup.sh
+#
+# Notes:
+#   - PyTorch is pinned to 2.2.2 (CPU) to match the original environment.
+#     For GPU support, see https://pytorch.org/get-started/locally/ and
+#     replace the torch/torchvision lines with the appropriate --index-url variant.
+#   - All other transitive dependencies (matplotlib, scipy, etc.) are pulled in
+#     automatically by the packages below — they are listed under "Optional" for
+#     reference only.
+
+# --- Core (training + inference) -------------------------------------------
+ultralytics>=8.4,<9
+torch==2.2.2
+torchvision==0.17.2
+opencv-python>=4.9,<5
+numpy>=1.26,<2
+Pillow>=12,<13
+
+# --- ONNX export & inference -----------------------------------------------
+onnx>=1.21,<2
+onnxruntime>=1.23,<2
+
+# --- Optional (pulled in transitively; pin here only if you need a specific version) ---
+# matplotlib>=3.10
+# scipy>=1.17
+# PyYAML>=6.0
+# polars>=1.39
+
+# --- Development / data generation ------------------------------------------
+# Add any dev-time tools below as needed:
+# jupyter
+# ipython

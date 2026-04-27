@@ -48,6 +48,12 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
+# MPS fallback: torchvision::nms is not implemented for MPS device.
+# Setting this env var causes MPS to fall back to CPU for unsupported ops.
+# Must be set before importing torch/ultralytics.
+if sys.platform == "darwin" and "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 # Check ultralytics installation
 try:
     from ultralytics import YOLO
@@ -55,6 +61,9 @@ except ImportError:
     print("Error: ultralytics not installed.")
     print("Install with: pip install ultralytics")
     sys.exit(1)
+
+# Label symlink management
+from label_links import ensure_labels_symlink, get_data_root_from_yaml
 
 
 def get_default_dataset_path():
@@ -68,6 +77,7 @@ def train(
     patience: int = 20,
     batch: int = 16,
     imgsz: int = 640,
+    cache: str = "ram",
     model: str = "yolo26n-pose.pt",  # Pose model
     project: str = "runs/pose",
     name: str = "photo-corner-detector",
@@ -125,6 +135,19 @@ def train(
         print(f"Error: Pose dataset not found at {data}")
         print("Run generate_batch.py first to create training data.")
         print("Pose labels should be in: data/pose/labels/")
+        sys.exit(1)
+    
+    # CRITICAL: Ensure data/labels symlink points to pose labels
+    # Ultralytics resolves labels by replacing /images/ with /labels/ in the
+    # image path. Without this symlink, all images are treated as backgrounds
+    # and training produces zero losses (the "zero-loss bug").
+    # NOTE: This must switch the symlink from detection to pose labels!
+    try:
+        data_root = get_data_root_from_yaml(data)
+        ensure_labels_symlink(data_root, "pose")
+    except Exception as e:
+        print(f"Error: Failed to set up label symlink: {e}")
+        print("Pose labels must be accessible at data/labels/train/")
         sys.exit(1)
     
     print("=" * 60)
@@ -200,6 +223,7 @@ def train(
         close_mosaic=close_mosaic,
         workers=workers,
         device=device,
+        cache=cache,
         
         # Output
         verbose=verbose,
@@ -283,6 +307,10 @@ def main():
         help="Number of dataloader workers"
     )
     parser.add_argument(
+        "--cache", type=str, default="ram",
+        help="Cache images: 'ram', 'disk', or False"
+    )
+    parser.add_argument(
         "--resume", action="store_true",
         help="Resume from last checkpoint"
     )
@@ -323,6 +351,7 @@ def main():
         scale=args.scale,
         lr0=args.lr0,
         resume=args.resume,
+        cache=args.cache,
     )
 
 

@@ -40,6 +40,12 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
+# MPS fallback: torchvision::nms is not implemented for MPS device.
+# Setting this env var causes MPS to fall back to CPU for unsupported ops.
+# Must be set before importing torch/ultralytics.
+if sys.platform == "darwin" and "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 # Check ultralytics installation
 try:
     from ultralytics import YOLO
@@ -47,6 +53,9 @@ except ImportError:
     print("Error: ultralytics not installed.")
     print("Install with: pip install ultralytics")
     sys.exit(1)
+
+# Label symlink management
+from label_links import ensure_labels_symlink, get_data_root_from_yaml
 
 
 def get_default_dataset_path():
@@ -117,6 +126,18 @@ def train(
         print(f"Error: Detection dataset not found at {data}")
         print("Run generate_batch.py first to create training data.")
         print("Detection labels should be in: data/detection/labels/")
+        sys.exit(1)
+    
+    # CRITICAL: Ensure data/labels symlink points to detection labels
+    # Ultralytics resolves labels by replacing /images/ with /labels/ in the
+    # image path. Without this symlink, all images are treated as backgrounds
+    # and training produces zero losses (the "zero-loss bug").
+    try:
+        data_root = get_data_root_from_yaml(data)
+        ensure_labels_symlink(data_root, "detection")
+    except Exception as e:
+        print(f"Error: Failed to set up label symlink: {e}")
+        print("Detection labels must be accessible at data/labels/train/")
         sys.exit(1)
     
     print("=" * 60)
