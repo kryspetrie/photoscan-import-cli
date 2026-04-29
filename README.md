@@ -13,6 +13,41 @@ When you photograph multiple physical photos laid out on a table (camera scannin
 
 The goal: **automatically detect each photo, locate its four corners precisely, and extract a clean perspective-corrected image.**
 
+## Current Status
+
+**Both models are fully trained and exported to ONNX.** The project is ready for deployment.
+
+| Model | Status | Best Epoch | mAP50 | mAP50-95 | ONNX Size |
+|-------|--------|-----------|-------|----------|------------|
+| **Detection** | ✅ Complete | 4 | 0.995 | 0.918 | 10.2 MB |
+| **Pose** | ✅ Complete | 15 | 0.995 | 0.107 | 10.0 MB |
+
+**What these numbers mean:**
+- **mAP50 = 0.995** — both models find photos with near-perfect accuracy at 50% IoU
+- **Detection mAP50-95 = 0.918** — bounding boxes are extremely precise
+- **Pose mAP50-95 = 0.107** — strict keypoint localization is still improving; corners are detected correctly at coarse threshold but fine-grained precision (IoU > 75%) needs more training or data
+
+### Trained Artifacts
+
+```
+models/
+├── detection_model.onnx        # ONNX export, opset 17, dynamic shapes
+└── pose_model.onnx              # ONNX export, opset 17, dynamic shapes
+
+training/
+└── runs/
+    ├── detection/photo-detector/weights/
+    │   ├── best.pt              # Best checkpoint (epoch 4)
+    │   └── last.pt              # Last checkpoint (epoch 6)
+    └── pose/photo-corner-detector/weights/
+        ├── best.pt              # Best checkpoint (epoch 15)
+        └── last.pt              # Last checkpoint (epoch 44)
+```
+
+> **Hardware note:** Models were trained on an Intel i7-9750H CPU (16 GB RAM) using `--device cpu --cache ram`. Training took ~2 hours for detection and ~27 hours for pose. On a CUDA GPU, training would complete in minutes.
+
+---
+
 ## Two-Model Architecture
 
 Two YOLO models work together in a pipeline — one finds where the photos are, the other pinpoints their exact corners:
@@ -29,7 +64,7 @@ Input Image
     ▼
 ┌───────────────────────────┐
 │  2. Pose Model (YOLO-Pose)│  → Where are the 4 corners?
-│     4 keypoints per photo  │
+│     4 keypoints per photo │
 └───────────────────────────┘
     │
     ▼
@@ -50,7 +85,8 @@ Input Image
 | **YOLO variant** | Standard detection | YOLO-Pose (keypoints) |
 | **Base weights** | `yolo11n.pt` | `yolo26n-pose.pt` |
 | **Output per photo** | Bounding box (x, y, w, h) | 4 corner keypoints |
-| **Label format** | 5 columns | 13 columns |
+| **Label format** | 5 columns | 17 columns (bbox + 4×3 keypoints) |
+| **ONNX output shape** | `(batch, 5, 8400)` | `(batch, 300, 18)` |
 | **Speed** | Very fast | Fast |
 
 ### Keypoint Order
@@ -91,7 +127,7 @@ Training data is generated synthetically — no manual annotation required. The 
 | Label Type | Columns | Example |
 |------------|---------|---------|
 | Detection | `class x y w h` | `0 0.501715 0.505848 0.378018 0.590964` |
-| Pose | `class x y w h kp0…kp3` | `0 0.501715 0.505848 0.378018 0.590964 0.312 0.801 2 0.690 0.801 2 0.689 0.210 2 0.314 0.210 2` |
+| Pose | `class x y w h kp0x kp0y kp0v kp1x kp1y kp1v kp2x kp2y kp2v kp3x kp3y kp3v` | `0 0.501715 0.505848 0.378018 0.590964 0.312 0.801 2 0.690 0.801 2 0.689 0.210 2 0.314 0.210 2` |
 
 > 📄 For full technical details on the generator (placement algorithm, rotation math, shadow rendering, etc.), see [`data_generator/SYSTEM_DOCUMENTATION.md`](data_generator/SYSTEM_DOCUMENTATION.md).
 
@@ -120,11 +156,15 @@ data/
 │       └── val/
 └── pose/
     └── labels/
-        ├── train/          # 13-column keypoint labels
+        ├── train/          # 17-column keypoint labels (bbox + 4 corners × 3)
         └── val/
 ```
 
 **Same images, different labels.** Each model's dataset YAML points to the shared images with its own label directory.
+
+> ⚠️ **Symlink requirement:** Ultralytics resolves labels by replacing `/images/` with `/labels/` in the image path. Both YAMLs point to `data/images/`, so both expect `data/labels/`. The training scripts (`train_detection.py`, `train_pose.py`) automatically create/switch a symlink at `data/labels → data/detection/labels` or `data/pose/labels` as needed. See [`label_links.py`](training/label_links.py) for details.
+>
+> **Future improvement:** Generate data directly in `data/detection/images/` + `data/detection/labels/` (self-contained trees), eliminating the symlink entirely.
 
 ---
 
@@ -132,10 +172,8 @@ data/
 
 ### Setup
 
-The project includes a `requirements.txt` and a `setup.sh` script for one-command environment creation.
-
 ```bash
-# Quick setup — creates .venv with CPU-only PyTorch
+# Quick setup — creates venv with CPU-only PyTorch
 ./setup.sh
 
 # With CUDA 11.8 GPU support
@@ -143,45 +181,28 @@ The project includes a `requirements.txt` and a `setup.sh` script for one-comman
 
 # With CUDA 12.1 GPU support
 ./setup.sh --cuda12
-
-# Or install into an already-active venv
-source your_env/bin/activate
-./setup.sh --existing
 ```
 
-<details>
-<summary>Manual setup (equivalent)</summary>
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-
-# CPU PyTorch:
-pip install torch==2.2.2 torchvision==0.17.2
-
-# —or— CUDA 11.8 PyTorch:
-# pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu118
-
-pip install -r requirements.txt
-```
-
-</details>
-
-> **Note on existing environments:** The repo currently contains two older virtual environments (`venv/` and `training_env/`) that were created during early development. `venv/` holds the full set of installed packages; `training_env/` is an empty shell that was never populated. Both are gitignored and can be removed once you've migrated to the new `.venv` — but they are preserved for now since active runs may depend on them.
-
-### Train Both Models
+### Train Models
 
 ```bash
 cd training
 
-# Train both sequentially
-python train_both.py --epochs 100 --batch 16 --device 0
+# Train detection model (finds bounding boxes)
+python3 train_detection.py --epochs 100 --batch 16 --device cpu --cache ram
 
-# Or train individually
-python train_detection.py --epochs 100 --batch 16
-python train_pose.py --epochs 100 --batch 16
+# Train pose model (finds corner keypoints)
+python3 train_pose.py --epochs 100 --batch 16 --device cpu --cache ram
+
+# Or train both sequentially
+python3 train_both.py --epochs 100 --batch 16 --device cpu
 ```
+
+**Important training notes:**
+- `--cache ram` loads images into RAM on first epoch, making each subsequent epoch ~35 min instead of 8+ hours
+- `--device cpu` is recommended on Intel Macs (MPS is slower than CPU on non-Apple Silicon)
+- Mac users need `PYTORCH_ENABLE_MPS_FALLBACK=1` (set automatically by training scripts)
+- The symlink at `data/labels` is automatically managed — switching between detection and pose training re-points it
 
 ### Hyperparameters
 
@@ -211,41 +232,43 @@ python validate.py --model runs/pose/photo-corner-detector/weights/best.pt
 
 ```bash
 cd export
-python export_onnx.py --model ../training/runs/pose/photo-corner-detector/weights/best.pt
+
+# Export both models
+python3 export_onnx.py --all
+
+# Export a specific model
+python3 export_onnx.py --model ../training/runs/detection/photo-detector/weights/best.pt
+
+# Export with test inference
+python3 export_onnx.py --all --test
 ```
 
-Produces a ~3–5 MB ONNX model suitable for cross-platform deployment.
+Produces:
+- `models/detection_model.onnx` — 10.2 MB
+- `models/pose_model.onnx` — 10.0 MB
 
-### Python Inference (testing)
+Both models use:
+- **ONNX opset 17** — broad runtime compatibility
+- **Dynamic input shapes** — accept any `(batch, 3, H, W)` at runtime
+- **Simplified graph** via `onnxslim`
+
+### Python Inference (ONNX)
 
 ```bash
 cd onnx_inference
-python infer.py --model ../models/photo-corner-detector/best.onnx --image ../data/images/val/val_000001.jpg
+python3 infer.py --model ../models/detection_model.onnx --image ../data/images/val/val_000001.jpg
+python3 infer.py --model ../models/pose_model.onnx --image ../data/images/val/val_000001.jpg
 ```
 
-### Kotlin / Android Deployment
-
-The ONNX model integrates into Kotlin using ONNX Runtime + BoofCV:
-
-```kotlin
-val detector = PhotoCornerDetector("photo-corner-detector.onnx")
-val detected = detector.detect(scannedImage)         // List<DetectedPhoto>
-val extracted = detector.extractPhotos(scannedImage)  // Perspective-corrected crops
-```
-
-> 📄 Full Kotlin integration guide with Gradle setup, preprocessing, and perspective transform: [`docs/KOTLIN_USAGE.md`](docs/KOTLIN_USAGE.md)
-
----
-
-## Inference Pipeline (Python)
+### Python Inference (Ultralytics, for testing)
 
 ```python
 from ultralytics import YOLO
 import cv2
 import numpy as np
 
-det_model = YOLO('runs/detection/photo-detector/weights/best.pt')
-pose_model = YOLO('runs/pose/photo-corner-detector/weights/best.pt')
+det_model = YOLO('training/runs/detection/photo-detector/weights/best.pt')
+pose_model = YOLO('training/runs/pose/photo-corner-detector/weights/best.pt')
 
 image = cv2.imread('scanned_photo.jpg')
 
@@ -275,6 +298,18 @@ for box in boxes:
     cv2.imwrite('extracted_photo.jpg', extracted)
 ```
 
+### Kotlin / Android Deployment
+
+The ONNX model integrates into Kotlin using ONNX Runtime + BoofCV:
+
+```kotlin
+val detector = PhotoCornerDetector("pose_model.onnx")
+val detected = detector.detect(scannedImage)         // List<DetectedPhoto>
+val extracted = detector.extractPhotos(scannedImage)  // Perspective-corrected crops
+```
+
+> 📄 Full Kotlin integration guide with Gradle setup, preprocessing, and perspective transform: [`docs/KOTLIN_USAGE.md`](docs/KOTLIN_USAGE.md)
+
 ---
 
 ## Project Structure
@@ -288,14 +323,26 @@ photo-pose-detector/
 │
 ├── training/
 │   ├── dataset_detection.yaml       # Detection dataset config
-│   ├── dataset_pose.yaml            # Pose dataset config
+│   ├── dataset_pose.yaml            # Pose dataset config (kpt_shape: [4, 3])
+│   ├── label_links.py               # Symlink manager for label paths
 │   ├── train_detection.py           # Detection training script
 │   ├── train_pose.py               # Pose training script
 │   ├── train_both.py               # Train both sequentially
-│   └── validate.py                  # Validation script
+│   ├── validate.py                  # Validation script
+│   └── runs/                        # Training outputs (gitignored)
+│       ├── detection/photo-detector/weights/
+│       │   ├── best.pt
+│       │   └── last.pt
+│       └── pose/photo-corner-detector/weights/
+│           ├── best.pt
+│           └── last.pt
 │
 ├── export/
-│   └── export_onnx.py              # ONNX export script
+│   └── export_onnx.py              # ONNX export script (both models)
+│
+├── models/                          # Exported ONNX models
+│   ├── detection_model.onnx         # 10.2 MB
+│   └── pose_model.onnx              # 10.0 MB
 │
 ├── onnx_inference/
 │   └── infer.py                    # Python ONNX inference testing
@@ -303,31 +350,29 @@ photo-pose-detector/
 ├── docs/
 │   ├── GETTING_STARTED.md          # Setup tutorial
 │   ├── KOTLIN_USAGE.md             # Kotlin/Android integration
-│   └── PROJECT_PLAN.md             # Original project plan
+│   ├── PROJECT_PLAN.md             # Original project plan
+│   └── REFACTORING_PLAN.md         # Refactoring notes
 │
 ├── textures/                        # 6 background textures
 ├── data/                            # Generated datasets (gitignored)
-├── runs/                            # Training runs (gitignored)
-│
 ├── requirements.txt                 # Python dependency list
 ├── setup.sh                         # One-command environment setup
-├── venv/                            # Legacy venv (gitignored, still in use)
-└── training_env/                    # Legacy empty venv (gitignored)
+└── venv/                            # Legacy venv (gitignored, still in use)
 ```
 
 ---
 
-## Troubleshooting
+## Known Issues & Pitfalls
 
-| Problem | Solution |
-|---------|----------|
-| Training loss NaN | Reduce learning rate (`--lr0 0.0001`) |
-| Keypoints wrong order | Check `flip_idx: [2, 3, 0, 1]` in dataset YAML |
-| Overfitting | Generate more data, reduce augmentation |
-| ONNX export fails | `pip install onnxruntime onnx` |
-| Slow inference | Use GPU provider, or try smaller input (320×320) |
-| Photos overlapping in generated data | Increase `OVERLAP_THRESHOLD` or reduce `NUM_PHOTOS_MAX` |
-| Generated photos too small | Increase `PHOTO_SIZE_MIN` in `generate.py` |
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| **All training losses = 0** | Missing `data/labels` symlink → Ultralytics can't find labels | Training scripts now auto-create it via `label_links.py` |
+| **MPS crash: `torchvision::nms not implemented`** | NMS not supported on MPS device | `PYTORCH_ENABLE_MPS_FALLBACK=1` is set automatically |
+| **Training epoch time doubles each epoch** | Images re-read from disk every epoch | Use `--cache ram` to cache in memory |
+| **Pose labels: "require 13 columns" error** | `kpt_shape` was `[4, 2]` but labels have visibility (3 values per keypoint) | Set `kpt_shape: [4, 3]` in `dataset_pose.yaml` |
+| **Nested output dirs** | Running from wrong working directory | Always `cd training/` before running scripts |
+| **Keypoints wrong order** | Incorrect `flip_idx` | Verify `flip_idx: [2, 3, 0, 1]` in `dataset_pose.yaml` |
+| **Cached labels from wrong model** | Stale `.cache` files after switching detection↔pose | `label_links.py` clears caches automatically |
 
 ---
 
