@@ -723,7 +723,7 @@ def fast_glare(img):
 
 def apply_texture_overlay(canvas):
     """Apply a random texture overlay to the background."""
-    textures_dir = Path("/Users/krys.petrie/dev/photo-pose-detector/textures")
+    textures_dir = Path(__file__).resolve().parent.parent / "textures"
     
     if not textures_dir.exists():
         return canvas

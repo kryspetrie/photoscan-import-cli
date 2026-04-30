@@ -124,7 +124,7 @@ If `/photo-pose-detector/textures/` exists and contains `.jpg`/`.png` files:
   - 50% chance: **multiply blend** → `canvas × texture`
 - Final: `canvas × (1 - opacity) + blended × opacity`
 
-The project includes 6 texture images in the `textures/` directory.
+The project includes 85 texture images in the `textures/` directory, sourced from the [Describable Textures Dataset (DTD)](https://www.robots.ox.ac.uk/~vgg/data/dtd/) and processed to 1200×1200 greyscale with brightness normalization.
 
 ---
 
@@ -313,7 +313,7 @@ photo = cv2.resize(photo, (int(w_orig * scale), int(h_orig * scale)))
 
 The scale factor is the **minimum** of width-ratio and height-ratio, ensuring the photo fits within the target dimensions while maintaining its original aspect ratio. The photo is never stretched — only scaled down.
 
-The **5062 source images** in `data_generator/images/` are from the Oxford Buildings dataset, providing diverse content (architecture, landscapes, objects).
+The **5,062 source images** in `data_generator/images/` are from the [Oxford Buildings Dataset](https://www.robots.ox.ac.uk/~vgg/data/oxbuildings/) (Oxford5k), providing diverse content (architecture, landscapes, objects). Download and extract them into this directory before running the generator.
 
 ### 6.2 Glare Effect — `fast_glare(img)`
 
@@ -671,7 +671,11 @@ Set `max_strength = 0.0` in `apply_perspective_safe`, or comment out the call in
 
 | Asset | Location | Count | Description |
 |-------|----------|-------|-------------|
-| Source photos | `data_generator/images/` | 5,062 | Oxford Buildings dataset — architecture, objects, scenes (`.jpg`) |
-| Background textures | `textures/` | 6 | Surface textures for background blending (`.jpg`) |
+| Source photos | `data_generator/images/` | 5,062 | [Oxford Buildings Dataset](https://www.robots.ox.ac.uk/~vgg/data/oxbuildings/) — architecture, objects, scenes (`.jpg`). Download and extract into `data_generator/images/` |
+| Background textures | `textures/` | 85 | [Describable Textures Dataset (DTD)](https://www.robots.ox.ac.uk/~vgg/data/dtd/) — processed to 1200×1200 greyscale, brightness-normalized (`.jpg`) |
+
+**Oxford Buildings Dataset:** The 5,062 source images are from the [Oxford Buildings Dataset](https://www.robots.ox.ac.uk/~vgg/data/oxbuildings/) (Oxford5k), created by the Visual Geometry Group at the University of Oxford. It is available under a Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License. Use `python download_oxford.py` to download and extract into `data_generator/images/`.
+
+**Describable Textures Dataset (DTD):** The 85 background textures are from the [Describable Textures Dataset](https://www.robots.ox.ac.uk/~vgg/data/dtd/), created by the Visual Geometry Group at the University of Oxford. Available under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License. Use `python download_textures.py` to download, process, and install into `textures/`.
 
 Source photos are randomly selected for each placement (with replacement), so the same photo may appear multiple times in one image or across images. This is intentional — the model must learn to detect photos regardless of content.

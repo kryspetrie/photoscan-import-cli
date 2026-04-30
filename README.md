@@ -106,13 +106,32 @@ Horizontal flip augmentation swaps: LL↔LR, UL↔UR (configured via `flip_idx: 
 
 ## Training Data
 
+### Download Source Data
+
+Two datasets are needed for synthetic data generation. Download scripts are included:
+
+```bash
+# Download Oxford Buildings Dataset (5,062 source photos, ~1.5 GB)
+python download_oxford.py
+
+# Download and process DTD textures (85 selected textures, ~600 MB download)
+python download_textures.py
+```
+
+| Dataset | Purpose | Count | License |
+|---------|---------|-------|---------|
+| [Oxford Buildings (Oxford5k)](https://www.robots.ox.ac.uk/~vgg/data/oxbuildings/) | Source photo content | 5,062 images | CC BY-NC-SA 4.0 |
+| [Describable Textures (DTD)](https://www.robots.ox.ac.uk/~vgg/data/dtd/) | Background textures | 85 selected images | CC BY-NC-SA 4.0 |
+
+The DTD textures are automatically processed (resized to 1200×1200, converted to greyscale, brightness-normalized to medium grey) before being placed in `textures/`.
+
 ### Synthetic Data Generation
 
 Training data is generated synthetically — no manual annotation required. The generator places real photo content onto random backgrounds with realistic distortions and effects.
 
 **Source material:**
-- **5,062 source photos** from the Oxford Buildings dataset (architecture, landscapes, objects)
-- **6 background textures** for surface simulation
+- **5,062 source photos** from the Oxford Buildings Dataset in `data_generator/images/`
+- **85 background textures** (processed from DTD) in `textures/`
 
 **Per-image variation:**
 - 1–4 photos randomly placed per 640×640 image
@@ -316,10 +335,15 @@ val extracted = detector.extractPhotos(scannedImage)  // Perspective-corrected c
 
 ```
 photo-pose-detector/
+├── download_oxford.py              # Download Oxford Buildings Dataset
+├── download_textures.py            # Download & process DTD textures
+│
 ├── data_generator/
 │   ├── generate.py                  # Main generator (examples + batch modes)
 │   ├── SYSTEM_DOCUMENTATION.md      # Detailed generator documentation
 │   └── images/                      # 5,062 source photos (Oxford Buildings)
+│
+├── textures/                        # 85 processed greyscale textures (DTD)
 │
 ├── training/
 │   ├── dataset_detection.yaml       # Detection dataset config
@@ -348,12 +372,9 @@ photo-pose-detector/
 │   └── infer.py                    # Python ONNX inference testing
 │
 ├── docs/
-│   ├── GETTING_STARTED.md          # Setup tutorial
-│   ├── KOTLIN_USAGE.md             # Kotlin/Android integration
-│   ├── PROJECT_PLAN.md             # Original project plan
-│   └── REFACTORING_PLAN.md         # Refactoring notes
+│   ├── KOTLIN_USAGE.md             # Kotlin/Android integration guide
+│   └── REFACTORING_PLAN.md         # Draft: separate data pipeline plan
 │
-├── textures/                        # 6 background textures
 ├── data/                            # Generated datasets (gitignored)
 ├── requirements.txt                 # Python dependency list
 ├── setup.sh                         # One-command environment setup
