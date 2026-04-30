@@ -26,7 +26,6 @@ wandb/
 logs/
 *.pt
 *.pth
-*.onnx
 *.h5
 *.ckpt
 
