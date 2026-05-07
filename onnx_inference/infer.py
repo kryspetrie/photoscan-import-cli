@@ -61,34 +61,35 @@ Cropping
     Output naming: {original_stem}_{photo_id}.{ext}
     Example: scan_001_1.jpg, scan_001_2.jpg
 
+Recommended Commands
+-------------------
+    # Best simple crop — keypoint-based bbox + 10px margin so edges aren't clipped
+    python3 infer.py --image scan.jpg --crop simple-corners --crop-margin 10
+
+    # Best warp crop — outward warp + margin + white fill for clean edges
+    python3 infer.py --image scan.jpg --crop warp-stretch \
+                     --crop-margin 10 --border-fill white
+
+    # Best transparent crop — corner-based with margin, for compositing
+    python3 infer.py --image scan.jpg --crop simple-corners \
+                     --crop-margin 10 --crop-transparent
+
+    # Crop a whole folder of images
+    python3 infer.py --image ./scans/ --output ./crops/ \
+                     --crop simple-corners --crop-margin 10
+
 Usage
 -----
-    # Two-stage pipeline (multi-photo image)
-    python3 infer.py --detection-model ../models/detection_model.onnx \
-                     --pose-model ../models/pose_model_v2.onnx \
+    # Single image (models auto-detected)
+    python3 infer.py --image scan.jpg
+
+    # Folder of images
+    python3 infer.py --image ./scans/ --output ./crops/
+
+    # Override model paths
+    python3 infer.py --detection-model /path/to/det.onnx \
+                     --pose-model /path/to/pose.onnx \
                      --image scan.jpg
-
-    # Single-stage (single-photo image, skip detection)
-    python3 infer.py --pose-model ../models/pose_model_v2.onnx --image crop.jpg
-
-    # Batch directory
-    python3 infer.py --detection-model ../models/detection_model.onnx \
-                     --pose-model ../models/pose_model_v2.onnx \
-                     --image ../data_pose_multi/images/val/ --batch --limit 5
-
-    # With perspective warp cropping
-    python3 infer.py --detection-model ../models/detection_model.onnx \
-                     --pose-model ../models/pose_model_v2.onnx \
-                     --image scan.jpg --crop warp
-
-    # With warp stretching (outward, preserves all content)
-    python3 infer.py --image scan.jpg --crop warp-stretch --border-fill white
-
-    # Simple crop as transparent PNG
-    python3 infer.py --image scan.jpg --crop simple --crop-transparent
-
-    # Corner-based crop with 10px margin to avoid clipping edges
-    python3 infer.py --image scan.jpg --crop simple-corners --crop-margin 10
 
     # Adjust thresholds
     python3 infer.py --image photo.jpg --det-conf 0.3 --pose-conf 0.25
@@ -117,10 +118,15 @@ KEYPOINT_FULL_NAMES = {
 }
 BOX_COLOR = "#FF00FF"
 EDGE_COLOR = "#00FFFF"
-CROP_PAD = 4              # Pixels of padding around detection box for crop
+POSE_CROP_EXPAND = 0.10    # Expand detection box by 10% of larger dim for pose crop
 DEFAULT_IMG_SIZE = 640
 DEDUP_MIN_DIST_RATIO = 0.12  # 12% of image min-dimension
 _VIS_THRESH_DEDUP = 0.25      # visibility threshold for center-based dedup
+
+# Default model paths (relative to this script's location)
+_SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_DETECTION_MODEL = _SCRIPT_DIR / ".." / "models" / "detection_model.onnx"
+DEFAULT_POSE_MODEL = _SCRIPT_DIR / ".." / "models" / "pose_model_v2.onnx"
 
 
 # ---------------------------------------------------------------------------
@@ -388,11 +394,18 @@ def dedup_pose_results(pose_results: list, min_center_dist: float):
 
 def pipeline(detection_session, pose_session, image: Image.Image,
             det_conf: float = 0.5, pose_conf: float = 0.5,
-            iou_threshold: float = 0.45, crop_pad: int = CROP_PAD,
+            iou_threshold: float = 0.45,
+            pose_crop_expand: float = POSE_CROP_EXPAND,
             img_size: int = DEFAULT_IMG_SIZE,
             dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO):
     """
     Full two-stage pipeline: detect photos → find corners → dedup.
+
+    The detection model produces tight bounding boxes that may clip the
+    actual photo corners. Before passing each crop to the pose model, the
+    detection box is expanded by ``pose_crop_expand`` (default 10%) of the
+    larger dimension of the box. This ensures the pose model sees enough
+    surrounding context to accurately locate all four corners.
 
     Returns list of dicts:
         {
@@ -426,11 +439,17 @@ def pipeline(detection_session, pose_session, image: Image.Image,
         x1, y1 = box["x1"], box["y1"]
         x2, y2 = box["x2"], box["y2"]
 
-        # Crop with padding
-        crop_x1 = max(0, int(x1) - crop_pad)
-        crop_y1 = max(0, int(y1) - crop_pad)
-        crop_x2 = min(orig_w, int(x2) + crop_pad)
-        crop_y2 = min(orig_h, int(y2) + crop_pad)
+        # Expand detection box by a proportion of its larger dimension.
+        # This gives the pose model enough surrounding context to find
+        # corners that may lie just outside the tight detection box.
+        box_w = x2 - x1
+        box_h = y2 - y1
+        expand_px = int(max(box_w, box_h) * pose_crop_expand)
+
+        crop_x1 = max(0, int(x1) - expand_px)
+        crop_y1 = max(0, int(y1) - expand_px)
+        crop_x2 = min(orig_w, int(x2) + expand_px)
+        crop_y2 = min(orig_h, int(y2) + expand_px)
 
         crop = image.crop((crop_x1, crop_y1, crop_x2, crop_y2))
 
@@ -1002,7 +1021,8 @@ def save_crops(image: Image.Image, results: list, image_path: str,
 def infer_single(detection_session, pose_session, image_path: str,
                  output_path: str = None, det_conf: float = 0.5,
                  pose_conf: float = 0.5, iou_threshold: float = 0.45,
-                 crop_pad: int = CROP_PAD, img_size: int = DEFAULT_IMG_SIZE,
+                 pose_crop_expand: float = POSE_CROP_EXPAND,
+                 img_size: int = DEFAULT_IMG_SIZE,
                  dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO,
                  crop_mode: str = None, crop_dir: str = None,
                  transparent: bool = False,
@@ -1019,7 +1039,7 @@ def infer_single(detection_session, pose_session, image_path: str,
 
     results = pipeline(
         detection_session, pose_session, image,
-        det_conf, pose_conf, iou_threshold, crop_pad, img_size,
+        det_conf, pose_conf, iou_threshold, pose_crop_expand, img_size,
         dedup_min_dist_ratio,
     )
 
@@ -1056,6 +1076,16 @@ def infer_single(detection_session, pose_session, image_path: str,
         base = Path(image_path).stem
         parent = Path(image_path).parent
         output_path = str(parent / f"{base}_detected.jpg")
+    else:
+        out = Path(output_path)
+        # If --output is a directory (no extension), place the annotated
+        # image inside it with the default naming convention.
+        if out.suffix == "" or out.is_dir():
+            out.mkdir(parents=True, exist_ok=True)
+            output_path = str(out / f"{Path(image_path).stem}_detected.jpg")
+
+    # Ensure output directory exists
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     vis.save(output_path, quality=95)
     print(f"\n  Saved: {output_path}")
@@ -1080,7 +1110,8 @@ def infer_single(detection_session, pose_session, image_path: str,
 def infer_batch(detection_session, pose_session, image_dir: str,
                output_dir: str = None, det_conf: float = 0.5,
                pose_conf: float = 0.5, iou_threshold: float = 0.45,
-               crop_pad: int = CROP_PAD, img_size: int = DEFAULT_IMG_SIZE,
+               pose_crop_expand: float = POSE_CROP_EXPAND,
+               img_size: int = DEFAULT_IMG_SIZE,
                dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO,
                limit: int = 0,
                crop_mode: str = None, crop_dir: str = None,
@@ -1102,19 +1133,19 @@ def infer_batch(detection_session, pose_session, image_dir: str,
     if output_dir:
         out_path = Path(output_dir)
     else:
-        out_path = image_dir / "detected"
+        out_path = image_dir / "output"
     out_path.mkdir(parents=True, exist_ok=True)
 
-    mode = "two-stage" if detection_session else "pose-only"
-    print(f"Processing {len(images)} images ({mode})")
-    print(f"Output: {out_path}")
+    print(f"Processing {len(images)} images")
+    print(f"  Input:  {image_dir}")
+    print(f"  Output: {out_path}")
 
     summary = []
     for img_path in images:
         out_file = out_path / f"{img_path.stem}_detected.jpg"
         results = infer_single(
             detection_session, pose_session, str(img_path), str(out_file),
-            det_conf, pose_conf, iou_threshold, crop_pad, img_size,
+            det_conf, pose_conf, iou_threshold, pose_crop_expand, img_size,
             dedup_min_dist_ratio,
             crop_mode, crop_dir,
             transparent, border_fill,
@@ -1153,56 +1184,48 @@ def main():
         description="Photo Pose Detector — Two-Stage ONNX Inference CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Two-stage pipeline (multi-photo image)
-  python3 infer.py \\
-    --detection-model ../models/detection_model.onnx \\
-    --pose-model ../models/pose_model_v2.onnx \\
-    --image scan.jpg
+Basic Usage:
+  # Single image (models auto-detected)
+  python3 infer.py --image scan.jpg
 
-  # Single-stage (skip detection, image is already a single photo)
-  python3 infer.py --pose-model ../models/pose_model_v2.onnx --image crop.jpg
+  # Folder of images → folder of results
+  python3 infer.py --image ./scans/ --output ./crops/
 
-  # Batch validation images
-  python3 infer.py \\
-    --detection-model ../models/detection_model.onnx \\
-    --pose-model ../models/pose_model_v2.onnx \\
-    --image ../data_pose_multi/images/val/ --batch --limit 5
-
-  # With perspective warp cropping
-  python3 infer.py \\
-    --detection-model ../models/detection_model.onnx \\
-    --pose-model ../models/pose_model_v2.onnx \\
-    --image scan.jpg --crop warp
-
-  # Outward warp (preserves all photo content)
-  python3 infer.py \\
-    --image scan.jpg --crop warp-stretch --border-fill white
-
-  # Simple crop as transparent PNG
-  python3 infer.py --image scan.jpg --crop simple --crop-transparent
-
-  # Corner-based crop with 10px margin
+Recommended Crop Commands:
+  # Best simple crop — keypoint bbox + margin so edges aren't clipped
   python3 infer.py --image scan.jpg --crop simple-corners --crop-margin 10
+
+  # Best warp crop — outward warp + margin + white fill for clean edges
+  python3 infer.py --image scan.jpg --crop warp-stretch \\
+    --crop-margin 10 --border-fill white
+
+  # Best transparent crop — corner-based with margin, for compositing
+  python3 infer.py --image scan.jpg --crop simple-corners \\
+    --crop-margin 10 --crop-transparent
+
+  # Crop a whole folder
+  python3 infer.py --image ./scans/ --output ./crops/ \\
+    --crop simple-corners --crop-margin 10
 """,
     )
 
     parser.add_argument(
-        "--detection-model", "-d", type=str, default=None,
-        help="Path to detection ONNX model (omit for single-photo/pose-only mode)",
+        "--detection-model", "-d", type=str, default=str(DEFAULT_DETECTION_MODEL),
+        help="Path to detection ONNX model (default: ../models/detection_model.onnx)",
     )
     parser.add_argument(
-        "--pose-model", "-p", type=str,
-        default="../models/pose_model_v2.onnx",
+        "--pose-model", "-p", type=str, default=str(DEFAULT_POSE_MODEL),
         help="Path to pose ONNX model (default: ../models/pose_model_v2.onnx)",
     )
     parser.add_argument(
         "--image", "-i", type=str, required=True,
-        help="Path to image file or directory (with --batch)",
+        help="Path to image file or directory of images to process",
     )
     parser.add_argument(
         "--output", "-o", type=str, default=None,
-        help="Output path for annotated image or directory (batch)",
+        help="Output path for annotated image(s). For a single input image, "
+             "defaults to {stem}_detected.jpg next to the input. For a "
+             "directory of images, defaults to an 'output' subdirectory.",
     )
     parser.add_argument(
         "--det-conf", type=float, default=0.5,
@@ -1217,8 +1240,11 @@ Examples:
         help="NMS IoU threshold for detection stage (default: 0.45)",
     )
     parser.add_argument(
-        "--crop-pad", type=int, default=CROP_PAD,
-        help="Padding around detection box for pose crop (default: 4)",
+        "--pose-crop-expand", type=float, default=POSE_CROP_EXPAND,
+        help="Proportion of the larger detection box dimension to expand "
+             "the crop by before passing to the pose model. A larger value "
+             "gives the pose model more surrounding context, helping it find "
+             "corners near the edges. (default: 0.10 = 10%%)",
     )
     parser.add_argument(
         "--imgsz", type=int, default=DEFAULT_IMG_SIZE,
@@ -1229,12 +1255,9 @@ Examples:
         help="Min center distance for dedup, as fraction of image min-dimension (default: 0.08)",
     )
     parser.add_argument(
-        "--batch", action="store_true",
-        help="Process all images in directory specified by --image",
-    )
-    parser.add_argument(
         "--limit", "-n", type=int, default=0,
-        help="Limit number of images in batch mode (0 = all)",
+        help="When processing a directory, limit the number of images "
+             "to process (0 = all)",
     )
     parser.add_argument(
         "--crop", type=str, default=None,
@@ -1277,46 +1300,46 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate pose model
-    if not Path(args.pose_model).exists():
-        print(f"Error: Pose model not found: {args.pose_model}")
+    # Validate models
+    detection_model_path = Path(args.detection_model).resolve()
+    pose_model_path = Path(args.pose_model).resolve()
+
+    if not detection_model_path.exists():
+        print(f"Error: Detection model not found: {detection_model_path}")
+        print(f"  (default: {DEFAULT_DETECTION_MODEL.resolve()})")
+        sys.exit(1)
+    if not pose_model_path.exists():
+        print(f"Error: Pose model not found: {pose_model_path}")
+        print(f"  (default: {DEFAULT_POSE_MODEL.resolve()})")
         sys.exit(1)
 
+    # Load detection model
+    print(f"Loading detection model: {detection_model_path}")
+    detection_session = load_onnx_model(str(detection_model_path))
+
     # Load pose model
-    print(f"Loading pose model: {args.pose_model}")
-    pose_session = load_onnx_model(args.pose_model)
+    print(f"Loading pose model: {pose_model_path}")
+    pose_session = load_onnx_model(str(pose_model_path))
 
-    # Load detection model (optional)
-    detection_session = None
-    if args.detection_model:
-        if not Path(args.detection_model).exists():
-            print(f"Error: Detection model not found: {args.detection_model}")
-            sys.exit(1)
-        print(f"Loading detection model: {args.detection_model}")
-        detection_session = load_onnx_model(args.detection_model)
-
-    # Validate image path
+    # Validate image path and auto-detect file vs directory mode
     image_path = Path(args.image)
-    if args.batch:
-        if not image_path.is_dir():
-            print("Error: --batch requires --image to be a directory")
-            sys.exit(1)
-    else:
-        if not image_path.exists():
-            print(f"Error: Image not found: {args.image}")
-            sys.exit(1)
+    if not image_path.exists():
+        print(f"Error: Image path not found: {args.image}")
+        sys.exit(1)
+
+    is_dir = image_path.is_dir()
 
     # Parse border fill color
     border_fill = parse_border_fill(args.border_fill)
 
-    # Run inference
-    if args.batch:
+    # Run inference — auto-detect file vs directory
+    if is_dir:
         infer_batch(
             detection_session, pose_session, args.image, args.output,
             det_conf=args.det_conf,
             pose_conf=args.pose_conf,
             iou_threshold=args.iou,
-            crop_pad=args.crop_pad,
+            pose_crop_expand=args.pose_crop_expand,
             img_size=args.imgsz,
             dedup_min_dist_ratio=args.dedup_dist,
             limit=args.limit,
@@ -1332,7 +1355,7 @@ Examples:
             det_conf=args.det_conf,
             pose_conf=args.pose_conf,
             iou_threshold=args.iou,
-            crop_pad=args.crop_pad,
+            pose_crop_expand=args.pose_crop_expand,
             img_size=args.imgsz,
             dedup_min_dist_ratio=args.dedup_dist,
             crop_mode=args.crop,
