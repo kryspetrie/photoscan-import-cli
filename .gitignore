@@ -8,6 +8,8 @@ data_generator/test/
 data_detection/
 data_pose/
 data_pose_multi/
+test/
+tests/
 
 # Python
 __pycache__/
