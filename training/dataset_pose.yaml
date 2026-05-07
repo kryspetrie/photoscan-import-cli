@@ -1,76 +1,31 @@
 # YOLO Pose Dataset Configuration
 # ===============================
-# For training the YOLO Pose Model (4 corner keypoints)
+# Self-contained pose dataset — no symlinks needed.
 #
-# This dataset uses the SAME images as the detection dataset, but with
-# DIFFERENT labels that include 4 keypoint coordinates per object.
-#
-# FORMAT: YOLO-pose (13 columns per object)
-#   class_id x_center y_center width height kp0x kp0y kpc0 kp1x kp1y kpc1 kp2x kp2y kpc2 kp3x kp3y kpc3
+# Label format: YOLO-pose (17 columns per object)
+#   class_id x_center y_center width height kp0x kp0y kp0v kp1x kp1y kp1v kp2x kp2y kp2v kp3x kp3y kp3v
 #
 # KEYPOINT ORDER: LL, UL, UR, LR (CRITICAL)
-#   kp0 = Lower-Left (LL)  - minimum Y, minimum X
-#   kp1 = Upper-Left (UL)  - maximum Y, minimum X
-#   kp2 = Upper-Right (UR) - maximum Y, maximum X
-#   kp3 = Lower-Right (LR) - minimum Y, maximum X
+#   kp0 = Lower-Left (LL)  - high Y, low X
+#   kp1 = Upper-Left (UL)  - low Y, low X
+#   kp2 = Upper-Right (UR) - low Y, high X
+#   kp3 = Lower-Right (LR) - high Y, high X
+#
+# Training data: single-photo crops with keypoints at full image extent
+# (matches the detection→pose inference pipeline).
 #
 # Usage:
-#   from ultralytics import YOLO
-#   model = YOLO('yolo26n-pose.pt')
-#   results = model.train(data='dataset_pose.yaml', ...)
+#   python3 train_pose.py
+#   (or explicitly: python3 train_pose.py --data dataset_pose.yaml)
 
-# Path to dataset root (relative to this file or absolute)
-path: /Users/krys.petrie/dev/photo-pose-detector/data
-
-# Training and validation image directories
+path: /Users/krys.petrie/dev/photo-pose-detector/data_pose
 train: images/train
 val: images/val
 
-# Number of classes
 nc: 1
-
-# Class names
 names:
   0: photo
 
-# -----------------------------------------------------------------------------
-# POSE CONFIGURATION (REQUIRED for pose training)
-# -----------------------------------------------------------------------------
-
-# Number of keypoints per object
-kpt_number: 4
-
-# Keypoint dimensions (x, y, visibility) - 3 for keypoints with visibility
+# Keypoint configuration
 kpt_shape: [4, 3]
-
-# Flip index for horizontal flip augmentation
-# When image is horizontally flipped:
-#   - LL (kp0) ↔ LR (kp3)  [left-right swap]
-#   - UL (kp1) ↔ UR (kp2)  [left-right swap]
-# This enables proper keypoint tracking through flip augmentation
-flip_idx: [2, 3, 0, 1]
-
-# Keypoint names (for documentation, not used by training)
-keypoint_names:
-  - lower_left
-  - upper_left
-  - upper_right
-  - lower_right
-
-# -----------------------------------------------------------------------------
-# MODEL PURPOSE
-# -----------------------------------------------------------------------------
-# This model detects 4 corner keypoints of photographs in images.
-# It outputs a quadrilateral defined by LL, UL, UR, LR corners.
-#
-# Use case:
-#   - Precise corner detection for photo extraction
-#   - Perspective correction using detected quadrilateral
-#   - Final corner localization in a pipeline
-#
-# Training notes:
-#   - YOLO-pose model required
-#   - flip_idx must be set correctly for augmentation
-#   - Disable aggressive augmentation that moves keypoints
-#   - mosaic=0.5, degrees=10, scale=0.3 recommended
-# -----------------------------------------------------------------------------
+flip_idx: [3, 2, 1, 0]

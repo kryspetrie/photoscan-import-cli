@@ -4,66 +4,42 @@ Train YOLO Pose Model
 =====================
 
 Trains a YOLO pose model to detect 4 corner keypoints (LL, UL, UR, LR)
-of photographs in images.
+of photographs in closely-cropped images.
 
-ARCHITECTURE
-------------
-This is a keypoint detection model that outputs 4 corner coordinates
-per detected photo. The corners are detected in a specific order:
-- kp0: Lower-Left (LL)  - minimum Y, minimum X
-- kp1: Upper-Left (UL)  - maximum Y, minimum X
-- kp2: Upper-Right (UR) - maximum Y, maximum X
-- kp3: Lower-Right (LR) - minimum Y, maximum X
+Uses yolo26s-pose (small variant) for better keypoint precision than
+the nano variant.  The training data is single-photo crops from
+data_pose/ — matching the inference distribution.
 
-This order enables:
-1. Proper horizontal flip augmentation (flip_idx = [2, 3, 0, 1])
-2. Quadrilateral extraction from corner keypoints
-3. Perspective correction of detected photos
-
-OUTPUT FORMAT
-------------
-YOLO-pose format (13 columns per object):
-    class_id x_center y_center width height kp0x kp0y kpc0 kp1x kp1y kpc1 kp2x kp2y kpc2 kp3x kp3y kpc3
-
-Where visibility=2 means "visible and within image bounds"
+Augmentation is reduced compared to detection training because:
+- The photo already fills most of the frame (less scale/translate needed)
+- Keypoints must track through augmentations (no mixup/copy_paste)
+- flip_idx handles horizontal flip correctly for LL↔LR and UL↔UR
 
 USAGE
 -----
-    # Train pose model
-    python train_pose.py --epochs 100 --batch 16
-
-    # Resume training
-    python train_pose.py --resume
-
-    # Train with custom dataset path
-    python train_pose.py --data /path/to/dataset_pose.yaml
+    python3 train_pose.py --epochs 100 --batch 16
+    python3 train_pose.py --resume
+    python3 train_pose.py --data /path/to/dataset_pose.yaml
 
 Author: Photo Pose Detector Project
-Version: 32 - Two-Model Architecture
+Version: 33 - Separate Data Pipelines
 """
 
 import os
 import sys
 import argparse
 from pathlib import Path
-from datetime import datetime
 
-# MPS fallback: torchvision::nms is not implemented for MPS device.
-# Setting this env var causes MPS to fall back to CPU for unsupported ops.
-# Must be set before importing torch/ultralytics.
+# MPS fallback
 if sys.platform == "darwin" and "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-# Check ultralytics installation
 try:
     from ultralytics import YOLO
 except ImportError:
     print("Error: ultralytics not installed.")
     print("Install with: pip install ultralytics")
     sys.exit(1)
-
-# Label symlink management
-from label_links import ensure_labels_symlink, get_data_root_from_yaml
 
 
 def get_default_dataset_path():
@@ -74,11 +50,11 @@ def get_default_dataset_path():
 def train(
     data: str = None,
     epochs: int = 100,
-    patience: int = 20,
+    patience: int = 30,
     batch: int = 16,
     imgsz: int = 640,
     cache: str = "ram",
-    model: str = "yolo26n-pose.pt",  # Pose model
+    model: str = "yolo26s-pose.pt",   # SMALL variant for better keypoint precision
     project: str = "runs/pose",
     name: str = "photo-corner-detector",
     # Optimization
@@ -88,124 +64,78 @@ def train(
     momentum: float = 0.937,
     weight_decay: float = 0.0005,
     warmup_epochs: float = 3.0,
-    # Augmentation (reduced for keypoint detection)
-    mosaic: float = 0.5,
-    mixup: float = 0.0,  # Disabled for pose
-    copy_paste: float = 0.0,  # Disabled for pose
-    scale: float = 0.3,  # Reduced scale
-    degrees: float = 10.0,
-    translate: float = 0.1,
-    flipud: float = 0.0,  # No vertical flip (would swap top/bottom)
-    fliplr: float = 0.5,  # Horizontal flip OK with flip_idx
+    # Augmentation (reduced for tightly-cropped single-photo images)
+    mosaic: float = 0.3,       # Less mosaic (photo fills frame)
+    mixup: float = 0.0,       # Disabled (moves keypoints unpredictably)
+    copy_paste: float = 0.0,  # Disabled (single-photo crops)
+    scale: float = 0.2,       # Reduced (photo already fills most of frame)
+    degrees: float = 10.0,    # Moderate rotation
+    translate: float = 0.05,  # Less translation (tight crop)
+    flipud: float = 0.0,      # No vertical flip (would swap top/bottom corners)
+    fliplr: float = 0.5,      # Horizontal flip OK with flip_idx
     hsv_h: float = 0.015,
     hsv_s: float = 0.3,
     hsv_v: float = 0.3,
     # Training settings
     pretrained: bool = True,
     close_mosaic: int = 10,
-    workers: int = 8,
-    device: str = "0",
-    # Output
+    workers: int = 4,
+    device: str = "cpu",
     exist_ok: bool = True,
     verbose: bool = True,
-    # Resume
     resume: bool = False,
 ):
-    """
-    Train YOLO-pose model for photo corner detection.
-    
-    Args:
-        data: Path to dataset YAML file
-        epochs: Number of training epochs
-        patience: Early stopping patience
-        batch: Batch size
-        imgsz: Input image size
-        model: Pretrained pose model to use (yolo26n-pose.pt)
-        project: Project directory
-        name: Experiment name
-        resume: Resume from last checkpoint
-        ... (other training parameters)
-    """
-    
-    # Resolve dataset path
+    """Train YOLO-pose model for photo corner detection."""
+
     if data is None:
         data = str(get_default_dataset_path())
-    
+
     if not Path(data).exists():
         print(f"Error: Pose dataset not found at {data}")
-        print("Run generate_batch.py first to create training data.")
-        print("Pose labels should be in: data/pose/labels/")
+        print("Run: cd data_generator && python3 generate_pose.py --mode batch")
         sys.exit(1)
-    
-    # CRITICAL: Ensure data/labels symlink points to pose labels
-    # Ultralytics resolves labels by replacing /images/ with /labels/ in the
-    # image path. Without this symlink, all images are treated as backgrounds
-    # and training produces zero losses (the "zero-loss bug").
-    # NOTE: This must switch the symlink from detection to pose labels!
-    try:
-        data_root = get_data_root_from_yaml(data)
-        ensure_labels_symlink(data_root, "pose")
-    except Exception as e:
-        print(f"Error: Failed to set up label symlink: {e}")
-        print("Pose labels must be accessible at data/labels/train/")
-        sys.exit(1)
-    
+
     print("=" * 60)
     print("YOLO POSE MODEL TRAINING")
     print("=" * 60)
-    print(f"Model: {model}")
-    print(f"Dataset: {data}")
-    print(f"Epochs: {epochs}")
-    print(f"Batch size: {batch}")
+    print(f"Model:      {model}")
+    print(f"Dataset:    {data}")
+    print(f"Epochs:     {epochs}")
+    print(f"Batch:      {batch}")
     print(f"Image size: {imgsz}")
+    print(f"Device:     {device}")
+    print(f"Cache:      {cache}")
     print()
     print("Keypoint Configuration:")
     print("  kp0 = Lower-Left (LL)")
     print("  kp1 = Upper-Left (UL)")
     print("  kp2 = Upper-Right (UR)")
     print("  kp3 = Lower-Right (LR)")
-    print("  flip_idx = [2, 3, 0, 1]")
-    print("=" * 60)
-    
-    # Create model
-    print(f"\nLoading model: {model}")
-    try:
-        yolo_model = YOLO(model)
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        print("Ultralytics will attempt to download it automatically.")
-        yolo_model = YOLO("yolo26n-pose.pt")
-    
-    # Train
-    print(f"\nStarting training...")
-    print(f"  Model type: YOLO-Pose (4 keypoints)")
-    print(f"  Output: Corner keypoints (LL, UL, UR, LR)")
+    print("  flip_idx = [3, 2, 1, 0]")
     print()
-    
+    print("Augmentation (reduced for pose):")
+    print(f"  scale={scale}  translate={translate}  mosaic={mosaic}")
+    print(f"  mixup={mixup}  copy_paste={copy_paste}")
+    print(f"  degrees={degrees}  fliplr={fliplr}  flipud={flipud}")
+    print("=" * 60)
+
+    yolo_model = YOLO(model)
+
     results = yolo_model.train(
-        # Dataset
         data=data,
-        
-        # Training parameters
         epochs=epochs,
         patience=patience,
         batch=batch,
         imgsz=imgsz,
-        
-        # Model save
         project=project,
         name=name,
         exist_ok=exist_ok,
-        
-        # Optimization
         optimizer=optimizer,
         lr0=lr0,
         lrf=lrf,
         momentum=momentum,
         weight_decay=weight_decay,
         warmup_epochs=warmup_epochs,
-        
-        # Augmentation
         mosaic=mosaic,
         mixup=mixup,
         copy_paste=copy_paste,
@@ -217,124 +147,50 @@ def train(
         hsv_h=hsv_h,
         hsv_s=hsv_s,
         hsv_v=hsv_v,
-        
-        # Training settings
         pretrained=pretrained,
         close_mosaic=close_mosaic,
         workers=workers,
         device=device,
         cache=cache,
-        
-        # Output
         verbose=verbose,
         val=True,
         plots=True,
-        
-        # Pose-specific settings
-        pose=True,
-        
-        # Resume
         resume=resume,
     )
-    
-    # Print results
+
     print("\n" + "=" * 60)
     print("Training complete!")
     print("=" * 60)
-    
+
     best_model = Path(project) / name / "weights" / "best.pt"
-    last_model = Path(project) / name / "weights" / "last.pt"
-    
     if best_model.exists():
         print(f"Best model: {best_model.absolute()}")
-    if last_model.exists():
-        print(f"Last model: {last_model.absolute()}")
-    
-    print(f"\nTo export to ONNX:")
-    print(f"  python export_onnx.py --model {best_model}")
-    
-    print(f"\nTo use the model for inference:")
-    print(f"  from ultralytics import YOLO")
-    print(f"  model = YOLO('{best_model}')")
-    print(f"  results = model.predict('image.jpg', save=True)")
-    
+
     return results
 
 
 def main():
-    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Train YOLO pose model for photo corner detection"
-    )
-    parser.add_argument(
-        "--data", type=str, default=None,
-        help="Path to dataset YAML file"
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=100,
-        help="Number of training epochs"
-    )
-    parser.add_argument(
-        "--patience", type=int, default=20,
-        help="Early stopping patience"
-    )
-    parser.add_argument(
-        "--batch", type=int, default=16,
-        help="Batch size"
-    )
-    parser.add_argument(
-        "--imgsz", type=int, default=640,
-        help="Input image size"
-    )
-    parser.add_argument(
-        "--model", type=str, default="yolo26n-pose.pt",
-        help="Pretrained pose model (yolo26n-pose.pt)"
-    )
-    parser.add_argument(
-        "--project", type=str, default="runs/pose",
-        help="Project directory"
-    )
-    parser.add_argument(
-        "--name", type=str, default="photo-corner-detector",
-        help="Experiment name"
-    )
-    parser.add_argument(
-        "--device", type=str, default="0",
-        help="Device (0, 1, ... or 'cpu')"
-    )
-    parser.add_argument(
-        "--workers", type=int, default=8,
-        help="Number of dataloader workers"
-    )
-    parser.add_argument(
-        "--cache", type=str, default="ram",
-        help="Cache images: 'ram', 'disk', or False"
-    )
-    parser.add_argument(
-        "--resume", action="store_true",
-        help="Resume from last checkpoint"
-    )
-    
-    # Augmentation arguments
-    parser.add_argument(
-        "--mosaic", type=float, default=0.5,
-        help="Mosaic augmentation probability (0-1)"
-    )
-    parser.add_argument(
-        "--degrees", type=float, default=10.0,
-        help="Rotation augmentation range (degrees)"
-    )
-    parser.add_argument(
-        "--scale", type=float, default=0.3,
-        help="Scale augmentation range"
-    )
-    parser.add_argument(
-        "--lr0", type=float, default=0.001,
-        help="Initial learning rate"
-    )
-    
+        description="Train YOLO pose model for photo corner detection")
+    parser.add_argument("--data", type=str, default=None)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--model", type=str, default="yolo26s-pose.pt")
+    parser.add_argument("--project", type=str, default="runs/pose")
+    parser.add_argument("--name", type=str, default="photo-corner-detector")
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--cache", type=str, default="ram")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--mosaic", type=float, default=0.3)
+    parser.add_argument("--degrees", type=float, default=10.0)
+    parser.add_argument("--scale", type=float, default=0.2)
+    parser.add_argument("--lr0", type=float, default=0.001)
+
     args = parser.parse_args()
-    
+
     train(
         data=args.data,
         epochs=args.epochs,
@@ -346,12 +202,12 @@ def main():
         name=args.name,
         device=args.device,
         workers=args.workers,
+        cache=args.cache,
         mosaic=args.mosaic,
         degrees=args.degrees,
         scale=args.scale,
         lr0=args.lr0,
         resume=args.resume,
-        cache=args.cache,
     )
 
 

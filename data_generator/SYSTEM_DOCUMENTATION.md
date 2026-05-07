@@ -489,7 +489,7 @@ Example: `0 0.501715 0.505848 0.378018 0.590964 0.312194 0.801330 2 0.690212 0.8
 | kp2 | UR | Upper-Right | (max X, min Y) |
 | kp3 | LR | Lower-Right | (max X, max Y) |
 
-**Horizontal flip mapping**: `flip_idx: [2, 3, 0, 1]` — when the image is flipped horizontally:
+**Horizontal flip mapping**: `flip_idx: [3, 2, 1, 0]` — when the image is flipped horizontally:
 - LL (kp0) ↔ LR (kp3)
 - UL (kp1) ↔ UR (kp2)
 

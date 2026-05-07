@@ -3,6 +3,17 @@
 Photo Pose Detector — Synthetic Training Data Generator
 ========================================================
 
+**DEPRECATED:** This combined generator is replaced by the separate pipeline:
+  - `generate_detection.py` — detection model data (bbox labels only)
+  - `generate_pose.py` — pose model data (keypoint labels only, tightly cropped)
+
+The separate pipelines eliminate the train-inference distribution mismatch
+that caused poor keypoint localization.  See docs/REFACTORING_PLAN.md.
+
+This file is kept for reference only.
+
+---ORIGINAL DOC BELOW---
+
 Generates synthetic training images for TWO YOLO models:
   1. Detection Model — axis-aligned bounding boxes around photos
   2. Pose Model — 4 corner keypoints per photo (LL, UL, UR, LR)

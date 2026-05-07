@@ -79,15 +79,14 @@ Input Image
 
 ### Model Details
 
-| | Detection Model | Pose Model |
-|---|---|---|
-| **Purpose** | Find photo regions | Find exact corners |
-| **YOLO variant** | Standard detection | YOLO-Pose (keypoints) |
-| **Base weights** | `yolo11n.pt` | `yolo26n-pose.pt` |
-| **Output per photo** | Bounding box (x, y, w, h) | 4 corner keypoints |
-| **Label format** | 5 columns | 17 columns (bbox + 4×3 keypoints) |
-| **ONNX output shape** | `(batch, 5, 8400)` | `(batch, 300, 18)` |
-| **Speed** | Very fast | Fast |
+| | Detection Model | Pose Model (single) | Pose Model (multi) |
+|---|---|---|---|
+| **Purpose** | Find photo regions | Find exact corners | Find exact corners |
+| **YOLO variant** | Standard detection | YOLO-Pose (keypoints) | YOLO-Pose (keypoints) |
+| **Base weights** | `yolo26n.pt` | `yolo26s-pose.pt` | `yolo26s-pose.pt` |
+| **Output per photo** | Bounding box (x, y, w, h) | 4 corner keypoints | 4 corner keypoints |
+| **Label format** | 5 columns | 17 columns (bbox + 4×3 keypoints) | 17 columns (bbox + 4×3 keypoints) |
+| **Training data** | Multi-photo scenes | Tightly-cropped singles | Multi-photo scenes |
 
 ### Keypoint Order
 
@@ -100,7 +99,7 @@ The Pose model outputs 4 corners in a fixed order. This order is critical for th
 | kp2 | UR | Upper-Right |
 | kp3 | LR | Lower-Right |
 
-Horizontal flip augmentation swaps: LL↔LR, UL↔UR (configured via `flip_idx: [2, 3, 0, 1]`).
+Horizontal flip augmentation swaps: LL↔LR, UL↔UR (configured via `flip_idx: [3, 2, 1, 0]`).
 
 ---
 
@@ -130,7 +129,7 @@ The DTD textures are automatically processed (resized to 1200×1200, converted t
 Training data is generated synthetically — no manual annotation required. The generator places real photo content onto random backgrounds with realistic distortions and effects.
 
 **Source material:**
-- **5,062 source photos** from the Oxford Buildings Dataset in `data_generator/images/`
+- **85 background textures** (processed from DTD) in `textures/`
 - **85 background textures** (processed from DTD) in `textures/`
 
 **Per-image variation:**
@@ -152,38 +151,38 @@ Training data is generated synthetically — no manual annotation required. The 
 
 ### Generate Training Data
 
+Each model has its own generator and dataset directory — **no shared images or symlinks needed.**
+
 ```bash
 cd data_generator
 
-# Quick test — 10 images with debug overlays
-python generate.py --count 10
+# Generate detection data (1-4 photos per image, bbox labels)
+python3 generate_detection.py --mode batch --train-count 4000 --val-count 1000 --source ./images --output ../data_detection
 
-# Full dataset — train/val split
-python generate.py --mode batch --train-count 4000 --val-count 1000 --output ../data
+# Generate pose data — single-photo crops (1 photo per tightly-cropped image, keypoint labels)
+python3 generate_pose.py --mode batch --train-count 4000 --val-count 1000 --source ./images --output ../data_pose
+
+# Generate pose data — multi-photo scenes (1-4 photos per image, keypoint labels)
+python3 generate_pose_multi.py --mode batch --train-count 4000 --val-count 1000 --source ./images --output ../data_pose_multi
 ```
 
-This produces:
+This produces three self-contained datasets:
 
 ```
-data/
-├── images/
-│   ├── train/              # Training images (shared by both models)
-│   └── val/                # Validation images
-├── detection/
-│   └── labels/
-│       ├── train/          # 5-column bounding box labels
-│       └── val/
-└── pose/
-    └── labels/
-        ├── train/          # 17-column keypoint labels (bbox + 4 corners × 3)
-        └── val/
+data_detection/          data_pose/                data_pose_multi/
+├── images/             ├── images/               ├── images/
+│   ├── train/          │   ├── train/            │   ├── train/
+│   └── val/            │   └── val/              │   └── val/
+└── labels/             └── labels/               └── labels/
+    ├── train/ (5-col)     ├── train/ (17-col)       ├── train/ (17-col)
+    └── val/               └── val/                 └── val/
 ```
 
-**Same images, different labels.** Each model's dataset YAML points to the shared images with its own label directory.
+**Two pose datasets** are provided to compare training distributions:
+- **`data_pose/`** — tightly-cropped single-photo images, matching the inference pipeline (detect → crop → pose)
+- **`data_pose_multi/`** — multi-photo scenes (same as detection), to test if the V1 failure was caused by configuration bugs rather than distribution mismatch
 
-> ⚠️ **Symlink requirement:** Ultralytics resolves labels by replacing `/images/` with `/labels/` in the image path. Both YAMLs point to `data/images/`, so both expect `data/labels/`. The training scripts (`train_detection.py`, `train_pose.py`) automatically create/switch a symlink at `data/labels → data/detection/labels` or `data/pose/labels` as needed. See [`label_links.py`](training/label_links.py) for details.
->
-> **Future improvement:** Generate data directly in `data/detection/images/` + `data/detection/labels/` (self-contained trees), eliminating the symlink entirely.
+> 📄 For full technical details on the generators, see [`data_generator/SYSTEM_DOCUMENTATION.md`](data_generator/SYSTEM_DOCUMENTATION.md).
 
 ---
 
@@ -210,37 +209,48 @@ cd training
 # Train detection model (finds bounding boxes)
 python3 train_detection.py --epochs 100 --batch 16 --device cpu --cache ram
 
-# Train pose model (finds corner keypoints)
+# Train pose model — single-photo crops (finds corner keypoints in tightly-cropped images)
 python3 train_pose.py --epochs 100 --batch 16 --device cpu --cache ram
 
-# Or train both sequentially
+# Train pose model — multi-photo scenes (finds corner keypoints in full scenes)
+python3 train_pose_multi.py --epochs 100 --batch 16 --device cpu --cache ram
+
+# Or train all three sequentially
 python3 train_both.py --epochs 100 --batch 16 --device cpu
+
+# Or train only specific models
+python3 train_both.py --detection-only
+python3 train_both.py --pose-only          # single-photo pose only
+python3 train_both.py --pose-multi-only    # multi-photo pose only
 ```
 
 **Important training notes:**
-- `--cache ram` loads images into RAM on first epoch, making each subsequent epoch ~35 min instead of 8+ hours
+- `--cache ram` loads images into RAM on first epoch, making each subsequent epoch much faster
 - `--device cpu` is recommended on Intel Macs (MPS is slower than CPU on non-Apple Silicon)
 - Mac users need `PYTORCH_ENABLE_MPS_FALLBACK=1` (set automatically by training scripts)
-- The symlink at `data/labels` is automatically managed — switching between detection and pose training re-points it
+- Each model has its own self-contained dataset — no symlinks needed
 
 ### Hyperparameters
 
-| Parameter | Detection | Pose | Why |
-|-----------|-----------|------|-----|
-| Base model | yolo11n | yolo26n-pose | Standard vs. pose architecture |
-| Mosaic | 0.5 | 0.5 | Reduced from default |
-| Mixup | 0.1 | 0.0 | Disabled for pose (moves keypoints) |
-| Scale | 0.5 | 0.3 | Reduced for pose to preserve keypoint positions |
-| Degrees | 10 | 10 | Moderate rotation augmentation |
-| Flip LR | 0.5 | 0.5 | Pose uses `flip_idx` for correct keypoint swap |
-| Flip UD | 0.0 | 0.0 | Would swap top/bottom corners incorrectly |
-| Patience | 20 | 20 | Early stopping |
+| Parameter | Detection | Pose (single) | Pose (multi) | Why |
+|-----------|-----------|---------------|--------------|-----|
+| Base model | yolo26n | **yolo26s-pose** | **yolo26s-pose** | All models use YOLOv26 architecture |
+| Training data | Full scenes | **Tightly-cropped** | Full scenes | Single matches inference; multi tests V1 bugs vs distribution |
+| Mosaic | 0.5 | **0.3** | 1.0 | Single: photo fills frame; Multi: small objects benefit |
+| Mixup | 0.1 | **0.0** | 0.1 | Single: moves keypoints unpredictably |
+| Scale | 0.5 | **0.2** | 0.5 | Single: photo already fills most of frame |
+| Degrees | 10 | 10 | 10 | Moderate rotation augmentation |
+| Translate | 0.1 | **0.05** | 0.1 | Single: tight crop has less translation room |
+| Flip LR | 0.5 | 0.5 | 0.5 | Pose uses `flip_idx` for correct keypoint swap |
+| Flip UD | 0.0 | 0.0 | 0.0 | Would swap top/bottom corners incorrectly |
+| Patience | 20 | **30** | **30** | Pose needs more epochs to converge |
 
 ### Validate
 
 ```bash
 python validate.py --model runs/detection/photo-detector/weights/best.pt
 python validate.py --model runs/pose/photo-corner-detector/weights/best.pt
+python validate.py --model runs/pose-multi/photo-corner-detector-multi/weights/best.pt
 ```
 
 ---
@@ -271,7 +281,26 @@ Both models use:
 - **Dynamic input shapes** — accept any `(batch, 3, H, W)` at runtime
 - **Simplified graph** via `onnxslim`
 
-### Python Inference (ONNX)
+### Python Inference (ONNX) — Extract Photos
+
+```bash
+# Detection mode — bounding-box crops
+python3 extract.py detect --input scan.jpg --output ./extracted/
+
+# Pose mode — corner keypoints with smart crop/warp
+python3 extract.py pose --input scan.jpg --output ./extracted/
+
+# Pose mode with distortion threshold (crop if <5px, warp if ≥5px)
+python3 extract.py pose --input scan.jpg --output ./extracted/ --threshold 5
+
+# Pose mode with detection pre-filter (two-model pipeline)
+python3 extract.py pose --input scan.jpg --output ./extracted/ --use-detection
+
+# Save annotated images showing what was detected
+python3 extract.py pose --input scan.jpg --output ./extracted/ --annotate
+```
+
+### Python Inference (ONNX) — Low-level testing
 
 ```bash
 cd onnx_inference
@@ -339,7 +368,11 @@ photo-pose-detector/
 ├── download_textures.py            # Download & process DTD textures
 │
 ├── data_generator/
-│   ├── generate.py                  # Main generator (examples + batch modes)
+│   ├── generate_common.py           # Shared generation utilities
+│   ├── generate_detection.py        # Detection data generator (bbox labels)
+│   ├── generate_pose.py             # Pose data generator (keypoint labels, tight crops)
+│   ├── generate_pose_multi.py       # Multi-photo pose generator (keypoints, full scenes)
+│   ├── generate.py                  # DEPRECATED — kept for reference only
 │   ├── SYSTEM_DOCUMENTATION.md      # Detailed generator documentation
 │   └── images/                      # 5,062 source photos (Oxford Buildings)
 │
@@ -347,17 +380,21 @@ photo-pose-detector/
 │
 ├── training/
 │   ├── dataset_detection.yaml       # Detection dataset config
-│   ├── dataset_pose.yaml            # Pose dataset config (kpt_shape: [4, 3])
-│   ├── label_links.py               # Symlink manager for label paths
+│   ├── dataset_pose.yaml            # Pose dataset config (single-photo, kpt_shape: [4, 3])
+│   ├── dataset_pose_multi.yaml      # Pose dataset config (multi-photo, kpt_shape: [4, 3])
 │   ├── train_detection.py           # Detection training script
-│   ├── train_pose.py               # Pose training script
-│   ├── train_both.py               # Train both sequentially
-│   ├── validate.py                  # Validation script
+│   ├── train_pose.py               # Pose training script (single-photo, yolo26s-pose)
+│   ├── train_pose_multi.py          # Pose training script (multi-photo, yolo26s-pose)
+│   ├── train_both.py               # Train all three sequentially
+│   └── validate.py                  # Validation script
 │   └── runs/                        # Training outputs (gitignored)
 │       ├── detection/photo-detector/weights/
 │       │   ├── best.pt
 │       │   └── last.pt
-│       └── pose/photo-corner-detector/weights/
+│       ├── pose/photo-corner-detector/weights/
+│       │   ├── best.pt
+│       │   └── last.pt
+│       └── pose-multi/photo-corner-detector-multi/weights/
 │           ├── best.pt
 │           └── last.pt
 │
@@ -368,8 +405,9 @@ photo-pose-detector/
 │   ├── detection_model.onnx         # 10.2 MB
 │   └── pose_model.onnx              # 10.0 MB
 │
+├── extract.py                       # CLI: detect & extract photos from images
 ├── onnx_inference/
-│   └── infer.py                    # Python ONNX inference testing
+│   └── infer.py                    # Low-level ONNX inference testing
 │
 ├── docs/
 │   ├── KOTLIN_USAGE.md             # Kotlin/Android integration guide
@@ -387,13 +425,13 @@ photo-pose-detector/
 
 | Problem | Cause | Solution |
 |---------|-------|----------|
-| **All training losses = 0** | Missing `data/labels` symlink → Ultralytics can't find labels | Training scripts now auto-create it via `label_links.py` |
+| **All training losses = 0** | No labels found (wrong dataset path) | Verify dataset YAML `path:` points to correct `data_detection/` or `data_pose/` directory |
 | **MPS crash: `torchvision::nms not implemented`** | NMS not supported on MPS device | `PYTORCH_ENABLE_MPS_FALLBACK=1` is set automatically |
 | **Training epoch time doubles each epoch** | Images re-read from disk every epoch | Use `--cache ram` to cache in memory |
 | **Pose labels: "require 13 columns" error** | `kpt_shape` was `[4, 2]` but labels have visibility (3 values per keypoint) | Set `kpt_shape: [4, 3]` in `dataset_pose.yaml` |
 | **Nested output dirs** | Running from wrong working directory | Always `cd training/` before running scripts |
-| **Keypoints wrong order** | Incorrect `flip_idx` | Verify `flip_idx: [2, 3, 0, 1]` in `dataset_pose.yaml` |
-| **Cached labels from wrong model** | Stale `.cache` files after switching detection↔pose | `label_links.py` clears caches automatically |
+| **Keypoints wrong order** | Incorrect `flip_idx` | Verify `flip_idx: [3, 2, 1, 0]` in `dataset_pose.yaml` |
+| **Cached labels from wrong model** | Stale `.cache` files after switching detection↔pose | Delete `data_detection/labels/.cache` or `data_pose/labels/.cache` |
 
 ---
 

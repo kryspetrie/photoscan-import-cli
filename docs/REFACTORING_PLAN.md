@@ -1,6 +1,6 @@
 # Refactoring Plan: Separate Data Pipelines for Detection & Pose Models
 
-> **Status:** Draft — Awaiting decision after 3–6 more pose training epochs  
+> **Status:** Implemented — 2026-04-30  
 > **Date:** 2026-04-27  
 > **Author:** Photo Pose Detector Project
 
@@ -254,7 +254,7 @@ nc: 1
 names:
   0: photo
 kpt_shape: [4, 3]
-flip_idx: [2, 3, 0, 1]
+flip_idx: [3, 2, 1, 0]
 ```
 
 No symlinks. Self-contained dataset.

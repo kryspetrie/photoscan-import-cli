@@ -3,27 +3,27 @@
 Train Both Models
 =================
 
-Trains BOTH YOLO models (Detection and Pose) from the same dataset.
+Trains YOLO models from their separate datasets.
 
-This script provides a convenient way to train both models sequentially,
-ensuring they use the same training data and hyperparameters.
+By default, trains ALL three models:
+  1. Detection model (detection dataset)
+  2. Pose model — single-photo crops (data_pose)
+  3. Pose model — multi-photo scenes (data_pose_multi)
+
+The two pose models use the same architecture (yolo26s-pose) but different
+training data distributions, to determine whether the V1 pose model failure
+was caused by configuration bugs or distribution mismatch.
 
 USAGE
 -----
-    # Train both models
-    python train_both.py --epochs 100 --batch 16
-    
-    # Train only detection
-    python train_both.py --detection-only
-    
-    # Train only pose
-    python train_both.py --pose-only
-    
-    # Use CPU for both
-    python train_both.py --device cpu
+    python3 train_both.py --epochs 100 --batch 16
+    python3 train_both.py --detection-only
+    python3 train_both.py --pose-only            # single-photo only
+    python3 train_both.py --pose-multi-only       # multi-photo only
+    python3 train_both.py --device cpu
 
 Author: Photo Pose Detector Project
-Version: 32 - Two-Model Architecture
+Version: 34 - Dual Pose Training
 """
 
 import os
@@ -32,43 +32,30 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
-# MPS fallback: torchvision::nms is not implemented for MPS device.
-# Setting this env var causes MPS to fall back to CPU for unsupported ops.
-# Must be set before importing torch/ultralytics.
+# MPS fallback
 if sys.platform == "darwin" and "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-# Import the individual training functions
 from train_detection import train as train_detection
 from train_pose import train as train_pose
+from train_pose_multi import train as train_pose_multi
 
 
 def train_both(
     epochs: int = 100,
-    patience: int = 20,
+    patience_det: int = 20,
+    patience_pose: int = 30,
     batch: int = 16,
     imgsz: int = 640,
-    device: str = "0",
-    workers: int = 8,
+    device: str = "cpu",
+    workers: int = 4,
     detection_only: bool = False,
     pose_only: bool = False,
+    pose_multi_only: bool = False,
     skip_if_exists: bool = True,
 ):
-    """
-    Train both YOLO models.
-    
-    Args:
-        epochs: Number of training epochs
-        patience: Early stopping patience
-        batch: Batch size
-        imgsz: Input image size
-        device: Device to use
-        workers: Number of dataloader workers
-        detection_only: Only train detection model
-        pose_only: Only train pose model
-        skip_if_exists: Skip training if weights already exist
-    """
-    
+    """Train YOLO models."""
+
     print("\n" + "=" * 70)
     print("YOLO TWO-MODEL TRAINING PIPELINE")
     print("=" * 70)
@@ -76,23 +63,48 @@ def train_both(
     print(f"Epochs: {epochs} | Batch: {batch} | Image Size: {imgsz}")
     print(f"Device: {device}")
     print("=" * 70)
-    
-    # Verify dataset exists
-    base_dir = Path("../data")
-    if not base_dir.exists():
-        print(f"\n❌ Error: Dataset not found at {base_dir}")
-        print("Run generate_batch.py first to create training data.")
+
+    # Verify datasets exist for requested phases
+    data_det = Path(__file__).parent / "dataset_detection.yaml"
+    data_pose = Path(__file__).parent / "dataset_pose.yaml"
+    data_pose_multi = Path(__file__).parent / "dataset_pose_multi.yaml"
+
+    if not pose_only and not pose_multi_only and not data_det.exists():
+        print(f"\n❌ Detection dataset not found at {data_det}")
+        print("Run: cd data_generator && python3 generate_detection.py --mode batch")
         sys.exit(1)
-    
-    # Train Detection Model
-    if not pose_only:
+
+    if detection_only and not data_det.exists():
+        print(f"\n❌ Detection dataset not found at {data_det}")
+        print("Run: cd data_generator && python3 generate_detection.py --mode batch")
+        sys.exit(1)
+
+    if pose_only and not data_pose.exists():
+        print(f"\n❌ Pose dataset not found at {data_pose}")
+        print("Run: cd data_generator && python3 generate_pose.py --mode batch")
+        sys.exit(1)
+
+    if pose_multi_only and not data_pose_multi.exists():
+        print(f"\n❌ Multi-photo pose dataset not found at {data_pose_multi}")
+        print("Run: cd data_generator && python3 generate_pose_multi.py --mode batch")
+        sys.exit(1)
+
+    if not pose_only and not pose_multi_only and not data_pose.exists():
+        print(f"\n⚠️  Pose dataset not found at {data_pose}")
+        print("Run: cd data_generator && python3 generate_pose.py --mode batch")
+        print("Skipping single-photo pose training.\n")
+
+    if not pose_only and not pose_multi_only and not data_pose_multi.exists():
+        print(f"\n⚠️  Multi-photo pose dataset not found at {data_pose_multi}")
+        print("Run: cd data_generator && python3 generate_pose_multi.py --mode batch")
+        print("Skipping multi-photo pose training.\n")
+
+    # Phase 1: Detection Model
+    if not pose_only and not pose_multi_only:
         print("\n" + "-" * 70)
         print("PHASE 1: DETECTION MODEL TRAINING")
         print("-" * 70)
-        
-        # Note: train_detection() will automatically set data/labels -> detection/labels
-        # This is required because Ultralytics resolves labels via path substitution
-        
+
         detection_weights = Path("runs/detection/photo-detector/weights/best.pt")
         if skip_if_exists and detection_weights.exists():
             print(f"\n⏭️  Skipping detection training (weights exist)")
@@ -100,119 +112,102 @@ def train_both(
         else:
             train_detection(
                 epochs=epochs,
-                patience=patience,
+                patience=patience_det,
                 batch=batch,
                 imgsz=imgsz,
                 device=device,
                 workers=workers,
             )
-    
-    # Train Pose Model
-    if not detection_only:
+
+    # Phase 2: Pose Model — Single-Photo Crops
+    if not detection_only and not pose_multi_only and data_pose.exists():
         print("\n" + "-" * 70)
-        print("PHASE 2: POSE MODEL TRAINING")
+        print("PHASE 2: POSE MODEL TRAINING — SINGLE-PHOTO CROPS")
         print("-" * 70)
-        
-        # Note: train_pose() will automatically switch data/labels -> pose/labels
-        # The symlink MUST be switched between detection and pose training!
-        
+
         pose_weights = Path("runs/pose/photo-corner-detector/weights/best.pt")
         if skip_if_exists and pose_weights.exists():
-            print(f"\n⏭️  Skipping pose training (weights exist)")
+            print(f"\n⏭️  Skipping single-photo pose training (weights exist)")
             print(f"   {pose_weights}")
         else:
             train_pose(
                 epochs=epochs,
-                patience=patience,
+                patience=patience_pose,
                 batch=batch,
                 imgsz=imgsz,
                 device=device,
                 workers=workers,
             )
-    
+
+    # Phase 3: Pose Model — Multi-Photo Scenes
+    if not detection_only and not pose_only and data_pose_multi.exists():
+        print("\n" + "-" * 70)
+        print("PHASE 3: POSE MODEL TRAINING — MULTI-PHOTO SCENES")
+        print("-" * 70)
+
+        pose_multi_weights = Path("runs/pose-multi/photo-corner-detector-multi/weights/best.pt")
+        if skip_if_exists and pose_multi_weights.exists():
+            print(f"\n⏭️  Skipping multi-photo pose training (weights exist)")
+            print(f"   {pose_multi_weights}")
+        else:
+            train_pose_multi(
+                epochs=epochs,
+                patience=patience_pose,
+                batch=batch,
+                imgsz=imgsz,
+                device=device,
+                workers=workers,
+            )
+
     # Summary
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")
     print("=" * 70)
-    
-    print("\n📁 Model weights:")
+
     det_path = Path("runs/detection/photo-detector/weights/best.pt")
     pose_path = Path("runs/pose/photo-corner-detector/weights/best.pt")
-    
+    pose_multi_path = Path("runs/pose-multi/photo-corner-detector-multi/weights/best.pt")
+
     if det_path.exists():
-        print(f"   Detection: {det_path.absolute()}")
+        print(f"   Detection:       {det_path.absolute()}")
     if pose_path.exists():
-        print(f"   Pose:      {pose_path.absolute()}")
-    
-    print("\n📋 Summary:")
-    print("   Detection Model:")
-    print("      - Output: Axis-aligned bounding boxes")
-    print("      - Use for: Initial detection, filtering")
-    print()
-    print("   Pose Model:")
-    print("      - Output: 4 corner keypoints (LL, UL, UR, LR)")
-    print("      - Use for: Precise corner detection, extraction")
-    print()
-    print("   Pipeline:")
-    print("      1. Run detection to find photo regions")
-    print("      2. Run pose on detected regions for corners")
-    print("      3. Extract photos using corner quadrilateral")
-    
+        print(f"   Pose (single):   {pose_path.absolute()}")
+    if pose_multi_path.exists():
+        print(f"   Pose (multi):    {pose_multi_path.absolute()}")
+
     print(f"\n⏱️  Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train both YOLO models (Detection and Pose)"
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=100,
-        help="Number of training epochs"
-    )
-    parser.add_argument(
-        "--patience", type=int, default=20,
-        help="Early stopping patience"
-    )
-    parser.add_argument(
-        "--batch", type=int, default=16,
-        help="Batch size"
-    )
-    parser.add_argument(
-        "--imgsz", type=int, default=640,
-        help="Input image size"
-    )
-    parser.add_argument(
-        "--device", type=str, default="0",
-        help="Device (0, 1, ... or 'cpu')"
-    )
-    parser.add_argument(
-        "--workers", type=int, default=8,
-        help="Number of dataloader workers"
-    )
-    parser.add_argument(
-        "--detection-only", action="store_true",
-        help="Only train detection model"
-    )
-    parser.add_argument(
-        "--pose-only", action="store_true",
-        help="Only train pose model"
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Force retraining even if weights exist"
-    )
-    
+        description="Train YOLO models (Detection + both Pose variants)")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--patience", type=int, default=20,
+                        help="Detection patience (pose uses 30)")
+    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--detection-only", action="store_true")
+    parser.add_argument("--pose-only", action="store_true",
+                        help="Train only single-photo pose model")
+    parser.add_argument("--pose-multi-only", action="store_true",
+                        help="Train only multi-photo pose model")
+    parser.add_argument("--force", action="store_true",
+                        help="Force retraining even if weights exist")
+
     args = parser.parse_args()
-    
+
     train_both(
         epochs=args.epochs,
-        patience=args.patience,
+        patience_det=args.patience,
         batch=args.batch,
         imgsz=args.imgsz,
         device=args.device,
         workers=args.workers,
         detection_only=args.detection_only,
         pose_only=args.pose_only,
+        pose_multi_only=args.pose_multi_only,
         skip_if_exists=not args.force,
     )
 

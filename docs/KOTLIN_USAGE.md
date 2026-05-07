@@ -68,16 +68,16 @@ Format: 5 channels × 8400 anchor points. Each column is:
 | **Output 0** | `(1, 300, 18)` | Filtered detections with keypoints |
 
 Format: 300 candidate detections × 18 values each. Each row is:
-- `[0]` = x_center (pixel coords in input image space)
-- `[1]` = y_center
-- `[2]` = width
-- `[3]` = height
+- `[0]` = x1 (left edge, pixel coords in model input space)
+- `[1]` = y1 (top edge)
+- `[2]` = x2 (right edge)
+- `[3]` = y2 (bottom edge)
 - `[4]` = objectness confidence
-- `[5, 6, 7]` = keypoint 0 (LL): x, y, confidence
-- `[8, 9, 10]` = keypoint 1 (UL): x, y, confidence
-- `[11, 12, 13]` = keypoint 2 (UR): x, y, confidence
-- `[14, 15, 16]` = keypoint 3 (LR): x, y, confidence
-- `[17]` = class confidence (always 0 or 1, single-class model)
+- `[5]` = class probability (≈0 for the photo class in single-class models)
+- `[6, 7, 8]` = keypoint 0 (LL): x, y, confidence
+- `[9, 10, 11]` = keypoint 1 (UL): x, y, confidence
+- `[12, 13, 14]` = keypoint 2 (UR): x, y, confidence
+- `[15, 16, 17]` = keypoint 3 (LR): x, y, confidence
 
 > **The pose model output is already NMS-filtered.** It returns at most 300 detections sorted by confidence. Filter by `row[4] > your_confidence_threshold`.
 
@@ -346,8 +346,8 @@ class PoseModel(modelPath: String) : AutoCloseable {
     )
 
     data class PoseDetection(
-        val xCenter: Float, val yCenter: Float,
-        val width: Float, val height: Float,
+        val x1: Float, val y1: Float,
+        val x2: Float, val y2: Float,
         val confidence: Float,
         val lowerLeft: Keypoint,    // kp0
         val upperLeft: Keypoint,    // kp1
@@ -361,6 +361,15 @@ class PoseModel(modelPath: String) : AutoCloseable {
     /**
      * Run pose detection on preprocessed image data.
      * Output shape: (1, 300, 18) — already NMS-filtered.
+     *
+     * Each row layout:
+     *   [0:4] = x1, y1, x2, y2 (xyxy bounding box)
+     *   [4]   = objectness confidence
+     *   [5]   = class probability
+     *   [6:9] = kp0 (LL): x, y, confidence
+     *   [9:12] = kp1 (UL): x, y, confidence
+     *   [12:15] = kp2 (UR): x, y, confidence
+     *   [15:18] = kp3 (LR): x, y, confidence
      */
     fun detect(preprocessed: ImagePreprocessor.PreprocessedInput, confThreshold: Float = 0.5f): List<PoseDetection> {
         val inputTensor = OnnxTensor.createTensor(
@@ -386,30 +395,30 @@ class PoseModel(modelPath: String) : AutoCloseable {
             if (conf < confThreshold) continue
 
             detections.add(PoseDetection(
-                xCenter = output.get(offset + 0),
-                yCenter = output.get(offset + 1),
-                width = output.get(offset + 2),
-                height = output.get(offset + 3),
+                x1 = output.get(offset + 0),
+                y1 = output.get(offset + 1),
+                x2 = output.get(offset + 2),
+                y2 = output.get(offset + 3),
                 confidence = conf,
                 lowerLeft = Keypoint(    // kp0
-                    x = output.get(offset + 5),
-                    y = output.get(offset + 6),
-                    confidence = output.get(offset + 7)
+                    x = output.get(offset + 6),
+                    y = output.get(offset + 7),
+                    confidence = output.get(offset + 8)
                 ),
                 upperLeft = Keypoint(     // kp1
-                    x = output.get(offset + 8),
-                    y = output.get(offset + 9),
-                    confidence = output.get(offset + 10)
+                    x = output.get(offset + 9),
+                    y = output.get(offset + 10),
+                    confidence = output.get(offset + 11)
                 ),
                 upperRight = Keypoint(    // kp2
-                    x = output.get(offset + 11),
-                    y = output.get(offset + 12),
-                    confidence = output.get(offset + 13)
+                    x = output.get(offset + 12),
+                    y = output.get(offset + 13),
+                    confidence = output.get(offset + 14)
                 ),
                 lowerRight = Keypoint(   // kp3
-                    x = output.get(offset + 14),
-                    y = output.get(offset + 15),
-                    confidence = output.get(offset + 16)
+                    x = output.get(offset + 15),
+                    y = output.get(offset + 16),
+                    confidence = output.get(offset + 17)
                 )
             ))
         }
@@ -537,8 +546,10 @@ class PhotoScanPipeline(
             DetectedPhoto(
                 confidence = pose.confidence,
                 boundingBox = DetectionModel.Detection(
-                    pose.xCenter, pose.yCenter,
-                    pose.width, pose.height,
+                    (pose.x1 + pose.x2) / 2f,  // xCenter from xyxy
+                    (pose.y1 + pose.y2) / 2f,   // yCenter from xyxy
+                    pose.x2 - pose.x1,           // width from xyxy
+                    pose.y2 - pose.y1,            // height from xyxy
                     pose.confidence
                 ),
                 corners = mappedCorners
@@ -758,7 +769,7 @@ Tips for faster inference:
 |-------|-------|-----|
 | All-zero outputs | Wrong preprocessing (BGR vs RGB, not normalized) | Ensure RGB + [0,1] normalization |
 | Coordinates off by 2× | Missing letterbox padding correction | Subtract `padX/padY` then divide by `scale` |
-| Keypoints in wrong order | Model expects LL/UL/UR/LR order | Verify `flip_idx: [2, 3, 0, 1]` was used in training |
+| Keypoints in wrong order | Model expects LL/UL/UR/LR order | Verify `flip_idx: [3, 2, 1, 0]` was used in training |
 | Too many detections | Low confidence threshold | Raise `confThreshold` (try 0.7) |
 | Detections at wrong scale | Preprocessing mismatch | Ensure the same 640×640 letterboxing used during training |
 | OOM on mobile | Full-resolution image passed to model | Resize to 640×640 before inference |

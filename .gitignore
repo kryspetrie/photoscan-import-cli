@@ -5,6 +5,9 @@ data_generator/images
 data/
 ../data/
 data_generator/test/
+data_detection/
+data_pose/
+data_pose_multi/
 
 # Python
 __pycache__/
