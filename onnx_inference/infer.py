@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Photo Pose Detector — Two-Stage ONNX Inference CLI
-===================================================
+Photo Pose Detector — Two/Three-Stage ONNX Inference CLI
+=========================================================
 
 Two-stage pipeline for detecting photo corners in multi-photo images:
 
@@ -10,7 +10,15 @@ Two-stage pipeline for detecting photo corners in multi-photo images:
                         Map keypoints back to original image coordinates
   Stage 3 (Dedup):      Greedy deduplication by keypoint-center proximity
 
-Single-photo mode is also supported (skip Stage 1, run Stage 2 directly).
+Optional Stage 2b (Refine): --pose-refine
+  After the first pose pass, derive a tighter bounding box from the detected
+  keypoints and re-run the pose model with a smaller crop. This helps when
+  the detection box is loose or misaligned — the second pass gets a crop that's
+  tightly centered on the actual photo, improving corner visibility.
+
+  The first pass uses --pose-crop-expand (default 15%) to give the pose model
+  enough context. The refine pass uses --pose-refine-expand (default 5%) since
+  the keypoint-derived box is already well-centered.
 
 Overlapping Detections
 ---------------------
@@ -78,6 +86,10 @@ Recommended Commands
     python3 infer.py --image ./scans/ --output ./crops/ \
                      --crop simple-corners --crop-margin 10
 
+    # Best accuracy — 3-stage refine for improved corner detection
+    python3 infer.py --image scan.jpg --pose-refine \
+                     --crop warp-stretch --crop-margin 10 --border-fill white
+
 Usage
 -----
     # Single image (models auto-detected)
@@ -118,10 +130,14 @@ KEYPOINT_FULL_NAMES = {
 }
 BOX_COLOR = "#FF00FF"
 EDGE_COLOR = "#00FFFF"
-POSE_CROP_EXPAND = 0.10    # Expand detection box by 10% of larger dim for pose crop
+POSE_CROP_EXPAND = 0.15    # Expand detection box by 15% of larger dim for pose crop
+POSE_REFINE_EXPAND = 0.05  # After first pose, re-crop from keypoints + 5% for refine pass
+SWEEP_CROP_EXPANDS = [0.05, 0.10, 0.15, 0.20]   # values to try for --pose-sweep
+SWEEP_REFINE_EXPANDS = [0.03, 0.05, 0.10, 0.15]  # values to try for --pose-sweep refine
 DEFAULT_IMG_SIZE = 640
 DEDUP_MIN_DIST_RATIO = 0.12  # 12% of image min-dimension
 _VIS_THRESH_DEDUP = 0.25      # visibility threshold for center-based dedup
+_VIS_THRESH_SWEEP = 0.30      # visibility threshold for sweep scoring
 
 # Default model paths (relative to this script's location)
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -392,30 +408,131 @@ def dedup_pose_results(pose_results: list, min_center_dist: float):
 # Two-stage pipeline
 # ---------------------------------------------------------------------------
 
+def _run_pose_on_crop(pose_session, image: Image.Image, box: dict,
+                     pose_conf: float, img_size: int,
+                     expand_ratio: float) -> dict | None:
+    """
+    Run the pose model on a single detection box, expanding the crop
+    by ``expand_ratio`` of the box's larger dimension before cropping.
+
+    Returns a result dict with keypoints mapped to original image coords,
+    or None if no pose detection above threshold.
+    """
+    orig_w, orig_h = image.size
+    x1, y1 = box["x1"], box["y1"]
+    x2, y2 = box["x2"], box["y2"]
+
+    box_w = x2 - x1
+    box_h = y2 - y1
+    expand_px = int(max(box_w, box_h) * expand_ratio)
+
+    crop_x1 = max(0, int(x1) - expand_px)
+    crop_y1 = max(0, int(y1) - expand_px)
+    crop_x2 = min(orig_w, int(x2) + expand_px)
+    crop_y2 = min(orig_h, int(y2) + expand_px)
+
+    crop = image.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+
+    pose_dets = run_pose(pose_session, crop, pose_conf, img_size)
+    if not pose_dets:
+        return None
+
+    best_pose = max(pose_dets, key=lambda p: p["confidence"])
+
+    # Map keypoints from crop coords → original image coords
+    visible_xs, visible_ys = [], []
+    mapped_keypoints = []
+    for kp in best_pose["keypoints"]:
+        mk = {
+            "name": kp["name"],
+            "x": kp["x"] + crop_x1,
+            "y": kp["y"] + crop_y1,
+            "visibility": kp["visibility"],
+        }
+        mapped_keypoints.append(mk)
+        if kp["visibility"] >= _VIS_THRESH_DEDUP:
+            visible_xs.append(mk["x"])
+            visible_ys.append(mk["y"])
+
+    if len(visible_xs) < 2:
+        return None
+
+    center = (float(np.mean(visible_xs)), float(np.mean(visible_ys)))
+    vis_count = len(visible_xs)
+    dedup_priority = best_pose["confidence"]
+    if vis_count < 3:
+        dedup_priority *= 0.5
+
+    return {
+        "pose_confidence": best_pose["confidence"],
+        "keypoints": mapped_keypoints,
+        "center": center,
+        "dedup_priority": dedup_priority,
+        "crop_box": {
+            "x1": crop_x1, "y1": crop_y1,
+            "x2": crop_x2, "y2": crop_y2,
+        },
+    }
+
+
+def _keypoints_to_bbox(keypoints: list, margin: float = 0) -> dict:
+    """
+    Derive a bounding box from detected corner keypoints.
+
+    If at least 2 visible corners are available, uses their positions.
+    Falls back to the detection bbox corners for invisible keypoints.
+    Adds ``margin`` pixels on each side.
+    """
+    kp_by_name = {kp["name"]: kp for kp in keypoints}
+    corners = {}
+    for name in ["LL", "UL", "UR", "LR"]:
+        kp = kp_by_name.get(name)
+        if kp and kp["visibility"] >= _VIS_THRESH_DEDUP:
+            corners[name] = (kp["x"], kp["y"])
+        # Invisible corners are omitted — the bbox is computed from
+        # whichever corners we have
+
+    if len(corners) < 2:
+        return None
+
+    xs = [c[0] for c in corners.values()]
+    ys = [c[1] for c in corners.values()]
+    x1 = min(xs) - margin
+    y1 = min(ys) - margin
+    x2 = max(xs) + margin
+    y2 = max(ys) + margin
+
+    return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+
+
 def pipeline(detection_session, pose_session, image: Image.Image,
             det_conf: float = 0.5, pose_conf: float = 0.5,
             iou_threshold: float = 0.45,
             pose_crop_expand: float = POSE_CROP_EXPAND,
+            pose_refine: bool = False,
+            pose_refine_expand: float = POSE_REFINE_EXPAND,
             img_size: int = DEFAULT_IMG_SIZE,
             dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO):
     """
-    Full two-stage pipeline: detect photos → find corners → dedup.
+    Two- or three-stage pipeline: detect → pose → [refine →] dedup.
 
-    The detection model produces tight bounding boxes that may clip the
-    actual photo corners. Before passing each crop to the pose model, the
-    detection box is expanded by ``pose_crop_expand`` (default 10%) of the
-    larger dimension of the box. This ensures the pose model sees enough
-    surrounding context to accurately locate all four corners.
+    Two-stage (default):
+        Detection model finds bounding boxes → pose model finds corners.
+
+    Three-stage refine (``pose_refine=True``):
+        Detection → pose (coarse, with expanded crop) → derive a tighter
+        bounding box from the detected keypoints → pose again (refined,
+        with a smaller crop centered on the actual photo). This helps
+        when the first pose pass has low-visibility corners because the
+        detection box is too loose or misaligned — the second pass gets
+        a crop that's tightly centered on the actual photo.
 
     Returns list of dicts:
         {
             'detection': {'box': {...}, 'confidence': float},
             'pose_confidence': float,
-            'keypoints': [                     # In ORIGINAL image coordinates
-                {'name': 'LL', 'x': float, 'y': float, 'visibility': float},
-                ...
-            ],
-            'center': (float, float),          # Mean of visible keypoints
+            'keypoints': [...],
+            'center': (float, float),
         }
     """
     orig_w, orig_h = image.size
@@ -426,7 +543,6 @@ def pipeline(detection_session, pose_session, image: Image.Image,
             detection_session, image, det_conf, iou_threshold, img_size
         )
     else:
-        # Single-photo mode: treat entire image as one detection
         detections = [{
             "box": {"x1": 0, "y1": 0, "x2": orig_w, "y2": orig_h},
             "confidence": 1.0,
@@ -435,68 +551,27 @@ def pipeline(detection_session, pose_session, image: Image.Image,
     # Stage 2: Find corners for each detected photo
     pose_results = []
     for det in detections:
-        box = det["box"]
-        x1, y1 = box["x1"], box["y1"]
-        x2, y2 = box["x2"], box["y2"]
-
-        # Expand detection box by a proportion of its larger dimension.
-        # This gives the pose model enough surrounding context to find
-        # corners that may lie just outside the tight detection box.
-        box_w = x2 - x1
-        box_h = y2 - y1
-        expand_px = int(max(box_w, box_h) * pose_crop_expand)
-
-        crop_x1 = max(0, int(x1) - expand_px)
-        crop_y1 = max(0, int(y1) - expand_px)
-        crop_x2 = min(orig_w, int(x2) + expand_px)
-        crop_y2 = min(orig_h, int(y2) + expand_px)
-
-        crop = image.crop((crop_x1, crop_y1, crop_x2, crop_y2))
-
-        # Run pose on crop
-        pose_dets = run_pose(pose_session, crop, pose_conf, img_size)
-
-        if not pose_dets:
+        result = _run_pose_on_crop(
+            pose_session, image, det["box"],
+            pose_conf, img_size, pose_crop_expand,
+        )
+        if result is None:
             continue
 
-        # Take highest-confidence pose result
-        best_pose = max(pose_dets, key=lambda p: p["confidence"])
+        # Stage 2b (optional): Refine by re-running pose on a tighter crop
+        # derived from the first pass keypoints.
+        if pose_refine:
+            refined_box = _keypoints_to_bbox(result["keypoints"])
+            if refined_box is not None:
+                refined = _run_pose_on_crop(
+                    pose_session, image, refined_box,
+                    pose_conf, img_size, pose_refine_expand,
+                )
+                if refined is not None:
+                    result = refined
 
-        # Map keypoints from crop coords → original image coords
-        visible_xs, visible_ys = [], []
-        mapped_keypoints = []
-        for kp in best_pose["keypoints"]:
-            mk = {
-                "name": kp["name"],
-                "x": kp["x"] + crop_x1,
-                "y": kp["y"] + crop_y1,
-                "visibility": kp["visibility"],
-            }
-            mapped_keypoints.append(mk)
-            if kp["visibility"] >= _VIS_THRESH_DEDUP:
-                visible_xs.append(mk["x"])
-                visible_ys.append(mk["y"])
-
-        if len(visible_xs) < 2:
-            continue  # Skip if too few visible corners
-
-        center = (float(np.mean(visible_xs)), float(np.mean(visible_ys)))
-
-        # Visibility penalty for dedup: results with only 2 visible corners
-        # get demoted so they're less likely to suppress a better detection.
-        # (2 visible corners from one side of the photo give a misleading center.)
-        vis_count = len(visible_xs)
-        dedup_priority = best_pose["confidence"]
-        if vis_count < 3:
-            dedup_priority *= 0.5  # Penalize low-visibility results
-
-        pose_results.append({
-            "detection": det,
-            "pose_confidence": best_pose["confidence"],
-            "keypoints": mapped_keypoints,
-            "center": center,
-            "dedup_priority": dedup_priority,
-        })
+        result["detection"] = det
+        pose_results.append(result)
 
     # Stage 3: Deduplicate by keypoint-center proximity
     if detection_session is not None and len(pose_results) > 1:
@@ -507,8 +582,175 @@ def pipeline(detection_session, pose_session, image: Image.Image,
 
 
 # ---------------------------------------------------------------------------
-# Visualization
+# Parameter sweep — search for best pose-crop-expand / pose-refine-expand
 # ---------------------------------------------------------------------------
+
+def pose_sweep(detection_session, pose_session, image: Image.Image,
+               det_conf: float = 0.5, pose_conf: float = 0.5,
+               iou_threshold: float = 0.45,
+               crop_expands: list = None,
+               refine_expands: list = None,
+               img_size: int = DEFAULT_IMG_SIZE,
+               dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO):
+    """
+    Search for the best pose-crop-expand and pose-refine-expand values
+    by trying a grid of combinations and scoring each by corner visibility.
+
+    Strategy:
+      1. Run detection once (shared across all combos).
+      2. For each detection box, try every (crop_expand, refine_expand)
+         combination.  We also include refine_expand=None (two-stage only)
+         for each crop_expand.
+      3. Score each combo per-photo using:
+           - min corner visibility across all 4 corners (higher is better)
+           - number of visible corners (vis >= threshold, higher is better)
+           - pose confidence as tiebreaker
+      4. Pick the best combo for each photo independently.
+      5. Report a summary table and return results using the best params.
+
+    Returns:
+        (results, best_params_per_photo)
+        where best_params_per_photo[i] = {"crop_expand": float, "refine_expand": float|None}
+    """
+    if crop_expands is None:
+        crop_expands = list(SWEEP_CROP_EXPANDS)
+    if refine_expands is None:
+        refine_expands = list(SWEEP_REFINE_EXPANDS)
+
+    orig_w, orig_h = image.size
+
+    # Stage 1: Detect photos (shared)
+    if detection_session is not None:
+        detections = run_detection(
+            detection_session, image, det_conf, iou_threshold, img_size
+        )
+    else:
+        detections = [{
+            "box": {"x1": 0, "y1": 0, "x2": orig_w, "y2": orig_h},
+            "confidence": 1.0,
+        }]
+
+    # Build list of (crop_expand, refine_expand_or_None) combos
+    combos = []
+    for ce in crop_expands:
+        combos.append((ce, None))  # two-stage (no refine)
+        for re in refine_expands:
+            combos.append((ce, re))  # three-stage refine
+
+    # For each detection, run all combos and find the best
+    best_results = []
+    best_params = []
+
+    print(f"\n{'=' * 80}")
+    print(f"POSE PARAMETER SWEEP  —  {len(detections)} detection(s), "
+          f"{len(combos)} combo(s) per detection")
+    print(f"{'=' * 80}")
+    print(f"  crop_expands:   {crop_expands}")
+    print(f"  refine_expands: {refine_expands}")
+    print(f"  (also trying 2-stage [no refine] for each crop_expand)\n")
+
+    for det_idx, det in enumerate(detections):
+        box = det["box"]
+        print(f"  Photo #{det_idx+1}:  box=({box['x1']:.0f},{box['y1']:.0f})"
+              f"→({box['x2']:.0f},{box['y2']:.0f})  det_conf={det['confidence']:.3f}")
+        print(f"  {'crop_exp':>9}  {'refn_exp':>9}  "
+              f"{'pose_conf':>9}  "
+              f"{'vis_corners':>11}  "
+              f"{'min_vis':>7}  "
+              f"{'LL':>6}  {'UL':>6}  {'UR':>6}  {'LR':>6}")
+        print(f"  {'-'*9}  {'-'*9}  {'-'*9}  {'-'*11}  {'-'*7}  "
+              f"{'-'*6}  {'-'*6}  {'-'*6}  {'-'*6}")
+
+        best_score = None
+        best_result = None
+        best_combo = None
+
+        for ce, re in combos:
+            # Run pose with this crop_expand
+            result = _run_pose_on_crop(
+                pose_session, image, box, pose_conf, img_size, ce
+            )
+            if result is None:
+                label = f"{'—':>6}" if re is None else f"{re:.2f}"
+                print(f"  {ce:9.2f}  {label:>9}  {'—':>9}  {'—':>11}  {'—':>7}  "
+                      f"{'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}")
+                continue
+
+            # Optionally refine
+            if re is not None:
+                refined_box = _keypoints_to_bbox(result["keypoints"])
+                if refined_box is not None:
+                    refined = _run_pose_on_crop(
+                        pose_session, image, refined_box,
+                        pose_conf, img_size, re
+                    )
+                    if refined is not None:
+                        result = refined
+
+            # Score this result
+            kps = result["keypoints"]
+            vis_values = {kp["name"]: kp["visibility"] for kp in kps}
+            vis_count = sum(1 for v in vis_values.values() if v >= _VIS_THRESH_SWEEP)
+            min_vis = min(vis_values.values()) if vis_values else 0.0
+            pose_con = result["pose_confidence"]
+
+            # Scoring: prioritize (vis_count, min_vis), then pose_conf as tiebreak
+            score = (vis_count, min_vis, pose_con)
+
+            re_label = f"{re:.2f}" if re is not None else "  —"
+            ll = vis_values.get("LL", 0)
+            ul = vis_values.get("UL", 0)
+            ur = vis_values.get("UR", 0)
+            lr = vis_values.get("LR", 0)
+            print(f"  {ce:9.2f}  {re_label:>9}  {pose_con:9.3f}  "
+                  f"{vis_count:>7}/4  {min_vis:7.3f}  "
+                  f"{ll:6.3f}  {ul:6.3f}  {ur:6.3f}  {lr:6.3f}")
+
+            if best_score is None or score > best_score:
+                best_score = score
+                best_result = result
+                best_combo = (ce, re)
+
+        # Print winner for this photo
+        if best_result is not None:
+            ce_best, re_best = best_combo
+            kps = best_result["keypoints"]
+            vis_values = {kp["name"]: kp["visibility"] for kp in kps}
+            vis_count = sum(1 for v in vis_values.values() if v >= _VIS_THRESH_SWEEP)
+            min_vis = min(vis_values.values())
+            re_str = f"refine={re_best:.2f}" if re_best is not None else "no refine"
+            print(f"  >>> BEST: crop_expand={ce_best:.2f}  {re_str}  "
+                  f"vis={vis_count}/4  min_vis={min_vis:.3f}\n")
+
+            best_result["detection"] = det
+            best_results.append(best_result)
+            best_params.append({
+                "crop_expand": ce_best,
+                "refine_expand": re_best,
+            })
+        else:
+            print(f"  >>> NO valid pose result for this photo\n")
+
+    # Dedup the final results
+    if detection_session is not None and len(best_results) > 1:
+        min_dist = min(orig_w, orig_h) * dedup_min_dist_ratio
+        best_results = dedup_pose_results(best_results, min_dist)
+
+    # Summary
+    print(f"\n{'=' * 80}")
+    print("SWEEP SUMMARY — best params per photo:")
+    print(f"{'=' * 80}")
+    for i, (res, params) in enumerate(zip(best_results, best_params)):
+        kps = res["keypoints"]
+        vis_values = {kp["name"]: kp["visibility"] for kp in kps}
+        vis_count = sum(1 for v in vis_values.values() if v >= _VIS_THRESH_SWEEP)
+        re_str = (f"refine={params['refine_expand']:.2f}"
+                  if params["refine_expand"] is not None else "no refine")
+        print(f"  Photo #{i+1}:  crop_expand={params['crop_expand']:.2f}  {re_str}  "
+              f"vis={vis_count}/4  min_vis={min(vis_values.values()):.3f}  "
+              f"pose_conf={res['pose_confidence']:.3f}")
+
+    return best_results, best_params
 
 def draw_results(image: Image.Image, results: list):
     """Draw detection boxes, keypoints, and corner quadrilaterals."""
@@ -1022,12 +1264,17 @@ def infer_single(detection_session, pose_session, image_path: str,
                  output_path: str = None, det_conf: float = 0.5,
                  pose_conf: float = 0.5, iou_threshold: float = 0.45,
                  pose_crop_expand: float = POSE_CROP_EXPAND,
+                 pose_refine: bool = False,
+                 pose_refine_expand: float = POSE_REFINE_EXPAND,
                  img_size: int = DEFAULT_IMG_SIZE,
                  dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO,
                  crop_mode: str = None, crop_dir: str = None,
                  transparent: bool = False,
                  border_fill: tuple = (114, 114, 114),
-                 margin: float = 0):
+                 margin: float = 0,
+                 do_pose_sweep: bool = False,
+                 sweep_crop_expands: list = None,
+                 sweep_refine_expands: list = None):
     """Run the full pipeline on a single image."""
 
     # Open image and capture EXIF before converting (convert creates
@@ -1037,19 +1284,40 @@ def infer_single(detection_session, pose_session, image_path: str,
     image = _raw_image.convert("RGB")
     orig_w, orig_h = image.size
 
-    results = pipeline(
-        detection_session, pose_session, image,
-        det_conf, pose_conf, iou_threshold, pose_crop_expand, img_size,
-        dedup_min_dist_ratio,
-    )
+    sweep_params = None  # filled in if sweep is used
+
+    if do_pose_sweep:
+        results, sweep_params = pose_sweep(
+            detection_session, pose_session, image,
+            det_conf, pose_conf, iou_threshold,
+            sweep_crop_expands, sweep_refine_expands,
+            img_size, dedup_min_dist_ratio,
+        )
+    else:
+        results = pipeline(
+            detection_session, pose_session, image,
+            det_conf, pose_conf, iou_threshold, pose_crop_expand,
+            pose_refine, pose_refine_expand,
+            img_size, dedup_min_dist_ratio,
+        )
 
     # Print results
-    mode = "two-stage" if detection_session else "single-stage (pose only)"
+    mode = "2-stage" if detection_session else "1-stage (pose only)"
+    if do_pose_sweep:
+        mode += " + sweep"
+    elif pose_refine:
+        mode += " + refine"
+    print(f"Mode: {mode}")
     print(f"\n{'=' * 60}")
     print(f"Image: {image_path}")
     print(f"Size: {orig_w}×{orig_h}")
     print(f"Mode: {mode}")
     print(f"Photos found: {len(results)}")
+    if sweep_params:
+        print(f"Best params per photo:")
+        for i, sp in enumerate(sweep_params):
+            re_str = f"refine={sp['refine_expand']:.2f}" if sp["refine_expand"] is not None else "no refine"
+            print(f"  Photo #{i+1}:  crop_expand={sp['crop_expand']:.2f}  {re_str}")
     print(f"{'=' * 60}")
 
     for i, res in enumerate(results):
@@ -1058,7 +1326,13 @@ def infer_single(detection_session, pose_session, image_path: str,
         pose_c = res.get("pose_confidence", 0)
         kps = res.get("keypoints", [])
 
-        print(f"\n  Photo #{i+1}:  detection_conf={det_c:.4f}  pose_conf={pose_c:.4f}")
+        line = f"\n  Photo #{i+1}:  detection_conf={det_c:.4f}  pose_conf={pose_c:.4f}"
+        if sweep_params:
+            sp = sweep_params[i] if i < len(sweep_params) else None
+            if sp:
+                re_str = f"refine={sp['refine_expand']:.2f}" if sp["refine_expand"] is not None else "no refine"
+                line += f"  [{sp['crop_expand']:.2f} / {re_str}]"
+        print(line)
         print(f"    Box: ({box['x1']:.1f}, {box['y1']:.1f}) → ({box['x2']:.1f}, {box['y2']:.1f})")
         if kps:
             for kp in kps:
@@ -1111,13 +1385,18 @@ def infer_batch(detection_session, pose_session, image_dir: str,
                output_dir: str = None, det_conf: float = 0.5,
                pose_conf: float = 0.5, iou_threshold: float = 0.45,
                pose_crop_expand: float = POSE_CROP_EXPAND,
+               pose_refine: bool = False,
+               pose_refine_expand: float = POSE_REFINE_EXPAND,
                img_size: int = DEFAULT_IMG_SIZE,
                dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO,
                limit: int = 0,
                crop_mode: str = None, crop_dir: str = None,
                transparent: bool = False,
                border_fill: tuple = (114, 114, 114),
-               margin: float = 0):
+               margin: float = 0,
+               do_pose_sweep: bool = False,
+               sweep_crop_expands: list = None,
+               sweep_refine_expands: list = None):
     """Run the full pipeline on all images in a directory."""
 
     image_dir = Path(image_dir)
@@ -1145,11 +1424,15 @@ def infer_batch(detection_session, pose_session, image_dir: str,
         out_file = out_path / f"{img_path.stem}_detected.jpg"
         results = infer_single(
             detection_session, pose_session, str(img_path), str(out_file),
-            det_conf, pose_conf, iou_threshold, pose_crop_expand, img_size,
-            dedup_min_dist_ratio,
+            det_conf, pose_conf, iou_threshold, pose_crop_expand,
+            pose_refine, pose_refine_expand,
+            img_size, dedup_min_dist_ratio,
             crop_mode, crop_dir,
             transparent, border_fill,
             margin,
+            do_pose_sweep=do_pose_sweep,
+            sweep_crop_expands=sweep_crop_expands,
+            sweep_refine_expands=sweep_refine_expands,
         )
         photo_count = len(results)
         pose_ok = sum(1 for r in results if r.get("keypoints"))
@@ -1203,6 +1486,10 @@ Recommended Crop Commands:
   python3 infer.py --image scan.jpg --crop simple-corners \\
     --crop-margin 10 --crop-transparent
 
+  # Best accuracy — 3-stage refine for improved corner detection
+  python3 infer.py --image scan.jpg --pose-refine \\
+    --crop warp-stretch --crop-margin 10 --border-fill white
+
   # Crop a whole folder
   python3 infer.py --image ./scans/ --output ./crops/ \\
     --crop simple-corners --crop-margin 10
@@ -1244,7 +1531,40 @@ Recommended Crop Commands:
         help="Proportion of the larger detection box dimension to expand "
              "the crop by before passing to the pose model. A larger value "
              "gives the pose model more surrounding context, helping it find "
-             "corners near the edges. (default: 0.10 = 10%%)",
+             "corners near the edges. (default: 0.15 = 15%%)",
+    )
+    parser.add_argument(
+        "--pose-refine", action="store_true",
+        help="Run a second pose pass: after the first pose finds corners, "
+             "derive a tighter bounding box from those keypoints and re-run "
+             "pose with a smaller crop. This can improve accuracy when the "
+             "first pass has low-visibility corners due to a loose detection "
+             "box or misalignment.",
+    )
+    parser.add_argument(
+        "--pose-refine-expand", type=float, default=POSE_REFINE_EXPAND,
+        help="Proportion to expand the refined crop by (from keypoint bbox) "
+             "before the second pose pass. Only used with --pose-refine. "
+             "(default: 0.05 = 5%%)",
+    )
+    parser.add_argument(
+        "--pose-sweep", action="store_true",
+        help="Search for the best pose-crop-expand and pose-refine-expand "
+             "values for each detected photo. Tries a grid of values, scores "
+             "each by corner visibility (min visibility across 4 corners, "
+             "then total visible corners), and picks the best per-photo. "
+             "Overrides --pose-crop-expand, --pose-refine, and "
+             "--pose-refine-expand.",
+    )
+    parser.add_argument(
+        "--sweep-crop-expands", type=str, default=None,
+        help="Comma-separated list of crop-expand values to try in sweep "
+             "(default: 0.05,0.10,0.15,0.20)",
+    )
+    parser.add_argument(
+        "--sweep-refine-expands", type=str, default=None,
+        help="Comma-separated list of refine-expand values to try in sweep "
+             "(default: 0.03,0.05,0.10,0.15)",
     )
     parser.add_argument(
         "--imgsz", type=int, default=DEFAULT_IMG_SIZE,
@@ -1332,6 +1652,17 @@ Recommended Crop Commands:
     # Parse border fill color
     border_fill = parse_border_fill(args.border_fill)
 
+    # Parse sweep parameters
+    do_sweep = args.pose_sweep
+    if args.sweep_crop_expands:
+        sweep_ce = [float(x.strip()) for x in args.sweep_crop_expands.split(",")]
+    else:
+        sweep_ce = list(SWEEP_CROP_EXPANDS)
+    if args.sweep_refine_expands:
+        sweep_re = [float(x.strip()) for x in args.sweep_refine_expands.split(",")]
+    else:
+        sweep_re = list(SWEEP_REFINE_EXPANDS)
+
     # Run inference — auto-detect file vs directory
     if is_dir:
         infer_batch(
@@ -1340,6 +1671,8 @@ Recommended Crop Commands:
             pose_conf=args.pose_conf,
             iou_threshold=args.iou,
             pose_crop_expand=args.pose_crop_expand,
+            pose_refine=args.pose_refine,
+            pose_refine_expand=args.pose_refine_expand,
             img_size=args.imgsz,
             dedup_min_dist_ratio=args.dedup_dist,
             limit=args.limit,
@@ -1348,6 +1681,9 @@ Recommended Crop Commands:
             transparent=args.crop_transparent,
             border_fill=border_fill,
             margin=args.crop_margin,
+            do_pose_sweep=do_sweep,
+            sweep_crop_expands=sweep_ce,
+            sweep_refine_expands=sweep_re,
         )
     else:
         infer_single(
@@ -1356,6 +1692,8 @@ Recommended Crop Commands:
             pose_conf=args.pose_conf,
             iou_threshold=args.iou,
             pose_crop_expand=args.pose_crop_expand,
+            pose_refine=args.pose_refine,
+            pose_refine_expand=args.pose_refine_expand,
             img_size=args.imgsz,
             dedup_min_dist_ratio=args.dedup_dist,
             crop_mode=args.crop,
@@ -1363,6 +1701,9 @@ Recommended Crop Commands:
             transparent=args.crop_transparent,
             border_fill=border_fill,
             margin=args.crop_margin,
+            do_pose_sweep=do_sweep,
+            sweep_crop_expands=sweep_ce,
+            sweep_refine_expands=sweep_re,
         )
 
 
