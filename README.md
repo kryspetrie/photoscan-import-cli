@@ -300,13 +300,17 @@ python3 extract.py pose --input scan.jpg --output ./extracted/ --use-detection
 python3 extract.py pose --input scan.jpg --output ./extracted/ --annotate
 ```
 
-### Python Inference (ONNX) — Low-level testing
+### Python Inference (ONNX) — `photocrop` CLI
 
 ```bash
-cd onnx_inference
-python3 infer.py --model ../models/detection_model.onnx --image ../data/images/val/val_000001.jpg
-python3 infer.py --model ../models/pose_model.onnx --image ../data/images/val/val_000001.jpg
+# The main extraction tool — detect photos, find corners, crop/warp
+photocrop --image scan.jpg --preset warp
+
+# Or run as a module
+python -m onnx_inference --image scan.jpg --preset best
 ```
+
+> 📄 Full CLI reference with all options, workflows, and troubleshooting: [`docs/PHOTOCROP_USAGE.md`](docs/PHOTOCROP_USAGE.md)
 
 ### Python Inference (Ultralytics, for testing)
 
@@ -407,13 +411,17 @@ photo-pose-detector/
 │
 ├── extract.py                       # CLI: detect & extract photos from images
 ├── onnx_inference/
-│   └── infer.py                    # Low-level ONNX inference testing
+│   ├── __init__.py                 # Package init
+│   ├── __main__.py                 # `python -m onnx_inference` entry point
+│   └── photocrop.py                 # Main CLI: detect & extract photos from scans
 │
 ├── docs/
+│   ├── PHOTOCROP_USAGE.md           # photocrop CLI usage guide
 │   ├── KOTLIN_USAGE.md             # Kotlin/Android integration guide
 │   └── REFACTORING_PLAN.md         # Draft: separate data pipeline plan
 │
 ├── data/                            # Generated datasets (gitignored)
+├── pyproject.toml                    # Package config (provides `photocrop` command)
 ├── requirements.txt                 # Python dependency list
 ├── setup.sh                         # One-command environment setup
 └── venv/                            # Legacy venv (gitignored, still in use)

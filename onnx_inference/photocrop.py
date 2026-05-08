@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Photo Pose Detector — Two/Three-Stage ONNX Inference CLI
-=========================================================
+photocrop — Detect & Extract Photos from Multi-Photo Scans
+===========================================================
 
 Two-stage pipeline for detecting photo corners in multi-photo images:
 
@@ -72,39 +72,39 @@ Cropping
 Recommended Commands
 -------------------
     # Best simple crop — keypoint-based bbox + 10px margin so edges aren't clipped
-    python3 infer.py --image scan.jpg --crop simple-corners --crop-margin 10
+    photocrop --image scan.jpg --crop simple-corners --crop-margin 10
 
     # Best warp crop — outward warp + margin + white fill for clean edges
-    python3 infer.py --image scan.jpg --crop warp-stretch \
+    photocrop --image scan.jpg --crop warp-stretch \
                      --crop-margin 10 --border-fill white
 
     # Best transparent crop — corner-based with margin, for compositing
-    python3 infer.py --image scan.jpg --crop simple-corners \
+    photocrop --image scan.jpg --crop simple-corners \
                      --crop-margin 10 --crop-transparent
 
     # Crop a whole folder of images
-    python3 infer.py --image ./scans/ --output ./crops/ \
+    photocrop --image ./scans/ --output ./crops/ \
                      --crop simple-corners --crop-margin 10
 
     # Best accuracy — 3-stage refine for improved corner detection
-    python3 infer.py --image scan.jpg --pose-refine \
+    photocrop --image scan.jpg --pose-refine \
                      --crop warp-stretch --crop-margin 10 --border-fill white
 
 Usage
 -----
     # Single image (models auto-detected)
-    python3 infer.py --image scan.jpg
+    photocrop --image scan.jpg
 
     # Folder of images
-    python3 infer.py --image ./scans/ --output ./crops/
+    photocrop --image ./scans/ --output ./crops/
 
     # Override model paths
-    python3 infer.py --detection-model /path/to/det.onnx \
+    photocrop --detection-model /path/to/det.onnx \
                      --pose-model /path/to/pose.onnx \
                      --image scan.jpg
 
     # Adjust thresholds
-    python3 infer.py --image photo.jpg --det-conf 0.3 --pose-conf 0.25
+    photocrop --image photo.jpg --det-conf 0.3 --pose-conf 0.25
 """
 
 import sys
@@ -114,6 +114,17 @@ from pathlib import Path
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw, ImageFont
+
+# ---------------------------------------------------------------------------
+# Logging — all diagnostic output goes through _log() which writes to
+# stderr.  Coordinate output (--coords) goes to stdout, making it easy
+# to capture in scripts:  photocrop --coords json --no-image img.jpg
+# ---------------------------------------------------------------------------
+
+
+def _log(*args, **kwargs):
+    """Print diagnostic output to stderr. Never mixed with --coords stdout."""
+    print(*args, file=sys.stderr, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -155,15 +166,15 @@ def load_onnx_model(model_path: str):
     try:
         import onnxruntime as ort
     except ImportError:
-        print("Error: onnxruntime not installed.")
-        print("Install with: pip install onnxruntime")
+        _log("Error: onnxruntime not installed.")
+        _log("Install with: pip install onnxruntime")
         sys.exit(1)
 
     session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     for inp in session.get_inputs():
-        print(f"  Input:  {inp.name}  shape={inp.shape}  dtype={inp.type}")
+        _log(f"  Input:  {inp.name}  shape={inp.shape}  dtype={inp.type}")
     for out in session.get_outputs():
-        print(f"  Output: {out.name}  shape={out.shape}  dtype={out.type}")
+        _log(f"  Output: {out.name}  shape={out.shape}  dtype={out.type}")
     return session
 
 
@@ -912,24 +923,24 @@ def pose_sweep(detection_session, pose_session, image: Image.Image,
     best_results = []
     best_params = []
 
-    print(f"\n{'=' * 80}")
-    print(f"POSE PARAMETER SWEEP  —  {len(detections)} detection(s), "
+    _log(f"\n{'=' * 80}")
+    _log(f"POSE PARAMETER SWEEP  —  {len(detections)} detection(s), "
           f"{len(combos)} combo(s) per detection")
-    print(f"{'=' * 80}")
-    print(f"  crop_expands:   {crop_expands}")
-    print(f"  refine_expands: {refine_expands}")
-    print(f"  (also trying 2-stage [no refine] for each crop_expand)\n")
+    _log(f"{'=' * 80}")
+    _log(f"  crop_expands:   {crop_expands}")
+    _log(f"  refine_expands: {refine_expands}")
+    _log(f"  (also trying 2-stage [no refine] for each crop_expand)\n")
 
     for det_idx, det in enumerate(detections):
         box = det["box"]
-        print(f"  Photo #{det_idx+1}:  box=({box['x1']:.0f},{box['y1']:.0f})"
+        _log(f"  Photo #{det_idx+1}:  box=({box['x1']:.0f},{box['y1']:.0f})"
               f"→({box['x2']:.0f},{box['y2']:.0f})  det_conf={det['confidence']:.3f}")
-        print(f"  {'crop_exp':>9}  {'refn_exp':>9}  "
+        _log(f"  {'crop_exp':>9}  {'refn_exp':>9}  "
               f"{'pose_conf':>9}  "
               f"{'vis_corners':>11}  "
               f"{'min_vis':>7}  "
               f"{'LL':>6}  {'UL':>6}  {'UR':>6}  {'LR':>6}")
-        print(f"  {'-'*9}  {'-'*9}  {'-'*9}  {'-'*11}  {'-'*7}  "
+        _log(f"  {'-'*9}  {'-'*9}  {'-'*9}  {'-'*11}  {'-'*7}  "
               f"{'-'*6}  {'-'*6}  {'-'*6}  {'-'*6}")
 
         best_score = None
@@ -944,7 +955,7 @@ def pose_sweep(detection_session, pose_session, image: Image.Image,
             )
             if result is None:
                 label = f"{'—':>6}" if re is None else f"{re:.2f}"
-                print(f"  {ce:9.2f}  {label:>9}  {'—':>9}  {'—':>11}  {'—':>7}  "
+                _log(f"  {ce:9.2f}  {label:>9}  {'—':>9}  {'—':>11}  {'—':>7}  "
                       f"{'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}")
                 continue
 
@@ -974,7 +985,7 @@ def pose_sweep(detection_session, pose_session, image: Image.Image,
             ul = vis_values.get("UL", 0)
             ur = vis_values.get("UR", 0)
             lr = vis_values.get("LR", 0)
-            print(f"  {ce:9.2f}  {re_label:>9}  {pose_con:9.3f}  "
+            _log(f"  {ce:9.2f}  {re_label:>9}  {pose_con:9.3f}  "
                   f"{vis_count:>7}/4  {min_vis:7.3f}  "
                   f"{ll:6.3f}  {ul:6.3f}  {ur:6.3f}  {lr:6.3f}")
 
@@ -991,7 +1002,7 @@ def pose_sweep(detection_session, pose_session, image: Image.Image,
             vis_count = sum(1 for v in vis_values.values() if v >= _VIS_THRESH_SWEEP)
             min_vis = min(vis_values.values())
             re_str = f"refine={re_best:.2f}" if re_best is not None else "no refine"
-            print(f"  >>> BEST: crop_expand={ce_best:.2f}  {re_str}  "
+            _log(f"  >>> BEST: crop_expand={ce_best:.2f}  {re_str}  "
                   f"vis={vis_count}/4  min_vis={min_vis:.3f}\n")
 
             best_result["detection"] = det
@@ -1001,7 +1012,7 @@ def pose_sweep(detection_session, pose_session, image: Image.Image,
                 "refine_expand": re_best,
             })
         else:
-            print(f"  >>> NO valid pose result for this photo\n")
+            _log(f"  >>> NO valid pose result for this photo\n")
 
     # Dedup the final results
     if detection_session is not None and len(best_results) > 1:
@@ -1009,16 +1020,16 @@ def pose_sweep(detection_session, pose_session, image: Image.Image,
         best_results = dedup_pose_results(best_results, min_dist)
 
     # Summary
-    print(f"\n{'=' * 80}")
-    print("SWEEP SUMMARY — best params per photo:")
-    print(f"{'=' * 80}")
+    _log(f"\n{'=' * 80}")
+    _log("SWEEP SUMMARY — best params per photo:")
+    _log(f"{'=' * 80}")
     for i, (res, params) in enumerate(zip(best_results, best_params)):
         kps = res["keypoints"]
         vis_values = {kp["name"]: kp["visibility"] for kp in kps}
         vis_count = sum(1 for v in vis_values.values() if v >= _VIS_THRESH_SWEEP)
         re_str = (f"refine={params['refine_expand']:.2f}"
                   if params["refine_expand"] is not None else "no refine")
-        print(f"  Photo #{i+1}:  crop_expand={params['crop_expand']:.2f}  {re_str}  "
+        _log(f"  Photo #{i+1}:  crop_expand={params['crop_expand']:.2f}  {re_str}  "
               f"vis={vis_count}/4  min_vis={min(vis_values.values()):.3f}  "
               f"pose_conf={res['pose_confidence']:.3f}")
 
@@ -1107,20 +1118,20 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
     best_params = []
 
     total_tier1 = len(tier1_x) * len(tier1_y)
-    print(f"\n{'=' * 90}")
-    print(f"ADAPTIVE X/Y SWEEP  —  {len(detections)} detection(s)")
-    print(f"{'=' * 90}")
-    print(f"  Tier 1 (quick): {tier1_x} x {tier1_y} = {total_tier1} combos")
+    _log(f"\n{'=' * 90}")
+    _log(f"ADAPTIVE X/Y SWEEP  —  {len(detections)} detection(s)")
+    _log(f"{'=' * 90}")
+    _log(f"  Tier 1 (quick): {tier1_x} x {tier1_y} = {total_tier1} combos")
     if tier3_x or tier3_y:
-        print(f"  Tier 3 (wide):  expand to full grid if needed")
-    print(f"  Refine candidates: top {max_refine_candidates} from tier 1, using {refine_expands}")
-    print(f"  Early stop: vis=4/4 and min_vis >= {early_stop_vis:.2f}")
+        _log(f"  Tier 3 (wide):  expand to full grid if needed")
+    _log(f"  Refine candidates: top {max_refine_candidates} from tier 1, using {refine_expands}")
+    _log(f"  Early stop: vis=4/4 and min_vis >= {early_stop_vis:.2f}")
 
     for det_idx, det in enumerate(detections):
         box = det["box"]
         bw = box["x2"] - box["x1"]
         bh = box["y2"] - box["y1"]
-        print(f"\n  Photo #{det_idx+1}:  box=({box['x1']:.0f},{box['y1']:.0f})"
+        _log(f"\n  Photo #{det_idx+1}:  box=({box['x1']:.0f},{box['y1']:.0f})"
               f"→({box['x2']:.0f},{box['y2']:.0f})  "
               f"size={bw:.0f}×{bh:.0f}  det_conf={det['confidence']:.3f}")
 
@@ -1131,8 +1142,8 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
         best_combo = None
         early_stop = False
 
-        print(f"  --- Tier 1: quick grid (no refine) ---")
-        print(f"  {'exp_x':>6} {'exp_y':>6} {'ref_x':>6} {'ref_y':>6}  "
+        _log(f"  --- Tier 1: quick grid (no refine) ---")
+        _log(f"  {'exp_x':>6} {'exp_y':>6} {'ref_x':>6} {'ref_y':>6}  "
               f"{'p_conf':>6} {'vis':>4} {'min_v':>6}  "
               f"{'LL':>6} {'UL':>6} {'UR':>6} {'LR':>6}")
 
@@ -1144,7 +1155,7 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
                     crop_limits=crop_limits_list[det_idx],
                 )
                 if result is None:
-                    print(f"  {ex:6.2f} {ey:6.2f} {'—':>6} {'—':>6}  "
+                    _log(f"  {ex:6.2f} {ey:6.2f} {'—':>6} {'—':>6}  "
                           f"{'—':>6} {'—':>4} {'—':>6}  "
                           f"{'—':>6} {'—':>6} {'—':>6} {'—':>6}")
                     continue
@@ -1161,7 +1172,7 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
                 ul = vis_values.get("UL", 0)
                 ur = vis_values.get("UR", 0)
                 lr = vis_values.get("LR", 0)
-                print(f"  {ex:6.2f} {ey:6.2f} {'—':>6} {'—':>6}  "
+                _log(f"  {ex:6.2f} {ey:6.2f} {'—':>6} {'—':>6}  "
                       f"{pose_con:6.3f} {vis_count:4}/4 {min_vis:6.3f}  "
                       f"{ll:6.3f} {ul:6.3f} {ur:6.3f} {lr:6.3f}")
 
@@ -1185,14 +1196,14 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
             vis_values = {kp["name"]: kp["visibility"] for kp in kps}
             vis_count = sum(1 for v in vis_values.values() if v >= _VIS_THRESH_SWEEP)
             min_vis = min(vis_values.values())
-            print(f"  >>> EARLY STOP: expand=({ex_b:.2f},{ey_b:.2f}) no refine  "
+            _log(f"  >>> EARLY STOP: expand=({ex_b:.2f},{ey_b:.2f}) no refine  "
                   f"vis={vis_count}/4 min_vis={min_vis:.3f} >= {early_stop_vis:.2f}")
         else:
             # ── Tier 2: Refine the best tier-1 candidates ──
             tier1_results.sort(key=lambda t: t[3], reverse=True)
             candidates = tier1_results[:max_refine_candidates]
 
-            print(f"  --- Tier 2: refine top {len(candidates)} candidate(s) ---")
+            _log(f"  --- Tier 2: refine top {len(candidates)} candidate(s) ---")
             for ex, ey, t1_result, t1_score in candidates:
                 for re in refine_expands:
                     refined_box = _keypoints_to_bbox(
@@ -1220,7 +1231,7 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
                     ul = vis_values.get("UL", 0)
                     ur = vis_values.get("UR", 0)
                     lr = vis_values.get("LR", 0)
-                    print(f"  {ex:6.2f} {ey:6.2f} {re:6.2f} {re:6.2f}  "
+                    _log(f"  {ex:6.2f} {ey:6.2f} {re:6.2f} {re:6.2f}  "
                           f"{pose_con:6.3f} {vis_count:4}/4 {min_vis:6.3f}  "
                           f"{ll:6.3f} {ul:6.3f} {ur:6.3f} {lr:6.3f}")
 
@@ -1237,7 +1248,7 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
 
             # ── Tier 3: Wider search if still not good enough ──
             if not early_stop and (tier3_x or tier3_y):
-                print(f"  --- Tier 3: wider search ---")
+                _log(f"  --- Tier 3: wider search ---")
                 for ex in tier3_x + tier1_x:
                     for ey in tier3_y + tier1_y:
                         # Skip if already tried in tier 1
@@ -1263,7 +1274,7 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
                         ul = vis_values.get("UL", 0)
                         ur = vis_values.get("UR", 0)
                         lr = vis_values.get("LR", 0)
-                        print(f"  {ex:6.2f} {ey:6.2f} {'—':>6} {'—':>6}  "
+                        _log(f"  {ex:6.2f} {ey:6.2f} {'—':>6} {'—':>6}  "
                               f"{pose_con:6.3f} {vis_count:4}/4 {min_vis:6.3f}  "
                               f"{ll:6.3f} {ul:6.3f} {ur:6.3f} {lr:6.3f}")
 
@@ -1297,7 +1308,7 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
             refine_str = ("no refine" if rx_b is None
                          else f"refine=({rx_b:.2f},{ry_b:.2f})")
             tier_str = " (early-stop)" if early_stop else ""
-            print(f"  >>> BEST: expand=({ex_b:.2f},{ey_b:.2f})  {refine_str}  "
+            _log(f"  >>> BEST: expand=({ex_b:.2f},{ey_b:.2f})  {refine_str}  "
                   f"vis={vis_count}/4  min_vis={min_vis:.3f}{tier_str}\n")
 
             best_result["detection"] = det
@@ -1307,7 +1318,7 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
                 "refine_x": rx_b, "refine_y": ry_b,
             })
         else:
-            print(f"  >>> NO valid pose result for this photo\n")
+            _log(f"  >>> NO valid pose result for this photo\n")
 
     # Dedup the final results
     if detection_session is not None and len(best_results) > 1:
@@ -1315,16 +1326,16 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
         best_results = dedup_pose_results(best_results, min_dist)
 
     # Summary
-    print(f"\n{'=' * 90}")
-    print("X/Y SWEEP SUMMARY — best params per photo:")
-    print(f"{'=' * 90}")
+    _log(f"\n{'=' * 90}")
+    _log("X/Y SWEEP SUMMARY — best params per photo:")
+    _log(f"{'=' * 90}")
     for i, (res, params) in enumerate(zip(best_results, best_params)):
         kps = res["keypoints"]
         vis_values = {kp["name"]: kp["visibility"] for kp in kps}
         vis_count = sum(1 for v in vis_values.values() if v >= _VIS_THRESH_SWEEP)
         refine_str = ("no refine" if params["refine_x"] is None
                       else f"refine=({params['refine_x']:.2f},{params['refine_y']:.2f})")
-        print(f"  Photo #{i+1}:  expand=({params['expand_x']:.2f}, {params['expand_y']:.2f})  "
+        _log(f"  Photo #{i+1}:  expand=({params['expand_x']:.2f}, {params['expand_y']:.2f})  "
               f"{refine_str}  "
               f"vis={vis_count}/4  min_vis={min(vis_values.values()):.3f}  "
               f"pose_conf={res['pose_confidence']:.3f}")
@@ -2070,6 +2081,55 @@ def _refine_corner_2d(grad_mag, grad_angle, grad_x_img, grad_y_img,
 
 
 # ---------------------------------------------------------------------------
+# Coordinate output helpers
+# ---------------------------------------------------------------------------
+
+# Canonical corner order for output: LL, UL, UR, LR
+_CORNER_ORDER = ["LL", "UL", "UR", "LR"]
+
+
+def format_coords(results: list, fmt: str = "json") -> str:
+    """Format photo corner coordinates for output.
+
+    Args:
+        results: List of result dicts from pipeline/infer.
+        fmt: Output format — "json" or "text".
+
+    Returns:
+        Formatted string ready for stdout.
+    """
+    if fmt == "json":
+        import json
+        photos = []
+        for res in results:
+            kps = {kp["name"]: kp for kp in res.get("keypoints", [])}
+            corners = []
+            for name in _CORNER_ORDER:
+                kp = kps.get(name)
+                if kp is not None:
+                    corners.append([round(kp["x"], 1), round(kp["y"], 1)])
+                else:
+                    corners.append(None)
+            photos.append(corners)
+        return json.dumps(photos)
+
+    elif fmt == "text":
+        lines = []
+        for i, res in enumerate(results):
+            kps = {kp["name"]: kp for kp in res.get("keypoints", [])}
+            for name in _CORNER_ORDER:
+                kp = kps.get(name)
+                if kp is not None:
+                    lines.append(f"{i + 1} {name} {kp['x']:.1f} {kp['y']:.1f} {kp['visibility']:.3f}")
+                else:
+                    lines.append(f"{i + 1} {name} - - 0.000")
+        return "\n".join(lines)
+
+    else:
+        raise ValueError(f"Unknown coords format: {fmt!r} (expected 'json' or 'text')")
+
+
+# ---------------------------------------------------------------------------
 def draw_results(image: Image.Image, results: list):
     """Draw detection boxes, keypoints, and corner quadrilaterals."""
     draw = ImageDraw.Draw(image)
@@ -2539,7 +2599,7 @@ def save_crops(image: Image.Image, results: list, image_path: str,
             )
             if cropped is None:
                 # Fallback to simple crop if warp fails (insufficient keypoints)
-                print(f"    Photo #{photo_id}: warp failed (insufficient keypoints), falling back to simple crop")
+                _log(f"    Photo #{photo_id}: warp failed (insufficient keypoints), falling back to simple crop")
                 cropped = crop_simple(image, res, transparent=transparent, margin=margin)
         else:
             use_corners = (crop_mode == "simple-corners")
@@ -2568,7 +2628,7 @@ def save_crops(image: Image.Image, results: list, image_path: str,
         vis_corners = sum(1 for kp in kps if kp["visibility"] >= 0.3)
         dim_info = f"{cropped.size[0]}×{cropped.size[1]}"
         mode_info = cropped.mode
-        print(f"    Photo #{photo_id} → {out_path}  "
+        _log(f"    Photo #{photo_id} → {out_path}  "
               f"({dim_info} {mode_info}  "
               f"box=({box['x1']:.0f},{box['y1']:.0f})→({box['x2']:.0f},{box['y2']:.0f})  "
               f"visible_corners={vis_corners}/4)")
@@ -2599,7 +2659,10 @@ def infer_single(detection_session, pose_session, image_path: str,
                  cv_refine: bool = False,
                  cv_refine_radius: int = 40,
 
-                 auto_refine: bool = False):
+                 auto_refine: bool = False,
+                 coords: str = None,
+                 debug: bool = False,
+                 no_image: bool = False):
     """Run the full pipeline on a single image."""
 
     # Open image and capture EXIF before converting (convert creates
@@ -2656,26 +2719,26 @@ def infer_single(detection_session, pose_session, image_path: str,
         mode += " + cv-refine"
     if auto_refine:
         mode += " + auto-refine"
-    print(f"Mode: {mode}")
-    print(f"\n{'=' * 60}")
-    print(f"Image: {image_path}")
-    print(f"Size: {orig_w}×{orig_h}")
-    print(f"Mode: {mode}")
-    print(f"Photos found: {len(results)}")
+    _log(f"Mode: {mode}")
+    _log(f"\n{'=' * 60}")
+    _log(f"Image: {image_path}")
+    _log(f"Size: {orig_w}×{orig_h}")
+    _log(f"Mode: {mode}")
+    _log(f"Photos found: {len(results)}")
     if sweep_params:
-        print(f"Best params per photo:")
+        _log(f"Best params per photo:")
         for i, sp in enumerate(sweep_params):
             if "expand_x" in sp:
                 # X/Y sweep format
                 rx_str = f"{sp['refine_x']:.2f}" if sp["refine_x"] is not None else "—"
                 ry_str = f"{sp['refine_y']:.2f}" if sp["refine_y"] is not None else "—"
                 refine_info = f"refine=({rx_str},{ry_str})" if sp["refine_x"] is not None else "no refine"
-                print(f"  Photo #{i+1}:  expand=({sp['expand_x']:.2f},{sp['expand_y']:.2f})  {refine_info}")
+                _log(f"  Photo #{i+1}:  expand=({sp['expand_x']:.2f},{sp['expand_y']:.2f})  {refine_info}")
             else:
                 # Uniform sweep format
                 re_str = f"refine={sp['refine_expand']:.2f}" if sp["refine_expand"] is not None else "no refine"
-                print(f"  Photo #{i+1}:  crop_expand={sp['crop_expand']:.2f}  {re_str}")
-    print(f"{'=' * 60}")
+                _log(f"  Photo #{i+1}:  crop_expand={sp['crop_expand']:.2f}  {re_str}")
+    _log(f"{'=' * 60}")
 
     for i, res in enumerate(results):
         box = res["detection"]["box"]
@@ -2695,41 +2758,46 @@ def infer_single(detection_session, pose_session, image_path: str,
                 else:
                     re_str = f"refine={sp['refine_expand']:.2f}" if sp["refine_expand"] is not None else "no refine"
                     line += f"  [{sp['crop_expand']:.2f} / {re_str}]"
-        print(line)
-        print(f"    Box: ({box['x1']:.1f}, {box['y1']:.1f}) → ({box['x2']:.1f}, {box['y2']:.1f})")
+        _log(line)
+        _log(f"    Box: ({box['x1']:.1f}, {box['y1']:.1f}) → ({box['x2']:.1f}, {box['y2']:.1f})")
         if kps:
             for kp in kps:
                 full = KEYPOINT_FULL_NAMES[kp["name"]]
-                print(f"    {kp['name']} ({full}): "
+                _log(f"    {kp['name']} ({full}): "
                       f"({kp['x']:.1f}, {kp['y']:.1f})  vis={kp['visibility']:.3f}")
         else:
-            print("    No pose detection in this crop")
+            _log("    No pose detection in this crop")
 
-    # Draw and save
-    vis = image.copy()
-    draw_results(vis, results)
+    # Output coordinates if requested
+    if coords:
+        print(format_coords(results, fmt=coords))
 
-    if output_path is None:
-        base = Path(image_path).stem
-        parent = Path(image_path).parent
-        output_path = str(parent / f"{base}_detected.jpg")
-    else:
-        out = Path(output_path)
-        # If --output is a directory (no extension), place the annotated
-        # image inside it with the default naming convention.
-        if out.suffix == "" or out.is_dir():
-            out.mkdir(parents=True, exist_ok=True)
-            output_path = str(out / f"{Path(image_path).stem}_detected.jpg")
+    # Draw and save annotated image (only with --debug)
+    if debug:
+        vis = image.copy()
+        draw_results(vis, results)
 
-    # Ensure output directory exists
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        if output_path is None:
+            base = Path(image_path).stem
+            parent = Path(image_path).parent
+            output_path = str(parent / f"{base}_detected.jpg")
+        else:
+            out = Path(output_path)
+            # If --output is a directory (no extension), place the annotated
+            # image inside it with the default naming convention.
+            if out.suffix == "" or out.is_dir():
+                out.mkdir(parents=True, exist_ok=True)
+                output_path = str(out / f"{Path(image_path).stem}_detected.jpg")
 
-    vis.save(output_path, quality=95)
-    print(f"\n  Saved: {output_path}")
+        # Ensure output directory exists
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # Save crops if requested
-    if crop_mode:
-        print(f"\n  Cropping ({crop_mode}):")
+        vis.save(output_path, quality=95)
+        _log(f"\n  Saved: {output_path}")
+
+    # Save crops if requested (skip with --no-image)
+    if crop_mode and not no_image:
+        _log(f"\n  Cropping ({crop_mode}):")
         wm = "outward" if crop_mode == "warp-stretch" else ("inward" if crop_mode.startswith("warp") else None)
         save_crops(image, results, image_path, crop_mode, crop_dir,
                    transparent=transparent, warp_mode=wm,
@@ -2766,7 +2834,10 @@ def infer_batch(detection_session, pose_session, image_dir: str,
                cv_refine: bool = False,
                cv_refine_radius: int = 40,
 
-               auto_refine: bool = False):
+               auto_refine: bool = False,
+               coords: str = None,
+               debug: bool = False,
+               no_image: bool = False):
 
     image_dir = Path(image_dir)
     extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
@@ -2784,9 +2855,9 @@ def infer_batch(detection_session, pose_session, image_dir: str,
         out_path = image_dir / "output"
     out_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"Processing {len(images)} images")
-    print(f"  Input:  {image_dir}")
-    print(f"  Output: {out_path}")
+    _log(f"Processing {len(images)} images")
+    _log(f"  Input:  {image_dir}")
+    _log(f"  Output: {out_path}")
 
     summary = []
     for img_path in images:
@@ -2809,6 +2880,9 @@ def infer_batch(detection_session, pose_session, image_dir: str,
             cv_refine_radius=cv_refine_radius,
 
             auto_refine=auto_refine,
+            coords=coords,
+            debug=debug,
+            no_image=no_image,
         )
         photo_count = len(results)
         pose_ok = sum(1 for r in results if r.get("keypoints"))
@@ -2819,17 +2893,17 @@ def infer_batch(detection_session, pose_session, image_dir: str,
         })
 
     # Summary
-    print(f"\n{'=' * 60}")
-    print("BATCH SUMMARY")
-    print(f"{'=' * 60}")
-    print(f"{'Image':<30} {'Photos':>8} {'W/Pose':>8}")
-    print(f"{'-' * 30} {'-' * 8} {'-' * 8}")
+    _log(f"\n{'=' * 60}")
+    _log("BATCH SUMMARY")
+    _log(f"{'=' * 60}")
+    _log(f"{'Image':<30} {'Photos':>8} {'W/Pose':>8}")
+    _log(f"{'-' * 30} {'-' * 8} {'-' * 8}")
     for e in summary:
-        print(f"{e['image']:<30} {e['photos']:>8} {e['with_pose']:>8}")
+        _log(f"{e['image']:<30} {e['photos']:>8} {e['with_pose']:>8}")
     total_photos = sum(e["photos"] for e in summary)
     total_pose = sum(e["with_pose"] for e in summary)
-    print(f"{'-' * 30} {'-' * 8} {'-' * 8}")
-    print(f"{'Total':<30} {total_photos:>8} {total_pose:>8}")
+    _log(f"{'-' * 30} {'-' * 8} {'-' * 8}")
+    _log(f"{'Total':<30} {total_photos:>8} {total_pose:>8}")
 
     return summary
 
@@ -2928,34 +3002,35 @@ def _apply_preset(parser, args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Photo Pose Detector — Two-Stage ONNX Inference CLI",
+        prog="photocrop",
+        description="photocrop — Detect & Extract Photos from Multi-Photo Scans",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Basic Usage:
   # Single image (models auto-detected)
-  python3 infer.py --image scan.jpg
+  photocrop --image scan.jpg
 
   # Folder of images → folder of results
-  python3 infer.py --image ./scans/ --output ./crops/
+  photocrop --image ./scans/ --output ./crops/
 
 Presets:
   Presets are named combinations of settings for common use cases.
   Any individual setting can override a preset value.
 
   # Quick — just detect + pose (~5s)
-  python3 infer.py --image scan.jpg --preset quick
+  photocrop --image scan.jpg --preset quick
 
   # Crop — detect + tight corner crop with auto-refine (~7s)
-  python3 infer.py --image scan.jpg --preset crop
+  photocrop --image scan.jpg --preset crop
 
   # Warp — detect + perspective warp with white fill (~5s)
-  python3 infer.py --image scan.jpg --preset warp
+  photocrop --image scan.jpg --preset warp
 
   # Best — full pipeline for tight layouts (~15s, includes sweep + cv-refine)
-  python3 infer.py --image scan.jpg --preset best
+  photocrop --image scan.jpg --preset best
 
   # Best preset but override the crop margin
-  python3 infer.py --image scan.jpg --preset best --crop-margin 30
+  photocrop --image scan.jpg --preset best --crop-margin 30
 
 Recommended for photos close together:
   When photos are close together on the scanner bed, the pose model can
@@ -2965,34 +3040,47 @@ Recommended for photos close together:
   corner detection on tight layouts:
 
   # Add sweep to any preset or command
-  python3 infer.py --image scan.jpg --preset warp --pose-sweep-xy
+  photocrop --image scan.jpg --preset warp --pose-sweep-xy
 
   # Or use the --preset best which includes sweep
-  python3 infer.py --image scan.jpg --preset best
+  photocrop --image scan.jpg --preset best
 
 CV Refinement (manual):
   # Edge detection + line intersection (Enhancements 1+2)
-  python3 infer.py --image scan.jpg --cv-refine
+  photocrop --image scan.jpg --cv-refine
 
   # With perspective warp cropping
-  python3 infer.py --image scan.jpg --cv-refine \\
+  photocrop --image scan.jpg --cv-refine \\
     --crop warp-stretch --crop-margin 20 --border-fill white
 
 Detailed Crop Commands:
   # Best simple crop — keypoint bbox + margin so edges aren't clipped
-  python3 infer.py --image scan.jpg --crop simple-corners --crop-margin 10
+  photocrop --image scan.jpg --crop simple-corners --crop-margin 10
 
   # Best warp crop — outward warp + margin + white fill for clean edges
-  python3 infer.py --image scan.jpg --crop warp-stretch \\
+  photocrop --image scan.jpg --crop warp-stretch \\
     --crop-margin 10 --border-fill white
 
   # Best transparent crop — corner-based with margin, for compositing
-  python3 infer.py --image scan.jpg --crop simple-corners \\
+  photocrop --image scan.jpg --crop simple-corners \\
     --crop-margin 10 --crop-transparent
 
   # Crop a whole folder
-  python3 infer.py --image ./scans/ --output ./crops/ \\
+  photocrop --image ./scans/ --output ./crops/ \\
     --crop simple-corners --crop-margin 10
+
+Coordinates Only (scripting-friendly):
+  # Output corner coordinates as JSON, no file output
+  photocrop --image scan.jpg --coords json --no-image
+
+  # Coordinates as line-delimited text (bash-friendly)
+  photocrop --image scan.jpg --coords text --no-image
+
+  # Debug: save annotated detection image with boxes and keypoints
+  photocrop --image scan.jpg --preset warp --debug
+
+  # Coordinates + debug image
+  photocrop --image scan.jpg --coords json --debug
 """,
     )
 
@@ -3172,6 +3260,25 @@ Detailed Crop Commands:
              "colors: white, black, grey/gray, red, green, blue. "
              "Ignored when --crop-transparent is set. (default: grey)",
     )
+    parser.add_argument(
+        "--coords", type=str, default=None,
+        choices=["json", "text"],
+        help="Output corner coordinates to stdout. 'json' prints a JSON array "
+             "[[[x1,y1],[x2,y2],...], ...] with corners in LL,UL,UR,LR order. "
+             "'text' prints one corner per line: 'PHOTO LL x y vis'. "
+             "Useful for scripting — combine with --no-image to skip "
+             "file output and get coordinates only.",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Save the annotated detection image (boxes, keypoints, corners "
+             "drawn on the original). Not saved by default.",
+    )
+    parser.add_argument(
+        "--no-image", action="store_true",
+        help="Don't save cropped photo files. Useful with --coords when you "
+             "only need coordinates without extracting image files.",
+    )
 
     args = parser.parse_args()
 
@@ -3184,20 +3291,20 @@ Detailed Crop Commands:
     pose_model_path = Path(args.pose_model).resolve()
 
     if not detection_model_path.exists():
-        print(f"Error: Detection model not found: {detection_model_path}")
-        print(f"  (default: {DEFAULT_DETECTION_MODEL.resolve()})")
+        _log(f"Error: Detection model not found: {detection_model_path}")
+        _log(f"  (default: {DEFAULT_DETECTION_MODEL.resolve()})")
         sys.exit(1)
     if not pose_model_path.exists():
-        print(f"Error: Pose model not found: {pose_model_path}")
-        print(f"  (default: {DEFAULT_POSE_MODEL.resolve()})")
+        _log(f"Error: Pose model not found: {pose_model_path}")
+        _log(f"  (default: {DEFAULT_POSE_MODEL.resolve()})")
         sys.exit(1)
 
     # Load detection model
-    print(f"Loading detection model: {detection_model_path}")
+    _log(f"Loading detection model: {detection_model_path}")
     detection_session = load_onnx_model(str(detection_model_path))
 
     # Load pose model
-    print(f"Loading pose model: {pose_model_path}")
+    _log(f"Loading pose model: {pose_model_path}")
     pose_session = load_onnx_model(str(pose_model_path))
 
     # Validate image path and auto-detect file vs directory mode
@@ -3254,6 +3361,9 @@ Detailed Crop Commands:
             cv_refine=args.cv_refine,
             cv_refine_radius=args.cv_refine_radius,
             auto_refine=args.auto_refine,
+            coords=args.coords,
+            debug=args.debug,
+            no_image=args.no_image,
         )
     else:
         infer_single(
@@ -3280,6 +3390,9 @@ Detailed Crop Commands:
             cv_refine=args.cv_refine,
             cv_refine_radius=args.cv_refine_radius,
             auto_refine=args.auto_refine,
+            coords=args.coords,
+            debug=args.debug,
+            no_image=args.no_image,
         )
 
 

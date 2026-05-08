@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photo-pose-detector"
+version = "0.1.0"
+description = "Detect and extract individual photographs from multi-photo scans"
+requires-python = ">=3.9"
+dependencies = [
+    "opencv-python>=4.9,<5",
+    "numpy>=1.26,<2",
+    "Pillow>=12,<13",
+    "onnx>=1.21,<2",
+    "onnxruntime>=1.23,<2",
+]
+
+[project.scripts]
+photocrop = "onnx_inference.photocrop:main"
+
+[tool.setuptools.packages.find]
+include = ["onnx_inference*"]
