@@ -2150,18 +2150,79 @@ def _fit_background_gradient(xs: np.ndarray, ys: np.ndarray,
     return coeffs, poly_func
 
 
-def _compute_matte(gray: np.ndarray, poly_func, threshold: float = 40.0):
+def _detect_foreground_polarity(gray: np.ndarray, detection_boxes: list,
+                                  bg_margin: int = 5):
+    """Determine whether photos are darker or lighter than the background.
+
+    Compares the average pixel value inside detection boxes (photos) to
+    the average pixel value in the image margins (background). Returns
+    'dark' if photos are darker than background (light background) or
+    'light' if photos are lighter (dark background).
+
+    Args:
+        gray: Grayscale image (H, W)
+        detection_boxes: List of detection box dicts with 'x1,y1,x2,y2'
+        bg_margin: Width of margin to consider background (for quick estimate)
+
+    Returns:
+        'dark' if photos are darker than background,
+        'light' if photos are lighter than background
+    """
+    h, w = gray.shape
+
+    # Average background value from margins
+    top_bg = np.mean(gray[:bg_margin, :])
+    bottom_bg = np.mean(gray[h - bg_margin:, :])
+    left_bg = np.mean(gray[bg_margin:h - bg_margin, :bg_margin])
+    right_bg = np.mean(gray[bg_margin:h - bg_margin, w - bg_margin:])
+    bg_val = np.mean([top_bg, bottom_bg, left_bg, right_bg])
+
+    # Average foreground value from detection boxes (interior, avoiding edges)
+    fg_vals = []
+    for box in detection_boxes:
+        x1, y1 = int(box["x1"]), int(box["y1"])
+        x2, y2 = int(box["x2"]), int(box["y2"])
+        # Use interior 60% to avoid edge effects
+        mx = int((x2 - x1) * 0.2)
+        my = int((y2 - y1) * 0.2)
+        ix1, iy1 = max(0, x1 + mx), max(0, y1 + my)
+        ix2, iy2 = min(w, x2 - mx), min(h, y2 - my)
+        if ix2 > ix1 and iy2 > iy1:
+            fg_vals.append(np.mean(gray[iy1:iy2, ix1:ix2]))
+
+    if not fg_vals:
+        # No detection boxes — assume dark photos on light background
+        return 'dark'
+
+    fg_val = np.mean(fg_vals)
+
+    if fg_val > bg_val:
+        return 'light'  # Photos are lighter than background
+    else:
+        return 'dark'   # Photos are darker than background
+
+
+def _compute_matte(gray: np.ndarray, poly_func, threshold: float = 40.0,
+                   polarity: str = 'dark'):
     """Compute a foreground/background matte using the background gradient.
 
-    For each pixel, compares its value to the predicted background. If
-    the pixel is significantly darker than the background (photos are
-    darker than the scanner bed), it's classified as foreground (photo).
+    For each pixel, compares its value to the predicted background. The
+    polarity parameter controls whether photos are expected to be darker
+    or lighter than the background:
+
+    - polarity='dark': photos are darker than background (light scanner bed)
+    - polarity='light': photos are lighter than background (dark background)
+
+    The threshold is always applied as the absolute difference — only the
+    sign of the comparison changes.
 
     Args:
         gray: Grayscale image (H, W)
         poly_func: Fitted background surface function
-        threshold: How much darker than background to count as foreground.
-            Photos on a white scanner bed are typically 50-150px darker.
+        threshold: Absolute difference from background to count as foreground.
+            Typical values: 50-150 for both dark and light photos.
+        polarity: 'dark' if photos are darker than background,
+                  'light' if photos are lighter than background.
 
     Returns:
         matte: Boolean array (H, W) — True where foreground (photo) detected
@@ -2172,9 +2233,14 @@ def _compute_matte(gray: np.ndarray, poly_func, threshold: float = 40.0):
     xy = np.column_stack([xx.ravel(), yy.ravel()])
     bg_surface = poly_func(xy).reshape(h, w)
 
-    # Foreground = significantly darker than background
     diff = bg_surface - gray.astype(np.float64)
-    matte = diff > threshold
+
+    if polarity == 'dark':
+        # Foreground = significantly darker than background
+        matte = diff > threshold
+    else:
+        # Foreground = significantly lighter than background
+        matte = diff < -threshold
 
     return matte, bg_surface
 
@@ -2412,19 +2478,26 @@ def _find_photo_edges(matte: np.ndarray, detection_box: dict,
                       grad_x: np.ndarray = None,
                       grad_y: np.ndarray = None,
                       grad_mag: np.ndarray = None,
-                      stripe_width: int = 30):
+                      stripe_width: int = 30,
+                      polarity: str = 'dark'):
     """Find the 4 edges of a photo using gradient scanning within
     detection box boundary strips.
 
     For each edge, scans a narrow stripe centered on the detection box
     boundary and finds the position with the strongest **directional**
-    gradient. The gradient sign is critical — each edge type expects a
-    specific brightness transition direction:
+    gradient. The gradient sign depends on polarity:
 
-      - Left edge:   bright background → dark photo  → NEGATIVE grad_x
-      - Right edge:  dark photo → bright background  → POSITIVE grad_x
-      - Top edge:    bright background → dark photo  → NEGATIVE grad_y
-      - Bottom edge: dark photo → bright background  → POSITIVE grad_y
+    Dark photos on light background (polarity='dark'):
+      - Left edge:   bright bg → dark photo  → NEGATIVE grad_x
+      - Right edge:  dark photo → bright bg  → POSITIVE grad_x
+      - Top edge:    bright bg → dark photo  → NEGATIVE grad_y
+      - Bottom edge: dark photo → bright bg  → POSITIVE grad_y
+
+    Light photos on dark background (polarity='light'):
+      - Left edge:   dark bg → light photo  → POSITIVE grad_x
+      - Right edge:  light photo → dark bg  → NEGATIVE grad_x
+      - Top edge:    dark bg → light photo  → POSITIVE grad_y
+      - Bottom edge: light photo → dark bg  → NEGATIVE grad_y
 
     Using signed gradients instead of |gradient| prevents picking up
     edges from adjacent photos (e.g., Photo 3's left edge scan won't
@@ -2442,6 +2515,8 @@ def _find_photo_edges(matte: np.ndarray, detection_box: dict,
         grad_mag: Gradient magnitude (unused, kept for API compat)
         stripe_width: Half-width of the search stripe along each
             detection box boundary (px)
+        polarity: 'dark' if photos are darker than background,
+                  'light' if photos are lighter than background.
 
     Returns:
         dict mapping edge names ('left', 'right', 'top', 'bottom')
@@ -2454,30 +2529,46 @@ def _find_photo_edges(matte: np.ndarray, detection_box: dict,
     y2 = int(detection_box["y2"])
     h, w = matte.shape
 
+    # Gradient sign multipier: for polarity='dark' the standard signs
+    # apply. For polarity='light', all signs are flipped.
+    sign = -1.0 if polarity == 'light' else 1.0
+
     edge_points = {}
 
     # --- Find LEFT and RIGHT edges using horizontal gradient ---
-    # Left edge:  bright bg → dark photo → NEGATIVE grad_x (argmin)
-    # Right edge: dark photo → bright bg → POSITIVE grad_x (argmax)
+    # Dark polarity: left edge = -grad_x (bright→dark), right = +grad_x (dark→bright)
+    # Direction multipliers for signed gradient search.
+    # Dark polarity (dark photos on light bg): edge transitions go
+    #   bg→photo is bright→dark, so grad is negative at left/top.
+    # Light polarity (light photos on dark bg): edge transitions go
+    #   bg→photo is dark→bright, so grad is positive at left/top.
+    # The 'sign' variable is +1 for dark polarity, -1 for light.
+    left_dir = -sign    # dark: -1 (negate grad_x), light: +1
+    right_dir = sign    # dark: +1 (keep grad_x),    light: -1
+    top_dir = -sign     # dark: -1 (negate grad_y), light: +1
+    bottom_dir = sign   # dark: +1 (keep grad_y),   light: -1
+
+    edge_points = {}
+
     if grad_x is not None:
-        # Left edge: scan stripe [x1-stripe, x1+stripe] for each row
+        # Left edge
         left_xs, left_ys = [], []
         lo = max(0, x1 - stripe_width)
         hi = min(w, x1 + stripe_width)
         for row_y in range(max(0, y1 - stripe_width), min(h, y2 + stripe_width)):
-            strip = -grad_x[row_y, lo:hi]  # negate: we want the most negative gradient
+            strip = left_dir * grad_x[row_y, lo:hi]
             if strip.max() < 10:
                 continue
             peak_x = np.argmax(strip) + lo
             left_xs.append(float(peak_x))
             left_ys.append(float(row_y))
 
-        # Right edge: scan stripe [x2-stripe, x2+stripe]
+        # Right edge
         right_xs, right_ys = [], []
         lo = max(0, x2 - stripe_width)
         hi = min(w, x2 + stripe_width)
         for row_y in range(max(0, y1 - stripe_width), min(h, y2 + stripe_width)):
-            strip = grad_x[row_y, lo:hi]  # positive: we want the most positive gradient
+            strip = right_dir * grad_x[row_y, lo:hi]
             if strip.max() < 10:
                 continue
             peak_x = np.argmax(strip) + lo
@@ -2487,36 +2578,30 @@ def _find_photo_edges(matte: np.ndarray, detection_box: dict,
         edge_points["left"] = (np.array(left_xs), np.array(left_ys))
         edge_points["right"] = (np.array(right_xs), np.array(right_ys))
 
-    # --- Find TOP and BOTTOM edges using vertical gradient ---
-    # Top edge:    bright bg → dark photo → NEGATIVE grad_y (argmin)
-    # Bottom edge: dark photo → bright bg → POSITIVE grad_y (argmax)
     if grad_y is not None:
-        # Top edge: scan stripe [y1-stripe, y1+stripe] for each column
+        # Top edge
         top_xs, top_ys = [], []
         lo = max(0, y1 - stripe_width)
         hi = min(h, y1 + stripe_width)
         for col_x in range(max(0, x1 - stripe_width), min(w, x2 + stripe_width)):
-            strip = -grad_y[lo:hi, col_x]  # negate: we want the most negative gradient
+            strip = top_dir * grad_y[lo:hi, col_x]
             if strip.max() < 10:
                 continue
             peak_y = np.argmax(strip) + lo
             top_xs.append(float(col_x))
             top_ys.append(float(peak_y))
 
-        # Bottom edge: scan stripe [y2-stripe, y2+stripe]
+        # Bottom edge
         bottom_xs, bottom_ys = [], []
         lo = max(0, y2 - stripe_width)
         hi = min(h, y2 + stripe_width)
         for col_x in range(max(0, x1 - stripe_width), min(w, x2 + stripe_width)):
-            strip = grad_y[lo:hi, col_x]  # positive: we want the most positive gradient
+            strip = bottom_dir * grad_y[lo:hi, col_x]
             if strip.max() < 10:
                 continue
             peak_y = np.argmax(strip) + lo
             bottom_xs.append(float(col_x))
             bottom_ys.append(float(peak_y))
-
-        edge_points["top"] = (np.array(top_xs), np.array(top_ys))
-        edge_points["bottom"] = (np.array(bottom_xs), np.array(bottom_ys))
 
     # Fit RANSAC lines to each edge
     edges = {}
@@ -2603,7 +2688,8 @@ def refine_corners_bg_matte(image: Image.Image, results: list,
     1. Sampling pixels from the image margins (background = scanner bed)
     2. Fitting a smooth 2D polynomial gradient to the background
     3. Computing a foreground mask by comparing each pixel to the
-       predicted background (photos are darker than the scanner bed)
+       predicted background, automatically detecting whether photos are
+       darker or lighter than the background
     4. Extracting edge transition points from the matte
     5. Fitting robust lines (RANSAC) to each of the 4 photo edges
     6. Computing corners as line-line intersections
@@ -2625,7 +2711,8 @@ def refine_corners_bg_matte(image: Image.Image, results: list,
         results: List of result dicts from pipeline (modified in-place)
         bg_margin: Width of image border to sample for background (px).
         bg_poly_degree: Polynomial degree for background gradient (1 or 2).
-        matte_threshold: How much darker than background to be "foreground".
+        matte_threshold: Absolute brightness difference from background to be
+            "foreground". Works for both dark-on-light and light-on-dark.
         ransac_residual: RANSAC inlier distance for line fitting (px).
         min_edge_points: Minimum edge points needed for line fitting.
         min_corner_confidence: Minimum intersection confidence to accept.
@@ -2653,8 +2740,18 @@ def refine_corners_bg_matte(image: Image.Image, results: list,
     _, poly_func = _fit_background_gradient(bg_xs, bg_ys, bg_vals,
                                             degree=bg_poly_degree)
 
+    # Step 2b: Detect whether photos are darker or lighter than background
+    detection_boxes = []
+    for res in results:
+        det = res.get("detection", {})
+        if det and det.get("box"):
+            detection_boxes.append(det["box"])
+    polarity = _detect_foreground_polarity(gray, detection_boxes,
+                                           bg_margin=bg_margin)
+
     # Step 3: Compute foreground matte
-    matte, _ = _compute_matte(gray, poly_func, threshold=matte_threshold)
+    matte, _ = _compute_matte(gray, poly_func, threshold=matte_threshold,
+                              polarity=polarity)
 
     # Compute Sobel gradients for edge detection
     grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
@@ -2678,7 +2775,8 @@ def refine_corners_bg_matte(image: Image.Image, results: list,
                                    min_edge_points=min_edge_points,
                                    ransac_residual=ransac_residual,
                                    grad_x=grad_x, grad_y=grad_y,
-                                   grad_mag=grad_mag)
+                                   grad_mag=grad_mag,
+                                   polarity=polarity)
 
         # Step 6: Compute corners as line intersections
         bg_corners = _extend_lines_to_corners(edges)
@@ -3532,18 +3630,25 @@ _PRESETS = {
         "description": "Fast detection + pose, no refinement or cropping",
         "args": {},
     },
+    "sweep": {
+        "description": "Adaptive per-photo crop-expand optimization "
+                       "(~3x slower but much better for tight layouts)",
+        "args": {
+            "pose_sweep_xy": True,
+        },
+    },
     "crop": {
-        "description": "Detect + tight corner crop with margin",
+        "description": "Detect + tight corner crop with margin (fast)",
         "args": {
             "crop": "simple-corners",
-            "crop_margin": 10,
+            "crop_margin": 20,
         },
     },
     "warp": {
-        "description": "Detect + perspective warp with white fill + margin",
+        "description": "Detect + perspective warp with white fill (fast)",
         "args": {
             "crop": "warp-stretch",
-            "crop_margin": 10,
+            "crop_margin": 20,
             "border_fill": "white",
         },
     },
@@ -3554,14 +3659,14 @@ _PRESETS = {
         },
     },
     "best": {
-        "description": "Full pipeline: detect → pose → refine pose → "
-                       "cv-refine → bg-matte → warp crop with white fill",
+        "description": "Full pipeline: sweep → cv-refine → bg-matte → warp "
+                       "(slow, best quality for tight layouts)",
         "args": {
-            "pose_refine": True,
+            "pose_sweep_xy": True,
             "cv_refine": True,
             "cv_refine_bg_matte": True,
             "crop": "warp-stretch",
-            "crop_margin": 10,
+            "crop_margin": 20,
             "border_fill": "white",
         },
     },
@@ -3631,23 +3736,36 @@ Presets:
   Presets are named combinations of settings for common use cases.
   Any individual setting can override a preset value.
 
-  # Quick — just detect + pose, no refinement
+  # Quick — just detect + pose (~5s)
   python3 infer.py --image scan.jpg --preset quick
 
-  # Crop — detect + tight corner crop
+  # Crop — detect + tight corner crop (fast)
   python3 infer.py --image scan.jpg --preset crop
 
-  # Warp — detect + perspective warp + white border
+  # Warp — detect + perspective warp + white border (fast)
   python3 infer.py --image scan.jpg --preset warp
 
-  # Refine — 3-stage pipeline (detect → pose → refine pose)
+  # Refine — 3-stage pipeline: detect → pose → refine pose
   python3 infer.py --image scan.jpg --preset refine
 
-  # Best — full pipeline with all refinements + warp crop
+  # Best — full pipeline for tight layouts (~18s, includes sweep)
   python3 infer.py --image scan.jpg --preset best
 
   # Best preset but override the crop margin
-  python3 infer.py --image scan.jpg --preset best --crop-margin 20
+  python3 infer.py --image scan.jpg --preset best --crop-margin 30
+
+Recommended for photos close together:
+  When photos are close together on the scanner bed, the pose model can
+  latch onto an adjacent photo if the crop is too large. --pose-sweep-xy
+  tries multiple crop-expand sizes per photo and picks the best, preventing
+  this issue. It adds ~3x processing time but significantly improves
+  corner detection on tight layouts:
+
+  # Add sweep to any preset or command
+  python3 infer.py --image scan.jpg --preset warp --pose-sweep-xy
+
+  # Or use the --preset best which includes sweep
+  python3 infer.py --image scan.jpg --preset best
 
 CV Refinement (manual):
   # Edge detection + line intersection (Enhancements 1+2)
@@ -3702,9 +3820,10 @@ Detailed Crop Commands:
         choices=list(_PRESETS.keys()),
         help="Named preset for common use cases. Sets multiple options at "
              "once; any individual option can override the preset. "
-             "quick=detect+pose only, crop=tight corner crop, warp=perspective "
-             "warp+white border, refine=3-stage pipeline, best=full pipeline "
-             "with all CV refinements + warp crop. (default: none)",
+             "quick=detect+pose only, sweep=adaptive per-photo expand, "
+             "crop=sweep+corner crop, warp=sweep+perspective warp, "
+             "refine=3-stage pipeline, "
+             "best=sweep+cv-refine+bg-matte+warp. (default: none)",
     )
     parser.add_argument(
         "--output", "-o", type=str, default=None,
@@ -3815,10 +3934,11 @@ Detailed Crop Commands:
     )
     parser.add_argument(
         "--cv-refine-bg-matte-threshold", type=float, default=40.0,
-        help="How much darker than background a pixel must be to be "
-             "classified as foreground (part of a photo). Decrease for "
-             "faded/light photos, increase for dark scanner beds. "
-             "(default: 40.0)",
+        help="Absolute brightness difference from background for a pixel "
+             "to be classified as foreground (part of a photo). Works for "
+             "both dark photos on light backgrounds and light photos on "
+             "dark backgrounds. Decrease for faded/low-contrast photos, "
+             "increase for high-contrast scenarios. (default: 40.0)",
     )
     parser.add_argument(
         "--cv-refine-bg-matte-ransac", type=float, default=3.0,
