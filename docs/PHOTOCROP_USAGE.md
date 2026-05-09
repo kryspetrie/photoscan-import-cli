@@ -93,12 +93,12 @@ Presets bundle common settings. Any individual flag can override a preset value.
 | Preset | What it does | Time | Use when |
 |--------|-------------|------|----------|
 | **quick** | Detect + pose only, no cropping | ~5s | You only need coordinates, no crops |
-| **crop** | + auto-refine + simple-corners crop | ~7s | You want rectangular crops with margin |
-| **warp** | + auto-refine + perspective warp, white fill | ~5s | You want perspective-corrected crops |
-| **best** | + sweep + cv-refine + auto-refine + warp | ~15s | Photos are close together; maximum quality |
+| **crop** | + auto-refine + adaptive margin + simple-corners crop | ~7s | You want rectangular crops with margin |
+| **warp** | + auto-refine + adaptive margin + perspective warp | ~5s | You want perspective-corrected crops |
+| **best** | + sweep + cv-refine + auto-refine + adaptive margin + warp | ~15s | Photos are close together; maximum quality |
 
 ```bash
-# Crop photos out with 20px margin, auto-fixing bad corners
+# Crop photos out with ~2% margin, auto-fixing bad corners
 photocrop --image scan.jpg --preset crop
 
 # Perspective warp with clean white borders
@@ -108,7 +108,7 @@ photocrop --image scan.jpg --preset warp
 photocrop --image scan.jpg --preset best
 
 # Combine: best preset but override the margin
-photocrop --image scan.jpg --preset best --crop-margin 30
+photocrop --image scan.jpg --preset best --crop-margin 0.03
 ```
 
 ---
@@ -121,8 +121,8 @@ photocrop --image scan.jpg --preset best --crop-margin 30
 |------|---------|-------------|
 | `--image`, `-i` | *(required)* | Path to a single image or directory of images |
 | `--output`, `-o` | auto | Output path for annotated image(s, only written with `--debug`). Single image defaults to `{stem}_detected.jpg` next to input. Directory defaults to an `output/` subdirectory |
-| `--detection-model`, `-d` | `../models/detection_model.onnx` | Path to detection ONNX model |
-| `--pose-model`, `-p` | `../models/pose_model_v2.onnx` | Path to pose ONNX model |
+| `--detection-model`, `-d` | `../models/detection_ep47.onnx` | Path to detection ONNX model |
+| `--pose-model`, `-p` | `../models/pose_single_ep42.onnx` | Path to pose ONNX model |
 | `--limit`, `-n` | 0 | Process at most N images from a directory (0 = all) |
 
 ### Presets
@@ -181,7 +181,7 @@ After the neural network finds approximate corners, CV refinement uses edge dete
 |------|---------|-------------|
 | `--crop` | *(none)* | Crop mode: `simple` (detection bbox), `simple-corners` (keypoint bbox + margin), `warp` (perspective, inward), `warp-stretch` (perspective, outward, preserves all content) |
 | `--crop-dir` | `crops/` | Output directory for cropped photos |
-| `--crop-margin` | 0 | Extra pixels to expand each side of the crop. For warp modes, pushes corners outward from quad center |
+| `--crop-margin` | 0 | Margin as a fraction of the detected photo's diagonal. E.g. 0.02 = ~2% of diagonal (~20px on a 1000px photo). Resolution-independent |
 | `--crop-transparent` | off | Save crops as transparent PNG. Area outside keypoint quad is transparent |
 | `--border-fill` | grey | Fill color for warp areas outside source image. Accepts `R,G,B`, `#RRGGBB`, `#RGB`, or named colors: `white`, `black`, `grey`/`gray`, `red`, `green`, `blue` |
 
@@ -267,15 +267,15 @@ for i, corners in enumerate(data):
 ```bash
 # Simple corner crop with generous margin (good for manual trimming)
 photocrop --image scan.jpg \
-  --crop simple-corners --crop-margin 30
+  --crop simple-corners --crop-margin 0.03
 
 # Perspective warp with white border + larger margin
 photocrop --image scan.jpg \
-  --crop warp-stretch --crop-margin 20 --border-fill white
+  --crop warp-stretch --crop-margin 0.02 --border-fill white
 
 # Transparent PNG for compositing in Photoshop etc
 photocrop --image scan.jpg \
-  --crop simple-corners --crop-margin 10 --crop-transparent
+  --crop simple-corners --crop-margin 0.02 --crop-transparent
 ```
 
 ### Manual refinement (advanced)
@@ -284,15 +284,15 @@ photocrop --image scan.jpg \
 # Full manual control: sweep + cv-refine + warp
 photocrop --image scan.jpg \
   --pose-sweep-xy --cv-refine \
-  --crop warp-stretch --crop-margin 20 --border-fill white
+  --crop warp-stretch --crop-margin 0.02 --border-fill white
 
 # Just CV refinement, no sweep (faster, good for well-separated photos)
 photocrop --image scan.jpg \
-  --cv-refine --crop warp-stretch --crop-margin 20 --border-fill white
+  --cv-refine --crop warp-stretch --crop-margin 0.02 --border-fill white
 
 # Pose refinement only (re-runs pose model with tighter crop)
 photocrop --image scan.jpg \
-  --pose-refine --crop simple-corners --crop-margin 20
+  --pose-refine --crop simple-corners --crop-margin 0.02
 ```
 
 ---
@@ -315,7 +315,7 @@ photocrop --image scan.jpg \
 ```bash
 # The recommended crop command
 photocrop --image scan.jpg \
-  --crop warp-stretch --crop-margin 20 --border-fill white
+  --crop warp-stretch --crop-margin 0.02 --border-fill white
 ```
 
 ---
@@ -330,6 +330,56 @@ photocrop --image scan.jpg \
 | **Included in** | `--preset best` | `--preset crop`, `--preset warp`, `--preset best` |
 
 The `--auto-refine` option is a safety net: if any photo has fewer than 3 visible corners (meaning the crop could collapse to a degenerate shape like a thin "strip"), it automatically runs the full CV refinement pass. On well-separated photos where all 4 corners are detected, it adds zero overhead.
+
+---
+
+## Understanding Adaptive Margin
+
+When a corner has low confidence (the pose model isn't sure where it is), the detected position may be inaccurate. **Adaptive margin** expands the crop outward around low-confidence corners, ensuring the actual photo content is included even if the corner position is wrong.
+
+### How it works
+
+For each corner, the extra margin is computed as:
+
+```
+extra_fraction = adaptive_margin_max × max(0, 1 - visibility / threshold)
+extra_pixels  = extra_fraction × photo_diagonal
+```
+
+The visibility used is the **original NN confidence** (before CV refinement boosts it). This ensures that corners where the neural network was uncertain still get extra margin even if CV refinement found a better position.
+
+A corner at `visibility = 0` gets the full `adaptive_margin_max` fraction of the photo diagonal as extra margin. A corner at `visibility = threshold` gets 0 extra (just the base `--crop-margin`). Corners above the threshold are unaffected. All margins are resolution-independent — specified as fractions of the detected photo's diagonal, so they scale naturally with image size.
+
+### Warp fallback
+
+When using perspective warp (`--crop warp` or `--crop warp-stretch`), a corner with very low **original** visibility (before CV refinement) can produce a badly distorted warp. If any corner falls below `--warp-fallback-thresh` (default 0.3), the crop automatically falls back to `simple-corners` and emits a warning to stderr. The output filename will show `_crop_` instead of `_warp_`, making it easy to spot which photos fell back.
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--adaptive-margin` | off | Enable adaptive margin expansion for low-confidence corners |
+| `--adaptive-margin-thresh` | 0.5 | Visibility threshold below which corners receive extra margin |
+| `--adaptive-margin-max` | 0.03 | Maximum extra margin as a fraction of the photo diagonal (at visibility = 0) |
+| `--warp-fallback-thresh` | 0.3 | Fall back from warp to simple crop if any corner is below this. Set to 0 to disable |
+
+### When adaptive margin helps
+
+- A photo's corner is obscured by shadow or glare → low visibility → more margin ensures the actual edge is included
+- A photo is near the edge of the scan → low visibility on outer corners → more margin captures the full edge
+- A perspective warp would be badly distorted by uncertain corners → warp fallback prevents bad warps
+
+```bash
+# Enable adaptive margin (included in crop/warp/best presets)
+photocrop --image scan.jpg --preset warp
+
+# Manual: adaptive margin with aggressive settings
+photocrop --image scan.jpg --crop warp-stretch --adaptive-margin \
+  --adaptive-margin-thresh 0.7 --adaptive-margin-max 0.10
+
+# Disable warp fallback (always warp, even with low-confidence corners)
+photocrop --image scan.jpg --preset warp --warp-fallback-thresh 0
+```
 
 ---
 
@@ -368,13 +418,18 @@ When cropping is enabled (`--crop`), each detected photo is saved separately:
 
 ```
 crops/
-├── scan_001_1.jpg    # First detected photo
-├── scan_001_2.jpg    # Second detected photo
-├── scan_001_3.jpg    # Third detected photo
-└── scan_001_4.jpg    # Fourth detected photo
+├── scan_001_warp_1.jpg    # Photo 1 — perspective warp
+├── scan_001_warp_2.jpg    # Photo 2 — perspective warp
+├── scan_001_crop_3.jpg    # Photo 3 — simple crop (warp fallback due to low confidence)
+└── scan_001_warp_4.jpg    # Photo 4 — perspective warp
 ```
 
-Naming: `{original_stem}_{photo_id}.{ext}`
+The tag in the filename tells you what crop mode was actually used:
+- **`warp`** — perspective warp (all corners had sufficient confidence)
+- **`crop`** — simple corner-based crop (either requested, or warp fell back due to low confidence)
+- **`box`** — detection bounding-box crop (no pose detection available)
+
+Naming: `{original_stem}_{tag}_{photo_id}.{ext}`
 
 ---
 
@@ -408,8 +463,8 @@ from onnx_inference.photocrop import format_coords
 from PIL import Image
 
 # Load models
-det_session = load_onnx_model("models/detection_model.onnx")
-pose_session = load_onnx_model("models/pose_model_v2.onnx")
+det_session = load_onnx_model("models/detection_ep47.onnx")
+pose_session = load_onnx_model("models/pose_single_ep42.onnx")
 
 # Process an image
 image = Image.open("scan.jpg")
@@ -435,15 +490,16 @@ json_coords = format_coords(results, fmt="json")
 text_coords = format_coords(results, fmt="text")
 # text_coords = '1 LL x y vis\n1 UL x y vis\n...'
 
-# Save crops
+# Save crops — margins are fractions of the detected photo's diagonal
 save_crops(
     image=image,
     results=results,
     image_path="scan.jpg",
     crop_mode="warp-stretch",
-    crop_margin=20,
-    border_fill=(255, 255, 255),  # white
-    output_dir="crops/",
+    margin=0.02,                       # 2% of photo diagonal
+    adaptive_margin=True,
+    adaptive_margin_max=0.03,         # 3% extra for vis=0 corners
+    border_fill=(255, 255, 255),       # white
 )
 ```
 

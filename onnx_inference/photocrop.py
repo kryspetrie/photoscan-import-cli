@@ -32,8 +32,10 @@ from all previously kept results.
 
 Model Output Formats
 --------------------
-  Detection model:  [1, 5, N_anchors]   — raw YOLO output (no NMS)
+  Detection model:  [1, 5, N_anchors] (legacy) — raw YOLO output (no NMS)
                     rows = cx, cy, w, h, class_confidence
+                    [1, N, 6] (NMS-enabled) — end-to-end output
+                    cols = x1, y1, x2, y2, conf, class
   Pose model:       [1, 300, 18]         — NMS-enabled (end-to-end)
                     cols = x1,y1,x2,y2,conf,class, kp0_x,kp0_y,kp0_vis,
                            kp1_x,kp1_y,kp1_vis, kp2_x,kp2_y,kp2_vis,
@@ -55,10 +57,11 @@ Cropping
     --crop warp-stretch    Perspective warp (outward): max of opposite edge
                            lengths → preserves ALL photo content
     --crop-dir DIR         Output directory for crops (default: ./crops/)
-    --crop-margin N        Expand crops outward by N pixels on each side.
-                           For simple/simple-corners: expands the bounding box.
-                           For warp/warp-stretch: pushes source corners
-                           outward from the quad center before warping.
+    --crop-margin F        Expand crops outward by F × photo-diagonal on each
+                           side. 0.02 = 2% of the photo's diagonal (~20px on a
+                           1000px photo). For simple/simple-corners: expands the
+                           bounding box. For warp/warp-stretch: pushes source
+                           corners outward from the quad center before warping.
     --crop-transparent     Save crops as transparent PNG. For simple crops,
                            area outside keypoint quad is transparent. For
                            warp, out-of-bounds areas are transparent.
@@ -66,29 +69,30 @@ Cropping
                            Accepts: R,G,B  #RRGGBB  #RGB  white/black/grey/
                            red/green/blue. Ignored with --crop-transparent.
 
-    Output naming: {original_stem}_{photo_id}.{ext}
+    Output naming: {original_stem}_{crop_tag}_{photo_id}.{ext}
+                  crop_tag: 'warp', 'crop', or 'box' (warp→fallback shows 'crop')
     Example: scan_001_1.jpg, scan_001_2.jpg
 
 Recommended Commands
 -------------------
-    # Best simple crop — keypoint-based bbox + 10px margin so edges aren't clipped
-    photocrop --image scan.jpg --crop simple-corners --crop-margin 10
+    # Best simple crop — keypoint-based bbox + 2% margin so edges aren't clipped
+    photocrop --image scan.jpg --crop simple-corners --crop-margin 0.02
 
     # Best warp crop — outward warp + margin + white fill for clean edges
     photocrop --image scan.jpg --crop warp-stretch \
-                     --crop-margin 10 --border-fill white
+                     --crop-margin 0.02 --border-fill white
 
     # Best transparent crop — corner-based with margin, for compositing
     photocrop --image scan.jpg --crop simple-corners \
-                     --crop-margin 10 --crop-transparent
+                     --crop-margin 0.02 --crop-transparent
 
     # Crop a whole folder of images
     photocrop --image ./scans/ --output ./crops/ \
-                     --crop simple-corners --crop-margin 10
+                     --crop simple-corners --crop-margin 0.02
 
     # Best accuracy — 3-stage refine for improved corner detection
     photocrop --image scan.jpg --pose-refine \
-                     --crop warp-stretch --crop-margin 10 --border-fill white
+                     --crop warp-stretch --crop-margin 0.02 --border-fill white
 
 Usage
 -----
@@ -153,8 +157,8 @@ _VIS_THRESH_SWEEP = 0.30      # visibility threshold for sweep scoring
 
 # Default model paths (relative to this script's location)
 _SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_DETECTION_MODEL = _SCRIPT_DIR / ".." / "models" / "detection_model.onnx"
-DEFAULT_POSE_MODEL = _SCRIPT_DIR / ".." / "models" / "pose_model_v2.onnx"
+DEFAULT_DETECTION_MODEL = _SCRIPT_DIR / ".." / "models" / "detection_ep47.onnx"
+DEFAULT_POSE_MODEL = _SCRIPT_DIR / ".." / "models" / "pose_single_ep42.onnx"
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +278,12 @@ def run_detection(session, image: Image.Image, conf_threshold: float = 0.5,
     """
     Run the detection model on a full image.
 
+    Supports two detection model output formats:
+      - Legacy: [1, 5, N_anchors] — raw YOLO with columns (cx, cy, w, h, conf).
+        Requires NMS post-processing.
+      - NMS-enabled: [1, N, 6] — end-to-end with columns
+        (x1, y1, x2, y2, conf, cls). NMS is already applied.
+
     Returns list of dicts with keys: 'box' (x1,y1,x2,y2 in original coords),
     'confidence'.
     """
@@ -283,44 +293,86 @@ def run_detection(session, image: Image.Image, conf_threshold: float = 0.5,
     input_name = session.get_inputs()[0].name
     output = session.run(None, {input_name: input_arr})[0]
 
-    # Raw output: [1, 5, N_anchors] → cx, cy, w, h, class_conf
-    cx = output[0, 0]
-    cy = output[0, 1]
-    w = output[0, 2]
-    h = output[0, 3]
-    conf = output[0, 4]
-
-    # Filter by confidence
-    mask = conf > conf_threshold
-    if not mask.any():
-        return []
-
-    # Convert to xyxy in original image space
     ratio = scale_info["ratio"]
     pad_w = scale_info["pad_w"]
     pad_h = scale_info["pad_h"]
 
-    x1 = (cx[mask] - w[mask] / 2 - pad_w) / ratio
-    y1 = (cy[mask] - h[mask] / 2 - pad_h) / ratio
-    x2 = (cx[mask] + w[mask] / 2 - pad_w) / ratio
-    y2 = (cy[mask] + h[mask] / 2 - pad_h) / ratio
-    filtered_conf = conf[mask]
+    # Detect output format from shape
+    # Legacy: [1, 5, N] — transposed, 5 rows for cx,cy,w,h,conf
+    # NMS-enabled: [1, N, 6] — row-oriented, 6 cols for x1,y1,x2,y2,conf,cls
+    if output.shape[1] == 5 and len(output.shape) == 3:
+        # Legacy format: [1, 5, N_anchors] → cx, cy, w, h, class_conf
+        cx = output[0, 0]
+        cy = output[0, 1]
+        w = output[0, 2]
+        h = output[0, 3]
+        conf = output[0, 4]
 
-    # NMS
-    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
-    keep = nms(boxes_xyxy, filtered_conf, iou_threshold)
+        mask = conf > conf_threshold
+        if not mask.any():
+            return []
 
-    results = []
-    for idx in keep:
-        bx1 = max(0, boxes_xyxy[idx, 0])
-        by1 = max(0, boxes_xyxy[idx, 1])
-        bx2 = min(orig_w, boxes_xyxy[idx, 2])
-        by2 = min(orig_h, boxes_xyxy[idx, 3])
+        # Convert cxcywh to xyxy in original image space
+        x1 = (cx[mask] - w[mask] / 2 - pad_w) / ratio
+        y1 = (cy[mask] - h[mask] / 2 - pad_h) / ratio
+        x2 = (cx[mask] + w[mask] / 2 - pad_w) / ratio
+        y2 = (cy[mask] + h[mask] / 2 - pad_h) / ratio
+        filtered_conf = conf[mask]
 
-        results.append({
-            "box": {"x1": bx1, "y1": by1, "x2": bx2, "y2": by2},
-            "confidence": float(filtered_conf[idx]),
-        })
+        # NMS (needed for legacy format)
+        boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+        keep = nms(boxes_xyxy, filtered_conf, iou_threshold)
+
+        results = []
+        for idx in keep:
+            bx1 = max(0, boxes_xyxy[idx, 0])
+            by1 = max(0, boxes_xyxy[idx, 1])
+            bx2 = min(orig_w, boxes_xyxy[idx, 2])
+            by2 = min(orig_h, boxes_xyxy[idx, 3])
+
+            results.append({
+                "box": {"x1": float(bx1), "y1": float(by1),
+                        "x2": float(bx2), "y2": float(by2)},
+                "confidence": float(filtered_conf[idx]),
+            })
+
+    else:
+        # NMS-enabled format: [1, N, 6] → x1, y1, x2, y2, conf, cls
+        # Coordinates are in letterboxed 640-space
+        detections = output[0]  # [N, 6]
+
+        # Filter by confidence
+        conf = detections[:, 4]
+        mask = conf > conf_threshold
+        if not mask.any():
+            return []
+
+        filtered = detections[mask]
+
+        # Convert from letterboxed 640-space to original image space
+        x1 = (filtered[:, 0] - pad_w) / ratio
+        y1 = (filtered[:, 1] - pad_h) / ratio
+        x2 = (filtered[:, 2] - pad_w) / ratio
+        y2 = (filtered[:, 3] - pad_h) / ratio
+        filtered_conf = filtered[:, 4]
+
+        # NMS already applied by model, but apply again for safety
+        # (some models may still produce overlapping detections)
+        boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+        keep = nms(boxes_xyxy, filtered_conf, iou_threshold)
+
+        results = []
+        for idx in keep:
+            bx1 = max(0, boxes_xyxy[idx, 0])
+            by1 = max(0, boxes_xyxy[idx, 1])
+            bx2 = min(orig_w, boxes_xyxy[idx, 2])
+            by2 = min(orig_h, boxes_xyxy[idx, 3])
+
+            results.append({
+                "box": {"x1": float(bx1), "y1": float(by1),
+                        "x2": float(bx2), "y2": float(by2)},
+                "confidence": float(filtered_conf[idx]),
+            })
 
     return results
 
@@ -1838,7 +1890,8 @@ def refine_corners_cv(image: Image.Image, results: list,
     Returns:
         The same results list with refined keypoint positions.
         ``visibility`` is boosted for successfully refined corners, and
-        original NN position is saved in ``nn_x`` / ``nn_y`` fields.
+        original NN position and visibility are saved in ``nn_x``, 
+        ``nn_y``, and ``nn_vis`` fields.
     """
     img_array = np.array(image)
     gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
@@ -1965,6 +2018,12 @@ def refine_corners_cv(image: Image.Image, results: list,
                 # Update the keypoint in-place (modifies kps list directly)
                 kp["nn_x"] = kp["x"]
                 kp["nn_y"] = kp["y"]
+                # Save original NN visibility before boosting — this tells us
+                # how confident the pose model was, regardless of CV refinement.
+                # Used by adaptive margin and warp fallback to decide whether
+                # to trust a corner for perspective warp.
+                if "nn_vis" not in kp:
+                    kp["nn_vis"] = kp["visibility"]
                 if use_projection:
                     kp["proj_x"] = float(proj_x)
                     kp["proj_y"] = float(proj_y)
@@ -2204,7 +2263,8 @@ def _get_keypoints_bbox(result: dict, margin: float = 0):
         result: Pipeline result dict with 'keypoints' list and
             'detection'/'box' dict.
         margin: Extra pixels to expand the box outward in each
-            direction. Positive values add padding around the crop.
+            direction (pixels, pre-converted from fraction of diagonal
+            when called via the CLI). Positive values add padding.
 
     Returns:
         (x1, y1, x2, y2) in original image pixel coordinates.
@@ -2262,6 +2322,9 @@ def crop_simple(image: Image.Image, result: dict,
         margin: Extra pixels to expand the crop outward in each
             direction (positive = more of the surrounding area
             included in the crop, negative = tighter crop).
+            Note: When using the CLI, --crop-margin is a fraction of
+            the photo diagonal (resolution-independent); this function
+            receives the pre-converted pixel value.
 
     Returns:
         Cropped PIL image (RGB or RGBA if transparent)
@@ -2326,7 +2389,8 @@ def crop_perspective_warp(image: Image.Image, result: dict,
                           warp_mode: str = "inward",
                           border_fill: tuple = (114, 114, 114),
                           transparent: bool = False,
-                          margin: float = 0) -> Image.Image:
+                          margin: float = 0,
+                          adaptive_margins: dict = None) -> Image.Image:
     """
     Perspective warp crop: use the 4 detected corner keypoints to
     compute a homography that dewarps the photo into a rectangular
@@ -2368,7 +2432,10 @@ def crop_perspective_warp(image: Image.Image, result: dict,
             RGBA.
         margin: Extra pixels to expand the source corner points outward
             along the quadrilateral edges before warping. Adds real
-            surrounding content to the output.
+            surrounding content to the output. Note: When using the
+            CLI, --crop-margin is a fraction of the photo diagonal
+            (resolution-independent); this function receives the
+            pre-converted pixel value.
 
     Returns:
         Dewarped (rectangular) PIL image, or None if insufficient
@@ -2402,25 +2469,24 @@ def crop_perspective_warp(image: Image.Image, result: dict,
             src_points.append(bbox_corners[name])
 
     src_pts = np.array(src_points, dtype=np.float32)
-
-    # Expand source corners outward by margin pixels along edges
-    # Each corner is pushed outward along the two edges it connects to.
-    # For corner i, the outward direction is the average of the two
-    # edge normals pointing away from the quadrilateral center.
-    if margin > 0:
+    # Expand source corners outward by margin pixels along edges.
+    # When adaptive_margins is provided, each corner gets its own margin
+    # based on keypoint visibility (lower visibility → more margin).
+    # Otherwise, uniform margin is applied to all corners.
+    if margin > 0 or adaptive_margins:
         center = src_pts.mean(axis=0)
-        # Edges: UL→UR, UR→LR, LR→LL, LL→UL
-        # Edge vectors (unnormalized direction from each corner toward the next)
-        edges_next = np.roll(src_pts, -1, axis=0) - src_pts
-        edges_prev = np.roll(src_pts, 1, axis=0) - src_pts
-        # Outward normal for each edge: rotate edge 90° away from center.
-        # For edge (x,y), outward normal is (y, -x) rotated if center is inside.
-        # Simpler approach: push each corner away from center.
         for i in range(4):
-            direction = src_pts[i] - center
-            dist = np.linalg.norm(direction)
-            if dist > 0:
-                src_pts[i] += (margin / dist) * direction
+            name = corner_names[i]
+            # Determine this corner's margin
+            if adaptive_margins and name in adaptive_margins:
+                m = adaptive_margins[name]
+            else:
+                m = margin
+            if m > 0:
+                direction = src_pts[i] - center
+                dist = np.linalg.norm(direction)
+                if dist > 0:
+                    src_pts[i] += (m / dist) * direction
 
     # Compute output dimensions from detected edge lengths
     w_top = np.linalg.norm(src_pts[1] - src_pts[0])
@@ -2539,7 +2605,11 @@ def save_crops(image: Image.Image, results: list, image_path: str,
                warp_mode: str = "inward",
                border_fill: tuple = (114, 114, 114),
                source_exif: bytes = None,
-               margin: float = 0):
+               margin: float = 0,
+               adaptive_margin: bool = False,
+               adaptive_margin_thresh: float = 0.5,
+               adaptive_margin_max: float = 0.03,
+               warp_fallback_thresh: float = 0.3):
     """
     Save cropped photos for each detected photo in results.
 
@@ -2560,10 +2630,24 @@ def save_crops(image: Image.Image, results: list, image_path: str,
                      for default grey (114,114,114).
         source_exif: Raw EXIF bytes from the source image to preserve
                      in cropped outputs. If None, no EXIF is written.
-        margin: Extra pixels to expand crops outward on each side.
-                For simple crops, expands the bounding box. For warp
-                crops, pushes corner keypoints outward from the
-                quadrilateral center before computing the homography.
+        margin: Margins expressed as a fraction of the detected photo's
+                diagonal. E.g. 0.02 = 2% of diagonal. For a 1000px
+                diagonal photo, that's ~20px. Converted to absolute
+                pixels internally based on each photo's detection bbox.
+        adaptive_margin: If True, expand crop margin for low-confidence
+                   corners. The lower a corner's visibility, the more
+                   margin is added (pushed outward from quad center).
+        adaptive_margin_thresh: Visibility threshold below which corners
+                   start receiving extra margin (default 0.5). A corner
+                   at visibility 0 gets adaptive_margin_max extra fraction.
+        adaptive_margin_max: Maximum extra margin as a fraction of the
+                   photo diagonal for a corner with visibility 0
+                   (default 0.03 = 3%). Margin scales linearly:
+                   extra_frac = max * (1 - vis/thresh) for vis < thresh.
+        warp_fallback_thresh: If any corner has visibility below this
+                   threshold, fall back to simple crop instead of warp.
+                   Emits a warning to stderr. Set to 0 to disable
+                   fallback (default 0.3).
     """
     if not results:
         return
@@ -2587,24 +2671,91 @@ def save_crops(image: Image.Image, results: list, image_path: str,
 
     for i, res in enumerate(results):
         photo_id = i + 1
-        out_name = f"{stem}_{photo_id}{ext}"
+
+        kps = res.get("keypoints", [])
+        kp_by_name = {kp["name"]: kp for kp in kps} if kps else {}
+
+        # Compute photo diagonal from detection bbox for resolution-independent
+        # margin conversion.  diagonal = sqrt(w² + h²) gives a natural scale
+        # that works across different image resolutions.
+        box = res["detection"]["box"]
+        bw = box["x2"] - box["x1"]
+        bh = box["y2"] - box["y1"]
+        diag = (bw ** 2 + bh ** 2) ** 0.5
+
+        # Convert fraction-of-diagonal margins to absolute pixels
+        px_margin = margin * diag
+
+        # Compute adaptive margins for low-confidence corners (in pixels)
+        # Uses original NN visibility (nn_vis) when available — the CV
+        # refinement boosts visibility artificially, but the original
+        # confidence tells us whether we should trust the corner.
+        adaptive_margins = None
+        if adaptive_margin and kps:
+            adaptive_margins = {}
+            for name in ["LL", "UL", "UR", "LR"]:
+                kp = kp_by_name.get(name, {})
+                # Use original NN visibility if CV refinement saved it,
+                # otherwise fall back to the current (possibly boosted) value
+                vis = kp.get("nn_vis", kp.get("visibility", 0))
+                if vis < adaptive_margin_thresh:
+                    # Linearly scale: vis=0 → max fraction, vis=thresh → 0
+                    extra_frac = adaptive_margin_max * (1 - vis / adaptive_margin_thresh)
+                    adaptive_margins[name] = px_margin + extra_frac * diag
+                else:
+                    adaptive_margins[name] = px_margin
+
+        # Check for warp fallback: if any corner had very low original
+        # visibility (before CV refinement boosted it), fall back to
+        # simple crop — a perspective warp with uncertain corners can
+        # produce badly distorted results.
+        do_warp = crop_mode.startswith("warp")
+        if do_warp and warp_fallback_thresh > 0 and kps:
+            low_vis_corners = []
+            for kp in kps:
+                orig_vis = kp.get("nn_vis", kp["visibility"])
+                if orig_vis < warp_fallback_thresh:
+                    low_vis_corners.append(f"{kp['name']}={orig_vis:.2f}")
+            if low_vis_corners:
+                _log(f"    Photo #{photo_id}: WARNING low-confidence corners "
+                      f"[{', '.join(low_vis_corners)}], "
+                      f"falling back to simple crop")
+                do_warp = False
+
+        # Determine the effective crop tag for the filename
+        if do_warp:
+            crop_tag = "warp"
+        else:
+            if crop_mode.startswith("warp"):
+                crop_tag = "crop"      # warp was requested but fell back
+            elif crop_mode == "simple-corners":
+                crop_tag = "crop"
+            else:
+                crop_tag = "box"
+
+        out_name = f"{stem}_{crop_tag}_{photo_id}{ext}"
         out_path = out_dir / out_name
 
-        if crop_mode.startswith("warp"):
+        if do_warp:
             wm = "outward" if crop_mode == "warp-stretch" else "inward"
             cropped = crop_perspective_warp(
                 image, res, warp_mode=wm,
                 border_fill=border_fill, transparent=transparent,
-                margin=margin,
+                margin=px_margin,
+                adaptive_margins=adaptive_margins,
             )
             if cropped is None:
                 # Fallback to simple crop if warp fails (insufficient keypoints)
                 _log(f"    Photo #{photo_id}: warp failed (insufficient keypoints), falling back to simple crop")
-                cropped = crop_simple(image, res, transparent=transparent, margin=margin)
+                cropped = crop_simple(image, res, transparent=transparent, margin=px_margin)
         else:
             use_corners = (crop_mode == "simple-corners")
+            effective_margin = px_margin
+            if adaptive_margins:
+                # For simple crops, use the max adaptive margin (uniform expansion)
+                effective_margin = max(adaptive_margins.values())
             cropped = crop_simple(image, res, transparent=transparent,
-                                  use_corners=use_corners, margin=margin)
+                                  use_corners=use_corners, margin=effective_margin)
 
         # Save with high quality, preserving EXIF from source
         save_kwargs = {}
@@ -2662,7 +2813,11 @@ def infer_single(detection_session, pose_session, image_path: str,
                  auto_refine: bool = False,
                  coords: str = None,
                  debug: bool = False,
-                 no_image: bool = False):
+                 no_image: bool = False,
+                 adaptive_margin: bool = False,
+                 adaptive_margin_thresh: float = 0.5,
+                 adaptive_margin_max: float = 0.03,
+                 warp_fallback_thresh: float = 0.3):
     """Run the full pipeline on a single image."""
 
     # Open image and capture EXIF before converting (convert creates
@@ -2803,7 +2958,11 @@ def infer_single(detection_session, pose_session, image_path: str,
                    transparent=transparent, warp_mode=wm,
                    border_fill=border_fill,
                    source_exif=_source_exif,
-                   margin=margin)
+                   margin=margin,
+                   adaptive_margin=adaptive_margin,
+                   adaptive_margin_thresh=adaptive_margin_thresh,
+                   adaptive_margin_max=adaptive_margin_max,
+                   warp_fallback_thresh=warp_fallback_thresh)
 
     return results
 
@@ -2837,7 +2996,11 @@ def infer_batch(detection_session, pose_session, image_dir: str,
                auto_refine: bool = False,
                coords: str = None,
                debug: bool = False,
-               no_image: bool = False):
+               no_image: bool = False,
+               adaptive_margin: bool = False,
+               adaptive_margin_thresh: float = 0.5,
+               adaptive_margin_max: float = 0.03,
+               warp_fallback_thresh: float = 0.3):
 
     image_dir = Path(image_dir)
     extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
@@ -2883,12 +3046,15 @@ def infer_batch(detection_session, pose_session, image_dir: str,
             coords=coords,
             debug=debug,
             no_image=no_image,
+            adaptive_margin=adaptive_margin,
+            adaptive_margin_thresh=adaptive_margin_thresh,
+            adaptive_margin_max=adaptive_margin_max,
+            warp_fallback_thresh=warp_fallback_thresh,
         )
-        photo_count = len(results)
         pose_ok = sum(1 for r in results if r.get("keypoints"))
         summary.append({
             "image": img_path.name,
-            "photos": photo_count,
+            "photos": len(results),
             "with_pose": pose_ok,
         })
 
@@ -2922,20 +3088,22 @@ _PRESETS = {
         "args": {},
     },
     "crop": {
-        "description": "Detect + tight corner crop with margin (fast, auto-refine)",
+        "description": "Detect + adaptive corner crop (fast, auto-refine, adaptive margin)",
         "args": {
             "auto_refine": True,
             "crop": "simple-corners",
-            "crop_margin": 20,
+            "crop_margin": 0.02,
+            "adaptive_margin": True,
         },
     },
     "warp": {
-        "description": "Detect + perspective warp with white fill (fast, auto-refine)",
+        "description": "Detect + perspective warp with white fill (fast, auto-refine, adaptive margin)",
         "args": {
             "auto_refine": True,
             "crop": "warp-stretch",
-            "crop_margin": 20,
+            "crop_margin": 0.02,
             "border_fill": "white",
+            "adaptive_margin": True,
         },
     },
     "best": {
@@ -2946,8 +3114,9 @@ _PRESETS = {
             "cv_refine": True,
             "auto_refine": True,
             "crop": "warp-stretch",
-            "crop_margin": 20,
+            "crop_margin": 0.02,
             "border_fill": "white",
+            "adaptive_margin": True,
         },
     },
 }
@@ -3030,7 +3199,7 @@ Presets:
   photocrop --image scan.jpg --preset best
 
   # Best preset but override the crop margin
-  photocrop --image scan.jpg --preset best --crop-margin 30
+  photocrop --image scan.jpg --preset best --crop-margin 0.03
 
 Recommended for photos close together:
   When photos are close together on the scanner bed, the pose model can
@@ -3051,23 +3220,23 @@ CV Refinement (manual):
 
   # With perspective warp cropping
   photocrop --image scan.jpg --cv-refine \\
-    --crop warp-stretch --crop-margin 20 --border-fill white
+    --crop warp-stretch --crop-margin 0.02 --border-fill white
 
 Detailed Crop Commands:
   # Best simple crop — keypoint bbox + margin so edges aren't clipped
-  photocrop --image scan.jpg --crop simple-corners --crop-margin 10
+  photocrop --image scan.jpg --crop simple-corners --crop-margin 0.02
 
   # Best warp crop — outward warp + margin + white fill for clean edges
   photocrop --image scan.jpg --crop warp-stretch \\
-    --crop-margin 10 --border-fill white
+    --crop-margin 0.02 --border-fill white
 
   # Best transparent crop — corner-based with margin, for compositing
   photocrop --image scan.jpg --crop simple-corners \\
-    --crop-margin 10 --crop-transparent
+    --crop-margin 0.02 --crop-transparent
 
   # Crop a whole folder
   photocrop --image ./scans/ --output ./crops/ \\
-    --crop simple-corners --crop-margin 10
+    --crop simple-corners --crop-margin 0.02
 
 Coordinates Only (scripting-friendly):
   # Output corner coordinates as JSON, no file output
@@ -3086,11 +3255,11 @@ Coordinates Only (scripting-friendly):
 
     parser.add_argument(
         "--detection-model", "-d", type=str, default=str(DEFAULT_DETECTION_MODEL),
-        help="Path to detection ONNX model (default: ../models/detection_model.onnx)",
+        help="Path to detection ONNX model (default: ../models/detection_ep47.onnx)",
     )
     parser.add_argument(
         "--pose-model", "-p", type=str, default=str(DEFAULT_POSE_MODEL),
-        help="Path to pose ONNX model (default: ../models/pose_model_v2.onnx)",
+        help="Path to pose ONNX model (default: ../models/pose_single_ep42.onnx)",
     )
     parser.add_argument(
         "--image", "-i", type=str, required=True,
@@ -3232,7 +3401,8 @@ Coordinates Only (scripting-friendly):
              "'warp' (perspective warp, inward — average edge dims), or "
              "'warp-stretch' (perspective warp, outward — max edge dims, "
              "preserves all photo content). "
-             "Output saved as {stem}_{photo_id}.{ext}",
+             "Output saved as {stem}_{tag}_{N}.{ext} where tag is "
+             "'warp', 'crop', or 'box' based on actual crop mode used.",
     )
     parser.add_argument(
         "--crop-dir", type=str, default=None,
@@ -3241,10 +3411,12 @@ Coordinates Only (scripting-friendly):
     )
     parser.add_argument(
         "--crop-margin", type=float, default=0,
-        help="Extra pixels to expand the crop outward on each side. For simple "
-             "crops, expands the bounding box. For warp crops, pushes corner "
-             "keypoints outward from the quadrilateral center. Useful to ensure "
-             "photo edges are fully included. (default: 0)",
+        help="Margin as a fraction of the detected photo's diagonal. E.g. "
+             "0.02 adds ~2%% of the diagonal (~20px on a 1000px photo). "
+             "For simple crops, expands the bounding box. For warp crops, "
+             "pushes corner keypoints outward from the quad center. "
+             "Resolution-independent — works across different image sizes. "
+             "(default: 0)",
     )
     parser.add_argument(
         "--crop-transparent", action="store_true",
@@ -3278,6 +3450,32 @@ Coordinates Only (scripting-friendly):
         "--no-image", action="store_true",
         help="Don't save cropped photo files. Useful with --coords when you "
              "only need coordinates without extracting image files.",
+    )
+    parser.add_argument(
+        "--adaptive-margin", action="store_true",
+        help="Expand crop margin for low-confidence corners. The lower a "
+             "corner's visibility score, the more margin is added outward from "
+             "the quadrilateral center, ensuring content near uncertain corners "
+             "is included. Useful for photos with partially-detected edges.",
+    )
+    parser.add_argument(
+        "--adaptive-margin-thresh", type=float, default=0.5,
+        help="Visibility threshold below which corners receive extra margin "
+             "(default: 0.5). A corner at visibility 0 gets "
+             "--adaptive-margin-max extra fraction; one at the threshold gets 0.",
+    )
+    parser.add_argument(
+        "--adaptive-margin-max", type=float, default=0.03,
+        help="Maximum extra margin as a fraction of the photo diagonal for a "
+             "corner with visibility 0 (default: 0.03 = 3%% of diagonal). "
+             "Scales linearly between 0 (at threshold) and this fraction "
+             "(at visibility 0). Resolution-independent across image sizes.",
+    )
+    parser.add_argument(
+        "--warp-fallback-thresh", type=float, default=0.3,
+        help="If any corner has visibility below this threshold, fall back "
+             "from perspective warp to simple crop and emit a warning. "
+             "Set to 0 to disable warp fallback (default: 0.3).",
     )
 
     args = parser.parse_args()
@@ -3364,6 +3562,10 @@ Coordinates Only (scripting-friendly):
             coords=args.coords,
             debug=args.debug,
             no_image=args.no_image,
+            adaptive_margin=args.adaptive_margin,
+            adaptive_margin_thresh=args.adaptive_margin_thresh,
+            adaptive_margin_max=args.adaptive_margin_max,
+            warp_fallback_thresh=args.warp_fallback_thresh,
         )
     else:
         infer_single(
@@ -3393,6 +3595,10 @@ Coordinates Only (scripting-friendly):
             coords=args.coords,
             debug=args.debug,
             no_image=args.no_image,
+            adaptive_margin=args.adaptive_margin,
+            adaptive_margin_thresh=args.adaptive_margin_thresh,
+            adaptive_margin_max=args.adaptive_margin_max,
+            warp_fallback_thresh=args.warp_fallback_thresh,
         )
 
 

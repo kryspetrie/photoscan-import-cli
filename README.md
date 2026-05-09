@@ -31,8 +31,11 @@ The goal: **automatically detect each photo, locate its four corners precisely, 
 
 ```
 models/
-├── detection_model.onnx        # ONNX export, opset 17, dynamic shapes
-└── pose_model.onnx              # ONNX export, opset 17, dynamic shapes
+├── detection_ep47.onnx        # ONNX export, NMS-enabled (end-to-end)
+├── detection_model.onnx      # ONNX export, legacy format (raw YOLO)
+├── pose_model_v2.onnx        # Multi-class pose model (legacy)
+├── pose_single_ep42.onnx     # Single-class pose model (recommended)
+└── pose_single_ep27.onnx
 
 training/
 └── runs/
@@ -273,8 +276,9 @@ python3 export_onnx.py --all --test
 ```
 
 Produces:
-- `models/detection_model.onnx` — 10.2 MB
-- `models/pose_model.onnx` — 10.0 MB
+- `models/detection_ep47.onnx` — NMS-enabled detection model (recommended)
+- `models/pose_single_ep42.onnx` — Single-class pose model (recommended)
+- Older models (`detection_model.onnx`, `pose_model_v2.onnx`) also supported
 
 Both models use:
 - **ONNX opset 17** — broad runtime compatibility
@@ -406,8 +410,11 @@ photo-pose-detector/
 │   └── export_onnx.py              # ONNX export script (both models)
 │
 ├── models/                          # Exported ONNX models
-│   ├── detection_model.onnx         # 10.2 MB
-│   └── pose_model.onnx              # 10.0 MB
+│   ├── detection_ep47.onnx         # NMS-enabled (recommended)
+├── detection_model.onnx       # Legacy raw YOLO format
+├── pose_model_v2.onnx        # Multi-class pose (legacy)
+├── pose_single_ep42.onnx     # Single-class pose (recommended)
+└── pose_single_ep27.onnx
 │
 ├── extract.py                       # CLI: detect & extract photos from images
 ├── onnx_inference/
