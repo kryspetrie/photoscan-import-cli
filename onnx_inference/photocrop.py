@@ -1169,15 +1169,22 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
     best_results = []
     best_params = []
 
-    total_tier1 = len(tier1_x) * len(tier1_y)
     _log(f"\n{'=' * 90}")
     _log(f"ADAPTIVE X/Y SWEEP  —  {len(detections)} detection(s)")
     _log(f"{'=' * 90}")
+    total_tier1 = len(tier1_x) * len(tier1_y)
     _log(f"  Tier 1 (quick): {tier1_x} x {tier1_y} = {total_tier1} combos")
     if tier3_x or tier3_y:
         _log(f"  Tier 3 (wide):  expand to full grid if needed")
     _log(f"  Refine candidates: top {max_refine_candidates} from tier 1, using {refine_expands}")
     _log(f"  Early stop: vis=4/4 and min_vis >= {early_stop_vis:.2f}")
+
+    # ── "Good enough" threshold for skipping Tier 2 refine ──
+    # If Tier 1 finds 4/4 corners with min_vis at or above this value,
+    # Tier 2 refine is skipped — the result is already good enough for
+    # accurate perspective warp. This defaults to 0.5, which is below
+    # early_stop_vis (0.7) but above the minimum for reliable cropping.
+    _TIER2_SKIP_VIS = 0.50
 
     for det_idx, det in enumerate(detections):
         box = det["box"]
@@ -1242,61 +1249,69 @@ def pose_sweep_xy(detection_session, pose_session, image: Image.Image,
             if early_stop:
                 break
 
-        if early_stop:
-            ex_b, ey_b, rx_b, ry_b = best_combo
-            kps = best_result["keypoints"]
-            vis_values = {kp["name"]: kp["visibility"] for kp in kps}
-            vis_count = sum(1 for v in vis_values.values() if v >= _VIS_THRESH_SWEEP)
-            min_vis = min(vis_values.values())
-            _log(f"  >>> EARLY STOP: expand=({ex_b:.2f},{ey_b:.2f}) no refine  "
-                  f"vis={vis_count}/4 min_vis={min_vis:.3f} >= {early_stop_vis:.2f}")
-        else:
-            # ── Tier 2: Refine the best tier-1 candidates ──
-            tier1_results.sort(key=lambda t: t[3], reverse=True)
-            candidates = tier1_results[:max_refine_candidates]
+        if not early_stop:
+            # ── Post-Tier-1 refinement ──
+            if best_result is not None:
+                # Compute best Tier 1 visibility to decide whether to skip Tier 2
+                kps = best_result["keypoints"]
+                vis_values = {kp["name"]: kp["visibility"] for kp in kps}
+                best_vis_count = sum(1 for v in vis_values.values() if v >= _VIS_THRESH_SWEEP)
+                best_min_vis = min(vis_values.values()) if vis_values else 0.0
 
-            _log(f"  --- Tier 2: refine top {len(candidates)} candidate(s) ---")
-            for ex, ey, t1_result, t1_score in candidates:
-                for re in refine_expands:
-                    refined_box = _keypoints_to_bbox(
-                        t1_result["keypoints"],
-                        margin_x=bw * re, margin_y=bh * re,
-                    )
-                    if refined_box is None:
-                        continue
-                    refined = _run_pose_on_crop(
-                        pose_session, image, refined_box, pose_conf, img_size,
-                        expand_ratio_x=re, expand_ratio_y=re,
-                    )
-                    if refined is None:
-                        continue
+                if best_vis_count == 4 and best_min_vis >= _TIER2_SKIP_VIS:
+                    # ── Tier 1 found 4/4 corners with "good enough" visibility ──
+                    # min_vis is below early_stop_vis but above the practical threshold
+                    # for reliable perspective warp. Tier 2 refine rarely helps here
+                    # because the corners are already well-located.
+                    _log(f"  >>> TIER 2 SKIP: 4/4 corners with min_vis={best_min_vis:.3f} "
+                          f">= {_TIER2_SKIP_VIS:.2f} (good enough for warp)")
+                else:
+                    # ── Tier 2: Refine the best tier-1 candidates ──
+                    tier1_results.sort(key=lambda t: t[3], reverse=True)
+                    candidates = tier1_results[:max_refine_candidates]
 
-                    kps = refined["keypoints"]
-                    vis_values = {kp["name"]: kp["visibility"] for kp in kps}
-                    vis_count = sum(1 for v in vis_values.values()
-                                    if v >= _VIS_THRESH_SWEEP)
-                    min_vis = min(vis_values.values()) if vis_values else 0.0
-                    pose_con = refined["pose_confidence"]
-                    score = (vis_count, min_vis, pose_con)
+                    _log(f"  --- Tier 2: refine top {len(candidates)} candidate(s) ---")
+                    for ex, ey, t1_result, t1_score in candidates:
+                        for re in refine_expands:
+                            refined_box = _keypoints_to_bbox(
+                                t1_result["keypoints"],
+                                margin_x=bw * re, margin_y=bh * re,
+                            )
+                            if refined_box is None:
+                                continue
+                            refined = _run_pose_on_crop(
+                                pose_session, image, refined_box, pose_conf, img_size,
+                                expand_ratio_x=re, expand_ratio_y=re,
+                            )
+                            if refined is None:
+                                continue
 
-                    ll = vis_values.get("LL", 0)
-                    ul = vis_values.get("UL", 0)
-                    ur = vis_values.get("UR", 0)
-                    lr = vis_values.get("LR", 0)
-                    _log(f"  {ex:6.2f} {ey:6.2f} {re:6.2f} {re:6.2f}  "
-                          f"{pose_con:6.3f} {vis_count:4}/4 {min_vis:6.3f}  "
-                          f"{ll:6.3f} {ul:6.3f} {ur:6.3f} {lr:6.3f}")
+                            kps = refined["keypoints"]
+                            vis_values = {kp["name"]: kp["visibility"] for kp in kps}
+                            vis_count = sum(1 for v in vis_values.values()
+                                            if v >= _VIS_THRESH_SWEEP)
+                            min_vis = min(vis_values.values()) if vis_values else 0.0
+                            pose_con = refined["pose_confidence"]
+                            score = (vis_count, min_vis, pose_con)
 
-                    if score > best_score:
-                        best_score = score
-                        best_result = refined
-                        best_combo = (ex, ey, re, re)
+                            ll = vis_values.get("LL", 0)
+                            ul = vis_values.get("UL", 0)
+                            ur = vis_values.get("UR", 0)
+                            lr = vis_values.get("LR", 0)
+                            _log(f"  {ex:6.2f} {ey:6.2f} {re:6.2f} {re:6.2f}  "
+                                  f"{pose_con:6.3f} {vis_count:4}/4 {min_vis:6.3f}  "
+                                  f"{ll:6.3f} {ul:6.3f} {ur:6.3f} {lr:6.3f}")
 
-                    if vis_count == 4 and min_vis >= early_stop_vis:
-                        early_stop = True
-                        break
-                if early_stop:
-                    break
+                            if score > best_score:
+                                best_score = score
+                                best_result = refined
+                                best_combo = (ex, ey, re, re)
+
+                            if vis_count == 4 and min_vis >= early_stop_vis:
+                                early_stop = True
+                                break
+                        if early_stop:
+                            break
 
             # ── Tier 3: Wider search if still not good enough ──
             if not early_stop and (tier3_x or tier3_y):
@@ -2859,6 +2874,50 @@ def infer_single(detection_session, pose_session, image_path: str,
 
             auto_refine=auto_refine,
         )
+
+    # ── Post-sweep CV refinement ──
+    # When sweep is used, cv_refine and auto_refine don't run inside
+    # pipeline() — apply them here on the sweep results instead.
+    #
+    # Optimization: If the sweep found all corners with vis >= 0.5, CV
+    # refinement is unlikely to help (it only affects low-vis corners).
+    # Skip it to save ~280ms per image on "easy" results.
+    _CV_SKIP_VIS = 0.5
+    if (do_pose_sweep_xy or do_pose_sweep):
+        # Check whether all corners are already confident enough
+        all_corners_good = all(
+            kp.get("visibility", 0) >= _CV_SKIP_VIS
+            for res in results
+            for kp in res.get("keypoints", [])
+        )
+        if all_corners_good:
+            if cv_refine:
+                _log(f"  Skipping cv-refine: all corners vis >= {_CV_SKIP_VIS:.2f} after sweep")
+                cv_refine = False
+            if auto_refine:
+                _log(f"  Skipping auto-refine: all corners vis >= {_CV_SKIP_VIS:.2f} after sweep")
+                auto_refine = False
+
+        # Apply CV refinement (if not skipped above)
+        if cv_refine:
+            results = refine_corners_cv(image, results,
+                                         search_radius=cv_refine_radius)
+            _log(f"  Post-sweep cv-refine applied")
+        elif auto_refine:
+            _AUTO_REFINE_VIS_THRESH = 0.3
+            _MIN_VISIBLE_CORNERS = 3
+            needs_refine = any(
+                sum(1 for kp in res.get("keypoints", [])
+                    if kp["visibility"] >= _AUTO_REFINE_VIS_THRESH)
+                < _MIN_VISIBLE_CORNERS
+                for res in results
+            )
+            if needs_refine:
+                results = refine_corners_cv(image, results,
+                                             search_radius=cv_refine_radius)
+                _log(f"  Post-sweep auto-refine applied")
+            else:
+                _log(f"  Skipping auto-refine: all photos have >= {_MIN_VISIBLE_CORNERS} visible corners")
 
     # Print results
     mode = "2-stage" if detection_session else "1-stage (pose only)"
