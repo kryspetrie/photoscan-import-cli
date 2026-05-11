@@ -1,0 +1,56 @@
+============================================================
+CONTINUING YOLO FIDUCIAL CORNER TRAINING (50→100 epochs)
+============================================================
+Weights:     /Users/krys.petrie/dev/photo-pose-detector/training/runs/detect/runs/fiducial/fiducial-corner/weights/best.pt
+Dataset:     /Users/krys.petrie/dev/photo-pose-detector/training/dataset_fiducial.yaml
+Epochs:      100 (extending from 50)
+Patience:    30 (extended from 15)
+Note:        New training run from best 50-epoch weights
+============================================================
+New https://pypi.org/project/ultralytics/8.4.48 available 😃 Update with 'pip install -U ultralytics'
+Ultralytics 8.4.33 🚀 Python-3.12.3 torch-2.2.2 CPU (Intel Core i7-9750H 2.60GHz)
+[34m[1mengine/trainer: [0magnostic_nms=False, amp=True, angle=1.0, augment=False, auto_augment=randaugment, batch=32, bgr=0.0, box=7.5, cache=disk, cfg=None, classes=None, close_mosaic=10, cls=0.5, compile=False, conf=None, copy_paste=0.0, copy_paste_mode=flip, cos_lr=False, cutmix=0.0, data=/Users/krys.petrie/dev/photo-pose-detector/training/dataset_fiducial.yaml, degrees=5.0, deterministic=True, device=cpu, dfl=1.5, dnn=False, dropout=0.0, dynamic=False, embed=None, end2end=None, epochs=100, erasing=0.4, exist_ok=False, fliplr=0.0, flipud=0.0, format=torchscript, fraction=1.0, freeze=None, half=False, hsv_h=0.015, hsv_s=0.5, hsv_v=0.3, imgsz=640, int8=False, iou=0.7, keras=False, kobj=1.0, line_width=None, lr0=0.01, lrf=0.01, mask_ratio=4, max_det=300, mixup=0.0, mode=train, model=/Users/krys.petrie/dev/photo-pose-detector/training/runs/detect/runs/fiducial/fiducial-corner/weights/best.pt, momentum=0.937, mosaic=0.3, multi_scale=0.0, name=fiducial-corner-extended, nbs=64, nms=False, opset=None, optimize=False, optimizer=SGD, overlap_mask=True, patience=30, perspective=0.0, plots=True, pose=12.0, pretrained=True, profile=False, project=runs/fiducial, rect=False, resume=False, retina_masks=False, rle=1.0, save=True, save_conf=False, save_crop=False, save_dir=/Users/krys.petrie/dev/photo-pose-detector/training/runs/detect/runs/fiducial/fiducial-corner-extended, save_frames=False, save_json=False, save_period=-1, save_txt=False, scale=0.3, seed=0, shear=0.0, show=False, show_boxes=True, show_conf=True, show_labels=True, simplify=True, single_cls=False, source=None, split=val, stream_buffer=False, task=detect, time=None, tracker=botsort.yaml, translate=0.1, val=True, verbose=True, vid_stride=1, visualize=False, warmup_bias_lr=0.1, warmup_epochs=3.0, warmup_momentum=0.8, weight_decay=0.0005, workers=8, workspace=None
+
+                   from  n    params  module                                       arguments                     
+  0                  -1  1       464  ultralytics.nn.modules.conv.Conv             [3, 16, 3, 2]                 
+  1                  -1  1      4672  ultralytics.nn.modules.conv.Conv             [16, 32, 3, 2]                
+  2                  -1  1      6640  ultralytics.nn.modules.block.C3k2            [32, 64, 1, False, 0.25]      
+  3                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]                
+  4                  -1  1     26080  ultralytics.nn.modules.block.C3k2            [64, 128, 1, False, 0.25]     
+  5                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]              
+  6                  -1  1     87040  ultralytics.nn.modules.block.C3k2            [128, 128, 1, True]           
+  7                  -1  1    295424  ultralytics.nn.modules.conv.Conv             [128, 256, 3, 2]              
+  8                  -1  1    346112  ultralytics.nn.modules.block.C3k2            [256, 256, 1, True]           
+  9                  -1  1    164608  ultralytics.nn.modules.block.SPPF            [256, 256, 5, 3, True]        
+ 10                  -1  1    249728  ultralytics.nn.modules.block.C2PSA           [256, 256, 1]                 
+ 11                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']          
+ 12             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]                           
+ 13                  -1  1    119808  ultralytics.nn.modules.block.C3k2            [384, 128, 1, True]           
+ 14                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']          
+ 15             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]                           
+ 16                  -1  1     34304  ultralytics.nn.modules.block.C3k2            [256, 64, 1, True]            
+ 17                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]                
+ 18            [-1, 13]  1         0  ultralytics.nn.modules.conv.Concat           [1]                           
+ 19                  -1  1     95232  ultralytics.nn.modules.block.C3k2            [192, 128, 1, True]           
+ 20                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]              
+ 21            [-1, 10]  1         0  ultralytics.nn.modules.conv.Concat           [1]                           
+ 22                  -1  1    463104  ultralytics.nn.modules.block.C3k2            [384, 256, 1, True, 0.5, True]
+ 23        [16, 19, 22]  1    242736  ultralytics.nn.modules.head.Detect           [4, 1, True, [64, 128, 256]]  
+YOLO26n summary: 260 layers, 2,505,360 parameters, 2,505,360 gradients, 5.8 GFLOPs
+
+Transferred 708/708 items from pretrained weights
+[34m[1mtrain: [0mFast image access ✅ (ping: 0.0±0.0 ms, read: 116.1±30.0 MB/s, size: 80.8 KB)
+[K[34m[1mtrain: [0mScanning /Users/krys.petrie/dev/photo-pose-detector/data_fiducial/labels/train.cache... 2000 images, 0 backgrounds, 0 corrupt: 100% ━━━━━━━━━━━━ 2000/2000 111.8Mit/s 0.0s
+[K[34m[1mtrain: [0mCaching images (1.1GB Disk): 49% ━━━━━╸────── 971/2000 2.7Kit/s 0.1s<0.4s[K[34m[1mtrain: [0mCaching images (2.3GB Disk): 100% ━━━━━━━━━━━━ 2000/2000 15.4Kit/s 0.1s
+[34m[1mval: [0mFast image access ✅ (ping: 0.2±0.5 ms, read: 88.9±24.4 MB/s, size: 84.6 KB)
+[K[34m[1mval: [0mScanning /Users/krys.petrie/dev/photo-pose-detector/data_fiducial/labels/val.cache... 500 images, 0 backgrounds, 0 corrupt: 100% ━━━━━━━━━━━━ 500/500 99.9Mit/s 0.0s
+[K[34m[1mval: [0mCaching images (0.6GB Disk): 100% ━━━━━━━━━━━━ 500/500 27.8Kit/s 0.0s
+[34m[1moptimizer:[0m SGD(lr=0.01, momentum=0.937) with parameter groups 114 weight(decay=0.0), 126 weight(decay=0.0005), 126 bias(decay=0.0)
+Plotting labels to /Users/krys.petrie/dev/photo-pose-detector/training/runs/detect/runs/fiducial/fiducial-corner-extended/labels.jpg... 
+Image sizes 640 train, 640 val
+Using 0 dataloader workers
+Logging results to [1m/Users/krys.petrie/dev/photo-pose-detector/training/runs/detect/runs/fiducial/fiducial-corner-extended[0m
+Starting training for 100 epochs...
+
+      Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size
+[K      1/100         0G      1.277      1.521     0.0225         34        640: 0% ──────────── 0/63  38.2s[K      1/100         0G      1.242      1.559    0.02082         38        640: 2% ──────────── 1/63 119.8s/it 1:14<2:03:45[K      1/100         0G      1.243       1.57    0.02083         41        640: 3% ──────────── 2/63 79.3s/it 1:58<1:20:37[K      1/100         0G      1.251      1.584    0.02102         39        640: 5% ╸─────────── 3/63 61.8s/it 2:39<1:01:45[K      1/100         0G      1.257      1.569    0.02127         40        640: 6% ╸─────────── 4/63 54.3s/it 3:22<53:22[K      1/100         0G      1.228      1.527    0.02107         32        640: 8% ╸─────────── 5/63 48.4s/it 4:00<46:48[K      1/100         0G      1.242       1.53    0.02129         34        640: 10% ━─────────── 6/63 44.6s/it 4:38<42:21[K      1/100         0G      1.254      1.537    0.02151         38        640: 11% ━─────────── 7/63 33.7s/it 4:59<31:30[K      1/100         0G      1.262       1.54     0.0215         45        640: 13% ━╸────────── 8/63 32.7s/it 5:30<29:60[K      1/100         0G      1.267      1.572    0.02137         40        640: 14% ━╸────────── 9/63 33.9s/it 6:07<30:28[K      1/100         0G      1.259      1.567    0.02122         36        640: 16% ━╸────────── 10/63 35.5s/it 6:47<31:22[K      1/100         0G      1.256      1.554    0.02132         34        640: 17% ━━────────── 11/63 36.2s/it 7:25<31:25[K      1/100         0G       1.25      1.552    0.02123         36        640: 19% ━━────────── 12/63 36.3s/it 8:01<30:52[K      1/100         0G       1.25      1.562    0.02119         43        640: 21% ━━────────── 13/63 38.8s/it 8:47<32:20[K      1/100         0G      1.251      1.554    0.02123         35        640: 22% ━━╸───────── 14/63 40.5s/it 9:32<33:03[K      1/100         0G      1.253      1.562     0.0212         37        640: 24% ━━╸───────── 15/63 42.0s/it 10:18<33:34[K      1/100         0G      1.247      1.559    0.02102         38        640: 25% ━━━───────── 16/63 41.1s/it 10:58<32:11[K      1/100         0G      1.245      1.555    0.02099         35        640: 27% ━━━───────── 17/63 41.1s/it 11:39<31:30[K      1/100         0G      1.248      1.555    0.02108         38        640: 29% ━━━───────── 18/63 40.6s/it 12:18<30:26[K      1/100         0G      1.248      1.564    0.02093         45        640: 30% ━━━╸──────── 19/63 41.1s/it 13:00<30:07[K      1/100         0G      1.246      1.566    0.02085         38        640: 32% ━━━╸──────── 20/63 37.3s/it 13:31<26:45[K      1/100         0G      1.251       1.57    0.02092         41        640: 33% ━━━━──────── 21/63 35.8s/it 14:04<25:03[K      1/100         0G      1.257      1.571    0.02101         37        640: 35% ━━━━──────── 22/63 34.2s/it 14:35<23:24[K      1/100         0G      1.252      1.564      0.021         34        640: 37% ━━━━──────── 23/63 35.2s/it 15:12<23:27[K      1/100         0G      1.261      1.562    0.02128         33        640: 38% ━━━━╸─────── 24/63 37.7s/it 15:58<24:30[K      1/100         0G      1.265       1.56    0.02139         37        640: 40% ━━━━╸─────── 25/63 39.2s/it 16:41<24:51[K      1/100         0G      1.267      1.562    0.02138         44        640: 41% ━━━━╸─────── 26/63 40.5s/it 17:25<24:59[K      1/100         0G      1.263      1.562    0.02129         37        640: 43% ━━━━━─────── 27/63 40.8s/it 18:06<24:27[K      1/100         0G      1.261      1.554    0.02125         38        640: 44% ━━━━━─────── 28/63 40.8s/it 18:47<23:47

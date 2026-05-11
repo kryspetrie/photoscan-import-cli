@@ -10,6 +10,7 @@ data_pose/
 data_pose_multi/
 test/
 tests/
+data_fiducial/
 
 # Python
 __pycache__/

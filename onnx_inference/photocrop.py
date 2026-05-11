@@ -159,6 +159,15 @@ _VIS_THRESH_SWEEP = 0.30      # visibility threshold for sweep scoring
 _SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DETECTION_MODEL = _SCRIPT_DIR / ".." / "models" / "detection_ep47.onnx"
 DEFAULT_POSE_MODEL = _SCRIPT_DIR / ".." / "models" / "pose_single_ep42.onnx"
+DEFAULT_FIDUCIAL_MODEL = _SCRIPT_DIR / ".." / "models" / "fiducial_corner.onnx"
+
+# Fiducial corner class IDs (4-class detection model)
+FIDUCIAL_CLASS_UL = 0
+FIDUCIAL_CLASS_UR = 1
+FIDUCIAL_CLASS_LL = 2
+FIDUCIAL_CLASS_LR = 3
+FIDUCIAL_CLASS_NAMES = {0: 'UL', 1: 'UR', 2: 'LL', 3: 'LR'}
+FIDUCIAL_CROP_SIZE = 640   # Input size for the fiducial model
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +436,276 @@ def run_pose(session, crop: Image.Image, conf_threshold: float = 0.5,
         })
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Stage 2b: Fiducial corner detection
+# ---------------------------------------------------------------------------
+#
+# The fiducial model is a single 4-class YOLO detector (UL, UR, LL, LR)
+# that finds precise corner positions from the L-shaped photo/background
+# boundary pattern. It can be used standalone (detection → fiducial) or
+# combined with the pose model for better initial corner estimates
+# (detection → pose → fiducial).
+#
+# Recommended pipeline for maximum accuracy:
+#   detection → pose (approximate corners) → fiducial (precise refinement) → warp
+# ---------------------------------------------------------------------------
+
+def run_fiducial(session, crop: Image.Image, conf_threshold: float = 0.5,
+                 img_size: int = FIDUCIAL_CROP_SIZE):
+    """Run the fiducial corner detection model on a PIL Image crop.
+
+    The model detects corners and classifies them as UL(0), UR(1), LL(2), LR(3).
+
+    Args:
+        session: ONNX inference session for the fiducial model.
+        crop: PIL Image crop (typically centered near a corner).
+        conf_threshold: Minimum confidence to keep a detection.
+        img_size: Model input size (default 640).
+
+    Returns:
+        list of dict with keys:
+            box: dict with x1, y1, x2, y2 in original crop pixel coords
+            confidence: detection confidence
+            class_id: 0=UL, 1=UR, 2=LL, 3=LR
+            center_x, center_y: bbox center (≈ corner position) in crop coords
+    """
+    crop_w, crop_h = crop.size
+    input_arr, scale_info = preprocess_letterbox(crop, img_size)
+
+    input_name = session.get_inputs()[0].name
+    output = session.run(None, {input_name: input_arr})[0]
+
+    ratio = scale_info["ratio"]
+    pad_w = scale_info["pad_w"]
+    pad_h = scale_info["pad_h"]
+
+    results = []
+
+    # Handle two output formats:
+    #   Per-row: (1, N, 6) with [x_center, y_center, w, h, conf, class]
+    #   Per-column: (1, 6, N) with [x1, y1, x2, y2, conf, class]
+    if len(output.shape) == 3 and output.shape[2] == 6:
+        # Per-row format
+        for i in range(output.shape[1]):
+            cx = output[0, i, 0]
+            cy = output[0, i, 1]
+            w = output[0, i, 2]
+            h = output[0, i, 3]
+            conf = output[0, i, 4]
+            cls = output[0, i, 5]
+
+            if conf < conf_threshold:
+                continue
+
+            # Map from letterboxed model space → original crop coords
+            orig_cx = (cx - pad_w) / ratio
+            orig_cy = (cy - pad_h) / ratio
+            orig_w = w / ratio
+            orig_h = h / ratio
+
+            results.append({
+                "box": {
+                    "x1": orig_cx - orig_w / 2,
+                    "y1": orig_cy - orig_h / 2,
+                    "x2": orig_cx + orig_w / 2,
+                    "y2": orig_cy + orig_h / 2,
+                },
+                "confidence": float(conf),
+                "class_id": int(cls),
+                "center_x": orig_cx,
+                "center_y": orig_cy,
+            })
+    elif len(output.shape) == 3 and output.shape[1] == 6:
+        # Per-column format (1, 6, N)
+        num_anchors = output.shape[2]
+        for i in range(num_anchors):
+            x1 = output[0, 0, i]
+            y1 = output[0, 1, i]
+            x2 = output[0, 2, i]
+            y2 = output[0, 3, i]
+            conf = output[0, 4, i]
+            cls = output[0, 5, i]
+
+            if conf < conf_threshold:
+                continue
+
+            ox1 = (x1 - pad_w) / ratio
+            oy1 = (y1 - pad_h) / ratio
+            ox2 = (x2 - pad_w) / ratio
+            oy2 = (y2 - pad_h) / ratio
+
+            results.append({
+                "box": {
+                    "x1": float(ox1),
+                    "y1": float(oy1),
+                    "x2": float(ox2),
+                    "y2": float(oy2),
+                },
+                "confidence": float(conf),
+                "class_id": int(cls),
+                "center_x": float((ox1 + ox2) / 2),
+                "center_y": float((oy1 + oy2) / 2),
+            })
+
+    return results
+
+
+def extract_fiducial_crop(image: Image.Image, x, y, crop_size: int = FIDUCIAL_CROP_SIZE):
+    """Extract a square crop centered on (x, y) from a PIL Image.
+
+    If the crop would extend beyond the image boundary, it is shifted
+    to stay within bounds. The returned crop is always crop_size × crop_size
+    (padded with grey if the image is too small).
+
+    Args:
+        image: PIL Image
+        x, y: Center point in original image coordinates (float)
+        crop_size: Size of the square crop (default: 640)
+
+    Returns:
+        crop: PIL Image (crop_size × crop_size)
+        offset_x, offset_y: top-left corner of the crop in original image coords
+    """
+    orig_w, orig_h = image.size
+    half = crop_size // 2
+
+    # Center the crop on (x, y) but clamp to image bounds
+    x1 = int(round(x - half))
+    y1 = int(round(y - half))
+
+    if x1 < 0:
+        x1 = 0
+    if y1 < 0:
+        y1 = 0
+    if x1 + crop_size > orig_w:
+        x1 = orig_w - crop_size
+    if y1 + crop_size > orig_h:
+        y1 = orig_h - crop_size
+
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(orig_w, x1 + crop_size)
+    y2 = min(orig_h, y1 + crop_size)
+
+    crop = image.crop((x1, y1, x2, y2))
+
+    if crop.size[0] < crop_size or crop.size[1] < crop_size:
+        padded = Image.new("RGB", (crop_size, crop_size), (114, 114, 114))
+        padded.paste(crop, (0, 0))
+        crop = padded
+
+    return crop, x1, y1
+
+
+def refine_corners_fiducial(image: Image.Image, result: dict,
+                             fiducial_session, iterations: int = 2,
+                             conf_threshold: float = 0.5):
+    """Refine the 4 corners of a detected photo using the fiducial model.
+
+    For each corner:
+      1. Extract a 640×640 crop around the approximate corner position
+      2. Run the fiducial model to detect the corner
+      3. Map the detected corner back to full image coordinates
+      4. Optionally iterate: re-crop around the detected position
+
+    The initial corner positions come from the pose model keypoints
+    in the result dict. The fiducial model refines them to pixel precision.
+
+    Args:
+        image: Full input PIL Image
+        result: Pipeline result dict with 'keypoints' list and 'detection'/'box'
+        fiducial_session: ONNX model session for the fiducial model
+        iterations: Number of refinement iterations (default 2)
+        conf_threshold: Minimum detection confidence for the fiducial model
+
+    Returns:
+        The same result dict with updated keypoint coordinates and
+        visibility boosted to 1.0 for successfully refined corners.
+        Corners that couldn't be refined are left unchanged.
+    """
+    kps = {kp["name"]: kp for kp in result.get("keypoints", [])}
+    box = result["detection"]["box"]
+
+    # Bbox corner positions as fallback starting points
+    bbox_corners = {
+        "UL": (box["x1"], box["y1"]),
+        "UR": (box["x2"], box["y1"]),
+        "LL": (box["x1"], box["y2"]),
+        "LR": (box["x2"], box["y2"]),
+    }
+
+    # Use pose keypoints as starting points, fall back to bbox corners
+    approx_corners = {}
+    for name in ["UL", "UR", "LL", "LR"]:
+        if name in kps and kps[name]["visibility"] >= 0.1:
+            approx_corners[name] = (kps[name]["x"], kps[name]["y"])
+        else:
+            approx_corners[name] = bbox_corners[name]
+
+    expected_classes = {
+        "UL": FIDUCIAL_CLASS_UL,
+        "UR": FIDUCIAL_CLASS_UR,
+        "LL": FIDUCIAL_CLASS_LL,
+        "LR": FIDUCIAL_CLASS_LR,
+    }
+
+    refined_corners = {}
+
+    for corner_name, (ax, ay) in approx_corners.items():
+        expected_class = expected_classes[corner_name]
+        best_detection = None
+
+        for iteration in range(iterations):
+            crop, offset_x, offset_y = extract_fiducial_crop(image, ax, ay)
+
+            detections = run_fiducial(fiducial_session, crop,
+                                       conf_threshold=conf_threshold)
+
+            if not detections:
+                break
+
+            # Prefer detections matching the expected class
+            class_matches = [d for d in detections if d["class_id"] == expected_class]
+
+            if class_matches:
+                best = max(class_matches, key=lambda d: d["confidence"])
+            else:
+                # Fallback: use highest confidence detection of any class
+                best = max(detections, key=lambda d: d["confidence"])
+
+            # Map back to full image coordinates
+            ax = best["center_x"] + offset_x
+            ay = best["center_y"] + offset_y
+            best_detection = best
+
+        if best_detection is not None:
+            refined_corners[corner_name] = (ax, ay)
+        else:
+            # Keep the original (unrefined) position
+            refined_corners[corner_name] = approx_corners[corner_name]
+
+    # Update the result dict with refined positions
+    for name in ["UL", "UR", "LL", "LR"]:
+        if name in refined_corners:
+            rx, ry = refined_corners[name]
+            if name in kps:
+                # Update existing keypoint
+                kps[name]["x"] = rx
+                kps[name]["y"] = ry
+                if best_detection is not None or name in kps:
+                    kps[name]["visibility"] = 1.0  # Fiducial-refined corners are high-confidence
+            else:
+                # Add missing keypoint
+                result.setdefault("keypoints", []).append({
+                    "name": name,
+                    "x": rx,
+                    "y": ry,
+                    "visibility": 1.0,
+                })
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2832,7 +3111,10 @@ def infer_single(detection_session, pose_session, image_path: str,
                  adaptive_margin: bool = False,
                  adaptive_margin_thresh: float = 0.5,
                  adaptive_margin_max: float = 0.03,
-                 warp_fallback_thresh: float = 0.3):
+                 warp_fallback_thresh: float = 0.3,
+                 fiducial_session=None,
+                 fiducial_iterations: int = 2,
+                 fiducial_conf: float = 0.5):
     """Run the full pipeline on a single image."""
 
     # Open image and capture EXIF before converting (convert creates
@@ -2919,6 +3201,18 @@ def infer_single(detection_session, pose_session, image_path: str,
             else:
                 _log(f"  Skipping auto-refine: all photos have >= {_MIN_VISIBLE_CORNERS} visible corners")
 
+    # ── Fiducial corner refinement ──
+    # After pose (+ optional CV refinement), run the fiducial corner model
+    # to refine corner positions to pixel precision. Each corner is localized
+    # by cropping around it and detecting the L-shaped boundary pattern.
+    if fiducial_session is not None and results:
+        _log(f"  Fiducial refinement: {fiducial_iterations} iteration(s)")
+        for res in results:
+            refine_corners_fiducial(image, res, fiducial_session,
+                                     iterations=fiducial_iterations,
+                                     conf_threshold=fiducial_conf)
+        _log(f"  Fiducial refinement complete")
+
     # Print results
     mode = "2-stage" if detection_session else "1-stage (pose only)"
     if do_pose_sweep:
@@ -2933,6 +3227,8 @@ def infer_single(detection_session, pose_session, image_path: str,
         mode += " + cv-refine"
     if auto_refine:
         mode += " + auto-refine"
+    if fiducial_session is not None:
+        mode += " + fiducial"
     _log(f"Mode: {mode}")
     _log(f"\n{'=' * 60}")
     _log(f"Image: {image_path}")
@@ -3059,7 +3355,10 @@ def infer_batch(detection_session, pose_session, image_dir: str,
                adaptive_margin: bool = False,
                adaptive_margin_thresh: float = 0.5,
                adaptive_margin_max: float = 0.03,
-               warp_fallback_thresh: float = 0.3):
+               warp_fallback_thresh: float = 0.3,
+               fiducial_session=None,
+               fiducial_iterations: int = 2,
+               fiducial_conf: float = 0.5):
 
     image_dir = Path(image_dir)
     extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
@@ -3109,6 +3408,9 @@ def infer_batch(detection_session, pose_session, image_dir: str,
             adaptive_margin_thresh=adaptive_margin_thresh,
             adaptive_margin_max=adaptive_margin_max,
             warp_fallback_thresh=warp_fallback_thresh,
+            fiducial_session=fiducial_session,
+            fiducial_iterations=fiducial_iterations,
+            fiducial_conf=fiducial_conf,
         )
         pose_ok = sum(1 for r in results if r.get("keypoints"))
         summary.append({
@@ -3536,6 +3838,25 @@ Coordinates Only (scripting-friendly):
              "from perspective warp to simple crop and emit a warning. "
              "Set to 0 to disable warp fallback (default: 0.3).",
     )
+    parser.add_argument(
+        "--fiducial-model", type=str, default=None,
+        help="Path to fiducial corner ONNX model. When provided, runs "
+             "fiducial corner refinement after pose detection to refine "
+             "corner positions to pixel precision. Each corner is localized "
+             "by cropping around it and detecting the L-shaped boundary pattern. "
+             "Default: disabled (no fiducial refinement).",
+    )
+    parser.add_argument(
+        "--fiducial-iterations", type=int, default=2,
+        help="Number of fiducial refinement iterations. Each iteration re-crops "
+             "around the detected corner position for higher precision. "
+             "(default: 2)",
+    )
+    parser.add_argument(
+        "--fiducial-conf", type=float, default=0.5,
+        help="Confidence threshold for the fiducial corner detection model. "
+             "(default: 0.5)",
+    )
 
     args = parser.parse_args()
 
@@ -3563,6 +3884,16 @@ Coordinates Only (scripting-friendly):
     # Load pose model
     _log(f"Loading pose model: {pose_model_path}")
     pose_session = load_onnx_model(str(pose_model_path))
+
+    # Load fiducial model (optional)
+    fiducial_session = None
+    if args.fiducial_model:
+        fiducial_model_path = Path(args.fiducial_model).resolve()
+        if not fiducial_model_path.exists():
+            _log(f"Error: Fiducial model not found: {fiducial_model_path}")
+            sys.exit(1)
+        _log(f"Loading fiducial model: {fiducial_model_path}")
+        fiducial_session = load_onnx_model(str(fiducial_model_path))
 
     # Validate image path and auto-detect file vs directory mode
     image_path = Path(args.image)
@@ -3625,6 +3956,9 @@ Coordinates Only (scripting-friendly):
             adaptive_margin_thresh=args.adaptive_margin_thresh,
             adaptive_margin_max=args.adaptive_margin_max,
             warp_fallback_thresh=args.warp_fallback_thresh,
+            fiducial_session=fiducial_session,
+            fiducial_iterations=args.fiducial_iterations,
+            fiducial_conf=args.fiducial_conf,
         )
     else:
         infer_single(
@@ -3658,6 +3992,9 @@ Coordinates Only (scripting-friendly):
             adaptive_margin_thresh=args.adaptive_margin_thresh,
             adaptive_margin_max=args.adaptive_margin_max,
             warp_fallback_thresh=args.warp_fallback_thresh,
+            fiducial_session=fiducial_session,
+            fiducial_iterations=args.fiducial_iterations,
+            fiducial_conf=args.fiducial_conf,
         )
 
 
