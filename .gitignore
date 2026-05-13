@@ -11,6 +11,9 @@ data_pose_multi/
 test/
 tests/
 data_fiducial/
+data_fiducial_binary/
+
+REMOVED/
 
 # Python
 __pycache__/
