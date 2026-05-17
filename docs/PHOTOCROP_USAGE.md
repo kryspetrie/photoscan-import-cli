@@ -5,16 +5,16 @@ Detect and extract individual photographs from multi-photo scans. Feed it a scan
 ## Quick Start
 
 ```bash
-# Just detect and output coordinates (~5s)
+# Just detect and output coordinates (~1s)
 photocrop --image scan.jpg --preset quick
 
-# Crop photos with auto-refine (~7s, recommended starting point)
+# Crop photos with auto-refine (~1s, recommended starting point)
 photocrop --image scan.jpg --preset crop
 
-# Perspective warp with white fill (~5s, clean edges)
+# Perspective warp with white fill (~1s, clean edges)
 photocrop --image scan.jpg --preset warp
 
-# Best quality for tight layouts (~15s)
+# Best quality — recovers invisible corners (~3s)
 photocrop --image scan.jpg --preset best
 
 # Show annotated detection image (not saved by default)
@@ -52,13 +52,19 @@ Input Image
     │
     ▼ (optional stages)
 ┌─────────────────────┐
-│  4. CV Refinement    │  Edge detection + line intersection
-│     (auto or manual) │  Fixes inaccurate NN-predicted corners
+│  4. Corner Refinement│  Recover invisible/low-vis corners
+│    (--corner-refine) │  Crops around each corner → runs model again
 └─────────────────────┘
     │
     ▼
 ┌─────────────────────┐
-│  5. Crop / Warp      │  Extract each photo individually
+│  5. CV Refinement    │  Edge detection + line intersection
+│     (auto or manual)│  Fixes inaccurate NN-predicted corners
+└─────────────────────┘
+    │
+    ▼
+┌─────────────────────┐
+│  6. Crop / Warp      │  Extract each photo individually
 └─────────────────────┘
 ```
 
@@ -79,10 +85,10 @@ The most common issues and their solutions:
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| **Photos too close together** | Default 15% crop expand includes adjacent photo | Use `--pose-sweep-xy` or `--preset best` |
+| **Invisible corners** | Corners occluded by shadow, glare, or edge | Use `--corner-refine` (included in best preset) |
 | **Tiny "strip" crops** | Fewer than 3 visible corners → crop collapses | Use `--auto-refine` (included in crop/warp/best presets) |
 | **Inaccurate corners** | NN prediction is approximate | Use `--cv-refine` (included in best preset) |
-| **Detects wrong photo** | Detection box too large, captures neighbor | Use `--pose-sweep-xy` |
+| **Detects wrong photo** | Detection box too large, captures neighbor | Use `--corner-refine` which re-crops around each corner |
 
 ---
 
@@ -92,23 +98,26 @@ Presets bundle common settings. Any individual flag can override a preset value.
 
 | Preset | What it does | Time | Use when |
 |--------|-------------|------|----------|
-| **quick** | Detect + pose only, no cropping | ~5s | You only need coordinates, no crops |
-| **crop** | + auto-refine + adaptive margin + simple-corners crop | ~7s | You want rectangular crops with margin |
-| **warp** | + auto-refine + adaptive margin + perspective warp | ~5s | You want perspective-corrected crops |
-| **best** | + sweep + cv-refine + auto-refine + adaptive margin + warp | ~15s | Photos are close together; maximum quality |
+| **quick** | Detect + pose only, no cropping | ~1s | You only need coordinates, no crops |
+| **crop** | + auto-refine + adaptive margin + simple-corners crop | ~1s | You want rectangular crops with margin |
+| **warp** | + auto-refine + adaptive margin + perspective warp | ~1s | You want perspective-corrected crops |
+| **best** | + corner-refine + cv-refine + auto-refine + adaptive margin + warp | ~3s | Invisible corners or maximum quality |
 
 ```bash
-# Crop photos out with ~2% margin, auto-fixing bad corners
+# Crop photos with ~2% margin, auto-fixing bad corners
 photocrop --image scan.jpg --preset crop
 
 # Perspective warp with clean white borders
 photocrop --image scan.jpg --preset warp
 
-# Tight layout — best quality with adaptive crop sizing
+# Best quality — recovers invisible corners
 photocrop --image scan.jpg --preset best
 
 # Combine: best preset but override the margin
 photocrop --image scan.jpg --preset best --crop-margin 0.03
+
+# Corner refinement with detection model instead of pose
+photocrop --image scan.jpg --corner-refine --corner-refine-model detection
 ```
 
 ---
@@ -152,6 +161,38 @@ photocrop --image scan.jpg --preset best --crop-margin 0.03
 |------|---------|-------------|
 | `--pose-refine` | off | Run a second pose pass with a tighter crop derived from the first pass keypoints. Helps when the initial detection box is loose |
 | `--pose-refine-expand` | 0.05 | Expansion for the refine crop (fraction). Only used with `--pose-refine` |
+
+### Corner Refinement
+
+Crops around each approximate corner position and runs the model again to recover corners that the initial pose pass couldn't see (low visibility, occluded by shadow or glare). This is the recommended approach for photos with invisible corners — it replaces the sweep-based approach (which was slower and less effective).
+
+**How it works:**
+1. For each corner (UL, UR, LL, LR), crop a region around the approximate position
+2. Run the pose or detection model on that crop
+3. For the **pose model** (default): find the matching named keypoint directly — no classification needed
+4. For the **detection model**: use the relevant bounding box corner (UL→(x1,y1), etc.) — pure geometry, no extra model needed
+5. Validate that the refined position is close to the original (rejects if moved >30% of crop size)
+6. Optionally iterate for higher precision
+
+**Crop size** is automatically computed from the photo's bounding box (1.2× the max dimension, minimum 640px) so the photo doesn't fill the entire crop.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--corner-refine` | off | Enable corner refinement after pose detection |
+| `--corner-refine-iterations` | 2 | Number of refinement iterations. Each iteration re-crops around the detected position |
+| `--corner-refine-conf` | 0.5 | Confidence threshold for corner refinement model |
+| `--corner-refine-model` | `pose` | Model to use: `pose` (default, uses named keypoints — faster and more precise) or `detection` (uses bounding box corners — no extra model session needed) |
+
+```bash
+# Enable corner refinement (recommended for best quality)
+photocrop --image scan.jpg --preset best
+
+# Corner refinement with detection model (use if you don't have a pose session)
+photocrop --image scan.jpg --corner-refine --corner-refine-model detection --crop warp
+
+# Single iteration (faster, usually sufficient)
+photocrop --image scan.jpg --corner-refine --corner-refine-iterations 1 --crop warp
+```
 
 ### Sweep (Adaptive Crop Sizing)
 
@@ -385,6 +426,8 @@ photocrop --image scan.jpg --preset warp --warp-fallback-thresh 0
 
 ## Understanding Sweep
 
+> **Note:** Sweep has been superseded by corner refinement (`--corner-refine`), which is both faster and more effective at recovering invisible corners. Sweep tries different crop sizes to find one where all corners are visible (adding ~6s), while corner refinement re-runs the model on each corner individually (adding ~1.8s). The `--preset best` now uses corner refinement instead of sweep. Sweep is still available for edge cases.
+
 The pose model needs some surrounding context to find corners, so it expands the crop from the detection box by `--pose-crop-expand` (default 15%). When photos are close together, this expansion can include parts of an adjacent photo, causing the pose model to detect the wrong photo's corners.
 
 Sweep solves this by trying multiple expand sizes and picking the one where the pose model is most confident (measured by corner visibility).
@@ -395,8 +438,11 @@ Sweep solves this by trying multiple expand sizes and picking the one where the 
 | `--pose-sweep-xy` | Per-axis (X/E-W, Y/N-S) expand values independently | **Tight layouts where photos are side by side** |
 
 ```bash
-# Add sweep to any preset (adds ~3x processing time)
+# Add sweep to any preset (adds ~6s, slower than corner refinement)
 photocrop --image scan.jpg --preset warp --pose-sweep-xy
+
+# Recommended instead: corner refinement (adds ~1.8s, better results)
+photocrop --image scan.jpg --preset best
 ```
 
 ---
@@ -439,17 +485,28 @@ Approximate processing times for a 1512×2016 scan with 4 photos:
 
 | Command | Time | Quality |
 |---------|------|---------|
-| `--preset quick` | ~5s | Annotated output only |
-| `--preset crop` | ~5-7s | Good crops with auto-refine safety net |
-| `--preset warp` | ~5s | Good perspective warps with auto-refine |
-| `--preset best` | ~15-20s | Maximum quality, sweep + cv-refine |
+| `--preset quick` | ~1s | Annotated output only |
+| `--preset crop` | ~1s | Good crops with auto-refine safety net |
+| `--preset warp` | ~1s | Good perspective warps with auto-refine |
+| `--preset best` | ~3s | Maximum quality, recovers invisible corners |
+
+### Corner Refinement Performance
+
+| Mode | Time (4 photos) | Per-photo | Inference calls |
+|------|----------------|-----------|-----------------|
+| Baseline (no refine) | ~700ms | ~175ms | 1 det + 4 pose |
+| + Corner refine (pose) | ~2,500ms | ~625ms | + 16 pose (4 corners × 4 photos) |
+| + Corner refine (detection) | ~1,900ms | ~475ms | + 13 det (varies by expand retries) |
+
+Corner refinement adds ~1.8s for 4 photos using the pose model. Each corner is a single model inference (~120ms for pose, ~65ms for detection). The 16 pose calls are independent and can be parallelized — see below.
 
 ### Speed Tips
 
-- **For well-separated photos:** `--preset warp` is fast and sufficient. Sweep adds little value when photos aren't close together.
-- **For tight layouts:** `--preset best` (which includes sweep) is worth the extra time.
-- **For batch processing:** Use `--preset warp` for speed, and inspect results. Re-run any failures with `--preset best`.
-- **Skip detection:** If you know the image contains exactly one photo, you can skip the detection model and run pose directly (currently requires API usage, not CLI).
+- **For well-separated photos:** `--preset warp` is fast and sufficient. Corner refinement adds little when all corners are already visible.
+- **For invisible/occluded corners:** `--preset best` (which includes corner refinement) recovers them reliably at ~3s total.
+- **For batch processing:** Use `--preset warp` for speed. Re-run any failures with `--preset best`.
+- **Detection model for refinement:** Use `--corner-refine-model detection` if you don't have a pose session loaded. Less precise but no additional model needed.
+- **Single iteration:** Use `--corner-refine-iterations 1` for faster refinement (usually sufficient since the first iteration almost always succeeds).
 
 ---
 
@@ -472,9 +529,11 @@ results = pipeline(
     detection_session=det_session,
     pose_session=pose_session,
     image=image,
-    cv_refine=True,          # Optional: CV corner refinement
-    auto_refine=True,         # Optional: auto-fix broken corners
-    pose_sweep_xy=True,       # Optional: adaptive crop sizing
+    corner_refine=True,       # Recover invisible corners
+    corner_refine_iterations=2,
+    corner_refine_model="pose",  # or "detection"
+    auto_refine=True,         # Auto-fix broken corners
+    cv_refine=True,           # CV edge-based corner refinement
 )
 
 # Each result has:

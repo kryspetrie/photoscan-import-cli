@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Corner Annotator</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1a1a2e;color:#e0e0e0;font-family:-apple-system,system-ui,sans-serif;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+.toolbar{display:flex;align-items:center;gap:12px;padding:8px 16px;background:#16213e;border-bottom:1px solid #0f3460;flex-shrink:0}
+.toolbar button{background:#0f3460;color:#e0e0e0;border:1px solid #1a5276;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:13px}
+.toolbar button:hover{background:#1a5276}
+.spacer{flex:1}
+.hint{color:#a0a0c0;font-size:13px}
+.canvas-wrap{flex:1;overflow:hidden;position:relative;background:#0a0a1a;cursor:crosshair}
+canvas{position:absolute;top:0;left:0}
+.sidebar{width:280px;background:#16213e;border-left:1px solid #0f3460;padding:12px;overflow-y:auto;flex-shrink:0}
+.sidebar h3{color:#e94560;margin-bottom:8px;font-size:14px}
+.photo-group{margin-bottom:12px;padding:8px;border-radius:4px;background:#1a1a3e}
+.photo-group .label{font-weight:bold;font-size:13px;margin-bottom:4px}
+.photo-group .corner{font-size:12px;color:#a0a0c0;font-family:monospace;padding:1px 0}
+.json-area{width:100%;height:180px;background:#0a0a1a;border:1px solid #0f3460;color:#a0d0a0;font-family:monospace;font-size:11px;padding:6px;resize:vertical;margin-top:8px;border-radius:4px}
+.main-area{display:flex;flex:1;overflow:hidden}
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <button id="loadBtn">Load Image</button>
+  <button id="undoBtn">Undo</button>
+  <button id="resetPhotoBtn">Clear Photo</button>
+  <button id="resetBtn">Clear All</button>
+  <div class="spacer"></div>
+  <span class="hint" id="hint">Click "Load Image" to start</span>
+</div>
+<div class="main-area">
+  <div class="canvas-wrap" id="canvasWrap">
+    <canvas id="canvas"></canvas>
+  </div>
+  <div class="sidebar">
+    <h3>Corners</h3>
+    <div id="photoList"></div>
+    <h3 style="margin-top:16px">JSON Output</h3>
+    <textarea class="json-area" id="jsonArea" readonly></textarea>
+    <button id="copyBtn" style="margin-top:6px;width:100%;background:#0f3460;color:#e0e0e0;border:1px solid #1a5276;padding:6px;border-radius:4px;cursor:pointer">Copy to Clipboard</button>
+  </div>
+</div>
+
+<script>
+(function() {
+  const CORNER_ORDER = ['UL','UR','LR','LL'];
+  const CORNER_LABELS = {UL:'Upper-Left',UR:'Upper-Right',LR:'Lower-Right',LL:'Lower-Left'};
+  const PALETTE = ['#e94560','#4ecdc4','#ffe66d','#a855f7','#f97316','#06b6d4','#84cc16','#f43f5e'];
+
+  let img = null;
+  let imgSrc = null;
+  let photos = [];
+  let currentPhotoIdx = 0;
+  let currentCornerIdx = 0;
+  let scale = 1, offsetX = 0, offsetY = 0;
+  let panning = false, panStartX = 0, panStartY = 0, panOffX = 0, panOffY = 0;
+  let spaceHeld = false;
+
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const wrap = document.getElementById('canvasWrap');
+  const hint = document.getElementById('hint');
+  const photoList = document.getElementById('photoList');
+  const jsonArea = document.getElementById('jsonArea');
+
+  function resizeCanvas() {
+    canvas.width = wrap.clientWidth;
+    canvas.height = wrap.clientHeight;
+    draw();
+  }
+
+  function fitImage() {
+    if (!img) return;
+    const ww = wrap.clientWidth, wh = wrap.clientHeight;
+    scale = Math.min(ww / img.naturalWidth, wh / img.naturalHeight, 1);
+    offsetX = (ww - img.naturalWidth * scale) / 2;
+    offsetY = (wh - img.naturalHeight * scale) / 2;
+  }
+
+  function imgToCanvas(ix, iy) { return [ix * scale + offsetX, iy * scale + offsetY]; }
+  function canvasToImg(cx, cy) { return [(cx - offsetX) / scale, (cy - offsetY) / scale]; }
+
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!img) return;
+    ctx.save();
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(scale, scale);
+    ctx.drawImage(img, 0, 0);
+    ctx.restore();
+
+    photos.forEach(function(corners, pi) {
+      if (!corners) return;
+      var color = PALETTE[pi % PALETTE.length];
+      var labeled = corners.filter(function(c){return c;});
+      if (labeled.length >= 3) {
+        ctx.beginPath();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6,3]);
+        labeled.forEach(function(c, i) {
+          var p = imgToCanvas(c.x, c.y);
+          if (i===0) ctx.moveTo(p[0],p[1]); else ctx.lineTo(p[0],p[1]);
+        });
+        if (labeled.length===4) { var p0=imgToCanvas(labeled[0].x,labeled[0].y); ctx.lineTo(p0[0],p0[1]); }
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      labeled.forEach(function(c) {
+        var p = imgToCanvas(c.x, c.y);
+        ctx.beginPath(); ctx.arc(p[0],p[1],8,0,Math.PI*2);
+        ctx.fillStyle=color; ctx.fill();
+        ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke();
+        ctx.fillStyle='#fff'; ctx.font='bold 11px sans-serif'; ctx.textAlign='center';
+        ctx.fillText(c.name, p[0], p[1]-12);
+      });
+    });
+  }
+
+  function updateHint() {
+    if (!img) { hint.textContent = 'Click "Load Image" to start'; return; }
+    var color = PALETTE[currentPhotoIdx % PALETTE.length];
+    var cn = CORNER_ORDER[currentCornerIdx];
+    hint.innerHTML = '<span style="color:'+color+'">Photo '+(currentPhotoIdx+1)+'</span> — Click <b>'+cn+'</b> ('+CORNER_LABELS[cn]+')';
+  }
+
+  function updateSidebar() {
+    photoList.innerHTML = '';
+    photos.forEach(function(corners, pi) {
+      if (!corners) return;
+      var color = PALETTE[pi % PALETTE.length];
+      var div = document.createElement('div');
+      div.className = 'photo-group';
+      div.style.borderLeft = '3px solid '+color;
+      var html = '<div class="label" style="color:'+color+'">Photo '+(pi+1)+'</div>';
+      corners.forEach(function(c) {
+        if (c) html += '<div class="corner">'+c.name+': ('+c.x.toFixed(1)+', '+c.y.toFixed(1)+')</div>';
+      });
+      div.innerHTML = html;
+      photoList.appendChild(div);
+    });
+    updateJson();
+  }
+
+  function updateJson() {
+    var output = [];
+    photos.forEach(function(corners, pi) {
+      if (!corners) return;
+      var obj = {};
+      corners.forEach(function(c) { if (c) obj[c.name] = {x:Math.round(c.x*10)/10, y:Math.round(c.y*10)/10}; });
+      if (Object.keys(obj).length > 0) output.push({photo:pi+1, corners:obj});
+    });
+    jsonArea.value = JSON.stringify(output, null, 2);
+  }
+
+  function addCorner(imgX, imgY) {
+    while (photos.length <= currentPhotoIdx) photos.push([null,null,null,null]);
+    var cornerName = CORNER_ORDER[currentCornerIdx];
+    photos[currentPhotoIdx][currentCornerIdx] = {name:cornerName, x:imgX, y:imgY};
+    currentCornerIdx++;
+    if (currentCornerIdx >= 4) { currentCornerIdx = 0; currentPhotoIdx++; }
+    updateHint(); updateSidebar(); draw();
+  }
+
+  function undo() {
+    if (photos.length === 0) return;
+    var pi = photos.length - 1;
+    while (pi >= 0) {
+      var last = -1;
+      for (var i=0;i<4;i++) { if (photos[pi][i]) last = i; }
+      if (last >= 0) { photos[pi][last] = null; break; }
+      photos.pop(); pi--;
+    }
+    if (photos.length === 0) { currentPhotoIdx=0; currentCornerIdx=0; }
+    else {
+      var p = photos[photos.length-1];
+      currentPhotoIdx = photos.length-1;
+      currentCornerIdx = 0;
+      for (var i=0;i<4;i++) { if (p[i]) currentCornerIdx = i+1; }
+      if (currentCornerIdx >= 4) { currentCornerIdx=0; currentPhotoIdx=photos.length; }
+    }
+    updateHint(); updateSidebar(); draw();
+  }
+
+  function resetAll() {
+    photos=[]; currentPhotoIdx=0; currentCornerIdx=0;
+    updateHint(); updateSidebar(); draw();
+  }
+
+  function resetCurrentPhoto() {
+    if (currentPhotoIdx < photos.length) {
+      photos[currentPhotoIdx] = [null,null,null,null];
+    }
+    currentCornerIdx = 0;
+    updateHint(); updateSidebar(); draw();
+  }
+
+  // --- FILE LOADING via hidden input + click simulation ---
+  var input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.style.display = 'none';
+  document.body.appendChild(input);
+
+  document.getElementById('loadBtn').addEventListener('click', function() {
+    input.value = '';
+    input.click();
+  });
+
+  input.addEventListener('change', function() {
+    var file = input.files[0];
+    if (!file) { hint.textContent = 'No file selected'; return; }
+    if (!file.type.startsWith('image/')) { hint.textContent = 'Not an image file'; return; }
+
+    hint.textContent = 'Loading ' + file.name + '...';
+
+    if (imgSrc) URL.revokeObjectURL(imgSrc);
+    imgSrc = URL.createObjectURL(file);
+
+    var newImg = new Image();
+    newImg.onload = function() {
+      img = newImg;
+      photos = [];
+      currentPhotoIdx = 0;
+      currentCornerIdx = 0;
+      fitImage();
+      resizeCanvas();
+      updateHint();
+      updateSidebar();
+      hint.textContent = file.name + ' (' + img.naturalWidth + 'x' + img.naturalHeight + ') loaded';
+    };
+    newImg.onerror = function() {
+      hint.textContent = 'ERROR: Failed to load image';
+      console.error('Image load failed for', imgSrc);
+    };
+    newImg.src = imgSrc;
+  });
+
+  // --- MOUSE EVENTS ---
+  canvas.addEventListener('mousedown', function(e) {
+    if (spaceHeld || e.button === 1) {
+      panning = true;
+      panStartX = e.clientX; panStartY = e.clientY;
+      panOffX = offsetX; panOffY = offsetY;
+      canvas.style.cursor = 'grabbing';
+    }
+  });
+
+  window.addEventListener('mousemove', function(e) {
+    if (panning) {
+      offsetX = panOffX + (e.clientX - panStartX);
+      offsetY = panOffY + (e.clientY - panStartY);
+      draw();
+    }
+  });
+
+  window.addEventListener('mouseup', function() {
+    if (panning) {
+      panning = false;
+      canvas.style.cursor = spaceHeld ? 'grab' : 'crosshair';
+    }
+  });
+
+  canvas.addEventListener('click', function(e) {
+    if (spaceHeld || !img || panning) return;
+    var rect = canvas.getBoundingClientRect();
+    var cx = e.clientX - rect.left;
+    var cy = e.clientY - rect.top;
+    var pt = canvasToImg(cx, cy);
+    if (pt[0] < 0 || pt[1] < 0 || pt[0] > img.naturalWidth || pt[1] > img.naturalHeight) return;
+    addCorner(pt[0], pt[1]);
+  });
+
+  canvas.addEventListener('wheel', function(e) {
+    e.preventDefault();
+    var rect = canvas.getBoundingClientRect();
+    var mx = e.clientX - rect.left;
+    var my = e.clientY - rect.top;
+    var pt = canvasToImg(mx, my);
+    var factor = e.deltaY < 0 ? 1.15 : 1/1.15;
+    var newScale = Math.max(0.05, Math.min(20, scale * factor));
+    offsetX = mx - pt[0] * newScale;
+    offsetY = my - pt[1] * newScale;
+    scale = newScale;
+    draw();
+  }, {passive:false});
+
+  // --- KEYBOARD ---
+  document.addEventListener('keydown', function(e) {
+    if (e.code === 'Space' && !e.repeat) { e.preventDefault(); spaceHeld=true; canvas.style.cursor='grab'; }
+    if ((e.ctrlKey||e.metaKey) && e.key==='z') { e.preventDefault(); undo(); }
+  });
+  document.addEventListener('keyup', function(e) {
+    if (e.code==='Space') { spaceHeld=false; canvas.style.cursor='crosshair'; }
+  });
+
+  // --- DRAG AND DROP ---
+  wrap.addEventListener('dragover', function(e) { e.preventDefault(); e.dataTransfer.dropEffect='copy'; });
+  wrap.addEventListener('drop', function(e) {
+    e.preventDefault();
+    var file = e.dataTransfer.files[0];
+    if (file && file.type.startsWith('image/')) {
+      // Reuse the same loading logic
+      if (imgSrc) URL.revokeObjectURL(imgSrc);
+      imgSrc = URL.createObjectURL(file);
+      var newImg = new Image();
+      newImg.onload = function() {
+        img = newImg; photos=[]; currentPhotoIdx=0; currentCornerIdx=0;
+        fitImage(); resizeCanvas(); updateHint(); updateSidebar();
+      };
+      newImg.src = imgSrc;
+    }
+  });
+
+  document.getElementById('undoBtn').addEventListener('click', undo);
+  document.getElementById('resetPhotoBtn').addEventListener('click', resetCurrentPhoto);
+  document.getElementById('resetBtn').addEventListener('click', resetAll);
+  document.getElementById('copyBtn').addEventListener('click', function() {
+    navigator.clipboard.writeText(jsonArea.value).then(function() {
+      document.getElementById('copyBtn').textContent = 'Copied!';
+      setTimeout(function(){ document.getElementById('copyBtn').textContent='Copy to Clipboard'; }, 1500);
+    });
+  });
+
+  window.addEventListener('resize', resizeCanvas);
+  resizeCanvas();
+})();
+</script>
+</body>
+</html>

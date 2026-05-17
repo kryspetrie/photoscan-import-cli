@@ -118,6 +118,7 @@ from pathlib import Path
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw, ImageFont
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------------------
 # Logging — all diagnostic output goes through _log() which writes to
@@ -161,9 +162,20 @@ DEFAULT_DETECTION_MODEL = _SCRIPT_DIR / ".." / "models" / "detection_ep47.onnx"
 DEFAULT_POSE_MODEL = _SCRIPT_DIR / ".." / "models" / "pose_single_ep42.onnx"
 
 # Corner refinement: crop size and edge-contact classification
-CORNER_CROP_SIZE_MIN = 640   # Minimum crop size for corner refinement
+CORNER_CROP_SIZE_MIN = 320   # Minimum crop size (half the model input resolution)
 CORNER_CROP_EXPAND = 1.5     # Max factor to expand crop when detection fails
 EDGE_MARGIN = 80              # Margin for inscribed-rect edge classification
+
+# Adaptive corner crop sizing: the initial crop and binary-search minimum
+# are proportional to the detected photo's size, not fixed at 640px.
+# A corner needs enough context for the pose model to detect the photo and
+# localize the keypoint. 70% of max_dim gives roughly the same crop as the
+# old fixed 640 for typical photos (~900px), but scales properly for very
+# large or small photos. The minimum is half the model input (320px) to
+# ensure enough pixels for reliable detection after resizing to 640×640.
+CORNER_CROP_PCT = 0.70        # Initial crop = 70% of photo's max bbox dimension
+CORNER_CROP_CONF_SCALE = 0.10 # Extra 10% of max_dim per unit of missing confidence
+CORNER_CROP_MIN_PCT = 0.40    # Binary-search floor = 40% of the initial crop
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +500,8 @@ def _corner_crop(image: Image.Image, x, y, crop_size: int = CORNER_CROP_SIZE_MIN
     Args:
         image: PIL Image
         x, y: Center point in original image coordinates (float)
-        crop_size: Size of the square crop (default: 640)
+        crop_size: Size of the square crop (default: CORNER_CROP_SIZE_MIN=320, but
+                    typically computed by _corner_crop_size based on photo dimensions)
 
     Returns:
         crop: PIL Image (crop_size × crop_size)
@@ -623,7 +636,7 @@ def _adaptive_crop_size(box: dict, image_size: tuple, min_size: int = CORNER_CRO
     Args:
         box: Detection bounding box dict with x1, y1, x2, y2.
         image_size: (width, height) of the full image.
-        min_size: Minimum crop size (default CORNER_CROP_SIZE_MIN=640).
+        min_size: Minimum crop size (default CORNER_CROP_SIZE_MIN=320).
         scale: Factor to scale the bbox by (default 1.2, i.e. 20% margin).
 
     Returns:
@@ -638,13 +651,89 @@ def _adaptive_crop_size(box: dict, image_size: tuple, min_size: int = CORNER_CRO
     ideal = max(bbox_w, bbox_h) * scale
     crop_size = max(min_size, int(ideal))
 
-    # Clamp to image dimensions
+    # Round up to multiple of 32 for efficient inference
+    crop_size = ((crop_size + 31) // 32) * 32
+
+    # Clamp to image dimensions (after rounding, so crop doesn't exceed image)
     crop_size = min(crop_size, img_w, img_h)
+
+    return crop_size
+
+
+def _corner_crop_size(box: dict, confidence: float, image_size: tuple,
+                       base_pct: float = CORNER_CROP_PCT,
+                       conf_scale: float = CORNER_CROP_CONF_SCALE,
+                       min_size: int = CORNER_CROP_SIZE_MIN) -> int:
+    """Compute the initial corner-crop size based on the detected photo's bbox.
+
+    A corner needs enough context for the pose model to detect the photo and
+    localize the keypoint. The crop is proportional to the photo's max bbox
+    dimension, with extra margin for low-confidence detections:
+
+        crop = max_dim * (base_pct + conf_scale * (1 - confidence))
+
+    At confidence=1.0: 70% of max_dim — roughly the old fixed 640 for typical
+    photos (~900px), but scales for very large or small photos.
+    At confidence=0.5: 75% of max_dim (extra margin when bbox is uncertain).
+    At confidence=0.0: 80% of max_dim.
+
+    The result is clamped to [min_size, min(img_w, img_h)] and rounded to
+    a multiple of 32 for efficient ONNX inference.
+
+    Args:
+        box: Detection bounding box dict with x1, y1, x2, y2.
+        confidence: Detection confidence (0–1). Lower confidence → larger crop.
+        image_size: (width, height) of the full source image.
+        base_pct: Base percentage of max bbox dimension (default 0.70).
+        conf_scale: Extra fraction of max_dim per unit of missing confidence
+                    (default 0.10).
+        min_size: Absolute minimum crop size in pixels (default 320, half the
+                  model input resolution).
+
+    Returns:
+        Crop size in pixels (multiple of 32, clamped to image dimensions).
+    """
+    img_w, img_h = image_size
+    bbox_w = box["x2"] - box["x1"]
+    bbox_h = box["y2"] - box["y1"]
+    max_dim = max(bbox_w, bbox_h)
+
+    # Scale by confidence: higher confidence → tighter crop, lower → more margin
+    pct = base_pct + conf_scale * (1.0 - confidence)
+    ideal = max_dim * pct
+
+    crop_size = max(min_size, int(ideal))
 
     # Round up to multiple of 32 for efficient inference
     crop_size = ((crop_size + 31) // 32) * 32
 
+    # Clamp to image dimensions (after rounding, so crop doesn't exceed image)
+    crop_size = min(crop_size, img_w, img_h)
+
     return crop_size
+
+
+def _corner_crop_min(crop_size: int, pct: float = CORNER_CROP_MIN_PCT,
+                     min_size: int = CORNER_CROP_SIZE_MIN) -> int:
+    """Compute the minimum crop size for binary search as a fraction of the initial crop.
+
+    When shrinking the corner crop to exclude adjacent photos, we don't want
+    to go arbitrarily small — the pose model needs enough context to detect
+    the photo. The floor is 40% of the initial crop, ensuring the binary
+    search still has room to shrink while never going below the model's
+    minimum usable resolution (320px, half the 640×640 input).
+
+    Args:
+        crop_size: The initial (maximum) crop size for this refinement.
+        pct: Fraction of crop_size to use as the minimum (default 0.40).
+        min_size: Absolute minimum in pixels (default 320).
+
+    Returns:
+        Minimum crop size for binary search (multiple of 32).
+    """
+    result = max(min_size, int(crop_size * pct))
+    result = ((result + 31) // 32) * 32
+    return result
 
 
 def refine_corners_geometric(image: Image.Image, result: dict,
@@ -673,9 +762,12 @@ def refine_corners_geometric(image: Image.Image, result: dict,
       - Uses the relevant bbox corner to approximate the fiducial position.
       - If no detection or bbox fills the crop, expands and retries.
 
-    Crop size is automatically computed from the photo's bbox dimensions
-    (1.2× the max dimension, at least 640px) so the photo doesn't fill the
-    entire crop — ensuring the detection model can identify edge contacts.
+    Crop size is automatically computed based on the model and photo:
+      - Pose model: proportional to max bbox dimension (70% base), with extra
+        margin for low-confidence detections. Binary search starts from this
+        size down to 25% of it, shrinking to exclude adjacent photos.
+      - Detection model: 1.2× the max bbox dimension so the photo doesn't fill
+        the entire crop, ensuring edge contacts are visible for classification.
 
     Args:
         image: Full input PIL Image
@@ -702,17 +794,24 @@ def refine_corners_geometric(image: Image.Image, result: dict,
     kps = {kp["name"]: kp for kp in result.get("keypoints", [])}
     box = result["detection"]["box"]
 
-    # Compute adaptive crop size based on bbox dimensions.
-    # The pose model works best at the minimum size (640px) — it just needs
-    # to see the corner clearly with enough context. The detection model
-    # needs a larger crop so the photo's bbox doesn't fill the entire frame.
+    # Compute adaptive crop size based on bbox dimensions and confidence.
+    # For the pose model: crop is proportional to the photo's max dimension,
+    # with extra margin for low-confidence detections. This ensures large
+    # photos get enough context while small photos don't include adjacent ones.
+    # For the detection model: crop must be large enough that the photo's
+    # bbox doesn't fill the entire frame (so edges are visible for classification).
+    confidence = result.get("detection", {}).get("confidence", 0.5)
     if crop_size <= 0:
         if use_pose:
-            crop_size = CORNER_CROP_SIZE_MIN
+            crop_size = _corner_crop_size(box, confidence, image.size)
         else:
             crop_size = _adaptive_crop_size(box, image.size)
-    _log(f"  Corner refinement: crop_size={crop_size}px (photo bbox "
-         f"{box['x2']-box['x1']:.0f}×{box['y2']-box['y1']:.0f}, model={model_name})")
+    min_crop_size = _corner_crop_min(crop_size)
+
+    bbox_max_dim = max(box["x2"] - box["x1"], box["y2"] - box["y1"])
+    _log(f"  Corner refinement: crop_size={crop_size}px, min_crop={min_crop_size}px "
+         f"(photo bbox {box['x2']-box['x1']:.0f}×{box['y2']-box['y1']:.0f}, "
+         f"max_dim={bbox_max_dim:.0f}, conf={confidence:.2f}, model={model_name})")
 
     # Bbox corner positions as fallback starting points
     bbox_corners = {
@@ -721,6 +820,23 @@ def refine_corners_geometric(image: Image.Image, result: dict,
         "LL": (box["x1"], box["y2"]),
         "LR": (box["x2"], box["y2"]),
     }
+
+    # Compute the original photo's keypoint center for cross-photo validation.
+    # When two photos are adjacent, a large corner crop can contain both,
+    # and the pose model may detect the wrong (adjacent) photo. We validate
+    # that the detected photo's center is consistent with our original photo.
+    orig_kps = result.get("keypoints", [])
+    if orig_kps:
+        vis_kps = [kp for kp in orig_kps if kp.get("visibility", 0) > 0.1]
+        if vis_kps:
+            photo_center_x = sum(kp["x"] for kp in vis_kps) / len(vis_kps)
+            photo_center_y = sum(kp["y"] for kp in vis_kps) / len(vis_kps)
+        else:
+            photo_center_x = (box["x1"] + box["x2"]) / 2
+            photo_center_y = (box["y1"] + box["y2"]) / 2
+    else:
+        photo_center_x = (box["x1"] + box["x2"]) / 2
+        photo_center_y = (box["y1"] + box["y2"]) / 2
 
     # Use pose keypoints as starting points, fall back to bbox corners
     approx_corners = {}
@@ -740,52 +856,112 @@ def refine_corners_geometric(image: Image.Image, result: dict,
             found = False
 
             if use_pose:
-                # ── Pose model: single pass, named keypoints ──
-                # The pose model returns named keypoints (UL, UR, LL, LR).
-                # The keypoint matching our target corner IS the answer.
-                # No classification needed — we already know which corner we want.
-                crop, offset_x, offset_y = _corner_crop(image, ax, ay, crop_size)
-                results = run_pose(model_session, crop,
-                                   conf_threshold=conf_threshold,
-                                   img_size=DEFAULT_IMG_SIZE)
+                # ── Pose model with cross-photo validation ──
+                # The pose model returns named keypoints, but when two photos
+                # overlap in the crop, it may detect the WRONG photo and return
+                # that photo's keypoint for the target corner name.
+                #
+                # Validation: the target keypoint in original-image coords must
+                # be near our approximate corner position. For the wrong photo,
+                # the "UL" keypoint will be at that WRONG photo's UL position,
+                # which can be far from our target.
+                #
+                # If the wrong photo is detected, shrink the crop and retry —
+                # a smaller crop is less likely to contain the adjacent photo.
+                lo = min_crop_size
+                hi = crop_size
+                best_result = None
+                best_crop_size = None
 
-                for det in sorted(results, key=lambda d: d["confidence"], reverse=True):
-                    if "keypoints" not in det:
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    # Round to multiple of 32 for efficient inference
+                    mid = ((mid + 31) // 32) * 32
+                    crop, offset_x, offset_y = _corner_crop(image, ax, ay, mid)
+                    pose_results = run_pose(model_session, crop,
+                                            conf_threshold=conf_threshold,
+                                            img_size=DEFAULT_IMG_SIZE)
+
+                    if not pose_results:
+                        # No detection at this crop size — try larger
+                        lo = mid + 32
                         continue
-                    det_kps = {kp["name"]: kp for kp in det["keypoints"]}
-                    target_kp = det_kps.get(corner_name)
 
-                    if target_kp and target_kp["visibility"] >= 0.3:
-                        # Found the target keypoint with good visibility.
+                    # Check each detection for valid target keypoint
+                    valid_found = False
+                    for det in sorted(pose_results, key=lambda d: d["confidence"], reverse=True):
+                        if "keypoints" not in det:
+                            continue
+                        det_kps_map = {kp["name"]: kp for kp in det["keypoints"]}
+                        target_kp = det_kps_map.get(corner_name)
+
+                        if not target_kp or target_kp.get("visibility", 0) < 0.3:
+                            continue
+
                         new_x = target_kp["x"] + offset_x
                         new_y = target_kp["y"] + offset_y
-                        # Validate: reject if refinement moved too far
+
+                        # Key validation: the keypoint should be near our
+                        # approximate position. The "near" threshold scales
+                        # with crop size — at larger crops we allow more drift
+                        # from the original position, but it must still be
+                        # geometrically consistent.
+                        # The approximate corner (ax, ay) is at the crop CENTER.
+                        # The detected keypoint in the crop should be within
+                        # ~half the crop size of the center. If it's farther,
+                        # it's likely from the wrong photo whose corner is at
+                        # the crop boundary, not the center.
+                        kp_center_dist = ((new_x - ax) ** 2 + (new_y - ay) ** 2) ** 0.5
+                        # Allow the keypoint to be up to crop_size/2 from the
+                        # approximate position (it's at the crop center, so
+                        # this means the keypoint is still within the crop).
+                        max_center_dist = mid * 0.5
+
+                        if kp_center_dist > max_center_dist:
+                            # Keypoint is too far from where we expect it —
+                            # likely from the wrong adjacent photo.
+                            _log(f"  {corner_name}: wrong photo at crop={mid}px "
+                                 f"(kp at ({new_x:.0f},{new_y:.0f}) is "
+                                 f"{kp_center_dist:.0f}px from approx "
+                                 f"({ax:.0f},{ay:.0f}), max={max_center_dist:.0f}px)")
+                            valid_found = "wrong"
+                            break
+
+                        # Also reject if refinement moved too far from original
                         if (abs(new_x - orig_x) > max_shift or
                                 abs(new_y - orig_y) > max_shift):
-                            _log(f"  {corner_name}: pose refinement moved too far "
+                            _log(f"  {corner_name}: refinement moved too far "
                                  f"({new_x:.0f},{new_y:.0f}) vs "
-                                 f"({orig_x:.0f},{orig_y:.0f}), skipping")
+                                 f"({orig_x:.0f},{orig_y:.0f}) at crop={mid}px")
+                            # Don't shrink — the keypoint was valid, just too far
+                            valid_found = "valid"  # prevent shrinking loop
                             break
-                        ax, ay = new_x, new_y
-                        found = True
+
+                        # Valid result from the correct photo
+                        best_result = (new_x, new_y)
+                        best_crop_size = mid
+                        valid_found = "valid"
                         break
 
-                    # Target keypoint not visible — use bbox corner as fallback
-                    det_box = det["box"]
-                    cx, cy = _bbox_corner_coord(det_box, corner_name)
-                    new_x = cx + offset_x
-                    new_y = cy + offset_y
-                    if (abs(new_x - orig_x) <= max_shift and
-                            abs(new_y - orig_y) <= max_shift):
-                        ax, ay = new_x, new_y
-                        found = True
-                        break
+                    if valid_found == "wrong":
+                        # Wrong photo — shrink crop to exclude it
+                        hi = mid - 32
+                    elif valid_found == "valid":
+                        # Found a valid result — try smaller for tighter localization
+                        hi = mid - 32
+                    else:
+                        # No detection at all — try larger crop
+                        lo = mid + 32
 
-                if found:
-                    break  # Stop iterating — refinement succeeded
+                if best_result is not None:
+                    ax, ay = best_result
+                    found = True
+                    _log(f"  {corner_name}: refined to ({ax:.1f},{ay:.1f}) "
+                         f"at crop={best_crop_size}px")
                 else:
-                    _log(f"  {corner_name}: no matching keypoint found (pose model)")
-                    break  # No point retrying — same crop will give same result
+                    _log(f"  {corner_name}: no valid refinement found "
+                         f"(binary search {min_crop_size}-{crop_size}px)")
+                    break
 
             else:
                 # ── Detection model: best detection's bbox corner ──
@@ -852,6 +1028,10 @@ def refine_corners_geometric(image: Image.Image, result: dict,
         if name in refined_corners:
             rx, ry = refined_corners[name]
             if name in kps:
+                # Save original visibility before refinement boosted it to 1.0,
+                # so warp fallback logic can make correct decisions.
+                if "nn_vis" not in kps[name]:
+                    kps[name]["nn_vis"] = kps[name]["visibility"]
                 kps[name]["x"] = rx
                 kps[name]["y"] = ry
                 kps[name]["visibility"] = 1.0
@@ -861,6 +1041,7 @@ def refine_corners_geometric(image: Image.Image, result: dict,
                     "x": rx,
                     "y": ry,
                     "visibility": 1.0,
+                    "nn_vis": 0.0,  # Corner was previously invisible
                 })
 
     return result
@@ -1231,11 +1412,9 @@ def pipeline(detection_session, pose_session, image: Image.Image,
             dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO,
             center_bias: bool = False,
             cv_refine: bool = False,
-            cv_refine_radius: int = 40,
-
-            auto_refine: bool = False):
+            cv_refine_radius: int = 40):
     """
-    Two- or three-stage pipeline: detect → pose → [refine →] dedup.
+    Two- or three-stage pipeline: detect → pose → [refine →] dedup → rescue.
 
     Two-stage (default):
         Detection model finds bounding boxes → pose model finds corners.
@@ -1249,14 +1428,16 @@ def pipeline(detection_session, pose_session, image: Image.Image,
         a crop that's tightly centered on the actual photo.
 
     CV refinement (optional):
-        ``cv_refine``: Sobel edge detection + line intersection (Enhancements 1+2).
+        ``cv_refine``: Sobel edge detection + line intersection on ALL
+        corners, regardless of visibility. Useful for fine-tuning already-
+        good corners. Applied before the automatic rescue step.
 
-    Auto-refine (``auto_refine=True``):
-        Automatically applies CV refinement only to photos that have fewer
-        than 3 visible corners (below a visibility threshold). This avoids
-        the cost of CV refinement on all photos while still fixing photos
-        that would produce degenerate crops (e.g., "strips" from only 2
-        visible corners).
+    Automatic rescue (always on):
+        After pose (and optional CV refinement), photos with fewer than 3
+        visible corners are rescued using Sobel edge detection + line
+        intersection. This prevents degenerate crops (e.g., "strips" from
+        only 2 visible corners) and avoids warp→simple fallback. Only
+        photos that need it are processed.
 
     Returns list of dicts:
         {
@@ -1316,32 +1497,19 @@ def pipeline(detection_session, pose_session, image: Image.Image,
         min_dist = min(orig_w, orig_h) * dedup_min_dist_ratio
         pose_results = dedup_pose_results(pose_results, min_dist)
 
-    # Stage 4 (optional): CV corner refinement
+    # Stage 4 (optional): CV corner refinement on all photos
     if cv_refine:
         pose_results = refine_corners_cv(image, pose_results,
                                           search_radius=cv_refine_radius)
 
-
-
-    # Stage 6 (optional): Auto-refine photos with poor corner detection
-    # For photos with fewer than 3 visible corners, apply CV refinement
-    # to recover missing corners. This prevents degenerate crops (e.g.,
-    # "strips" from only 2 visible corners) without the cost of running
-    # CV refinement on every photo.
-    if auto_refine:
-        _AUTO_REFINE_VIS_THRESH = 0.3
-        _MIN_VISIBLE_CORNERS = 3
-
-        needs_refine = any(
-            sum(1 for kp in res.get("keypoints", [])
-                if kp["visibility"] >= _AUTO_REFINE_VIS_THRESH)
-            < _MIN_VISIBLE_CORNERS
-            for res in pose_results
-        )
-
-        if needs_refine:
-            pose_results = refine_corners_cv(image, pose_results,
-                                              search_radius=cv_refine_radius)
+    # Stage 5: Rescue low-visibility corners (always on)
+    # When photos have fewer than 3 visible corners, the results are
+    # degenerate (e.g., "strip" crops, or warp→simple fallback). CV
+    # edge refinement can recover invisible corners using Sobel edges
+    # and neighbor-anchored projection. This runs automatically — no
+    # flag needed — because leaving a photo with 2/4 corners is always
+    # worse than attempting recovery.
+    pose_results = rescue_low_vis_corners(image, pose_results)
 
     return pose_results
 
@@ -2288,6 +2456,91 @@ def _intersect_lines(line1, line2):
     return (ix, iy)
 
 
+def rescue_low_vis_corners(image: Image.Image, results: list,
+                            vis_threshold: float = 0.3,
+                            min_visible_corners: int = 3,
+                            search_radius: int = 40) -> list:
+    """Apply CV refinement only to photos with insufficient visible corners.
+
+    For each result that has fewer than ``min_visible_corners`` corners
+    above ``vis_threshold`` visibility, run Sobel edge detection + line
+    intersection refinement on ALL of that photo's low-visibility corners.
+    This recovers corners the neural network couldn't find, using the
+    physical edge structure of the photo in the image.
+
+    High-confidence corners (visibility >= the CV refinement vis_threshold
+    of 0.7) are left untouched — they're already accurate.
+
+    This is the standard "rescue" step in the pipeline, always enabled.
+    It prevents degenerate crops (e.g., "strip" crops from only 2 visible
+    corners) and avoids warp→simple-crop fallback when edges are clearly
+    visible but the NN missed the corner position.
+
+    Args:
+        image: Source image (RGB PIL Image)
+        results: List of result dicts from pipeline/sweep
+        vis_threshold: NN visibility below which a corner counts as
+            "low". Also the threshold for counting "visible" corners
+            to decide whether a photo needs rescue. (default 0.3)
+        min_visible_corners: Minimum number of visible corners for a
+            photo to be considered OK — no rescue needed. (default 3)
+        search_radius: Half-size of the search region for CV refinement.
+            (default 40)
+
+    Returns:
+        The same results list with rescued corners updated in-place.
+    """
+    needs_rescue = []
+    for i, res in enumerate(results):
+        kps = res.get("keypoints", [])
+        visible = sum(1 for kp in kps if kp["visibility"] >= vis_threshold)
+        if visible < min_visible_corners:
+            needs_rescue.append(i)
+
+    if not needs_rescue:
+        return results
+
+    _RESCUE_VIS_THRESHOLD = 0.7  # CV refinement only processes corners below this
+    low_vis_names = []
+    for i in needs_rescue:
+        kps = results[i].get("keypoints", [])
+        low = [f"{kp['name']}={kp['visibility']:.2f}"
+               for kp in kps if kp["visibility"] < vis_threshold]
+        low_vis_names.append(f"Photo #{i+1}: [{', '.join(low)}]")
+        _log(f"  Rescue: Photo #{i+1} has only "
+             f"{sum(1 for kp in kps if kp['visibility'] >= vis_threshold)}/4 "
+             f"visible corners (need {min_visible_corners}), "
+             f"applying CV edge refinement")
+
+    # Filter to only the results that need rescue — avoids processing
+    # all photos when only one has low-visibility corners.
+    rescue_subset = [results[i] for i in needs_rescue]
+    refined = refine_corners_cv(image, rescue_subset,
+                                search_radius=search_radius,
+                                vis_threshold=_RESCUE_VIS_THRESHOLD)
+
+    # Copy refined results back
+    for idx, i in enumerate(needs_rescue):
+        results[i] = refined[idx]
+
+    # Log rescue results
+    for i in needs_rescue:
+        kps = results[i].get("keypoints", [])
+        vis_now = {kp["name"]: kp["visibility"] for kp in kps}
+        rescued_corners = []
+        for kp in kps:
+            if "nn_vis" in kp and kp["nn_vis"] < vis_threshold:
+                rescued_corners.append(
+                    f"{kp['name']}: vis {kp['nn_vis']:.2f}→{kp['visibility']:.2f} "
+                    f"pos ({kp['nn_x']:.0f},{kp['nn_y']:.0f})→({kp['x']:.0f},{kp['y']:.0f})")
+        if rescued_corners:
+            _log(f"  Rescue: Photo #{i+1} recovered: {'; '.join(rescued_corners)}")
+        else:
+            _log(f"  Rescue: Photo #{i+1} — CV refinement could not recover any corners")
+
+    return results
+
+
 def refine_corners_cv(image: Image.Image, results: list,
                        search_radius: int = 40,
                        edge_threshold: float = 50.0,
@@ -3154,22 +3407,46 @@ def save_crops(image: Image.Image, results: list, image_path: str,
                 else:
                     adaptive_margins[name] = px_margin
 
-        # Check for warp fallback: if any corner had very low original
-        # visibility (before CV refinement boosted it), fall back to
-        # simple crop — a perspective warp with uncertain corners can
-        # produce badly distorted results.
+        # Check for warp fallback: if any corner has very low CURRENT
+        # visibility, fall back to simple crop — a perspective warp with
+        # uncertain corners can produce badly distorted results.
+        # Note: we check current visibility, not nn_vis, because corner
+        # refinement can recover invisible corners to vis=1.0. Those
+        # recovered positions are reliable enough for warping.
+        #
+        # Before falling back, attempt CV edge rescue on just this photo.
+        # If rescue recovers the low-vis corners above the threshold,
+        # we can still do a proper warp crop instead of a degraded simple crop.
         do_warp = crop_mode.startswith("warp")
         if do_warp and warp_fallback_thresh > 0 and kps:
             low_vis_corners = []
             for kp in kps:
-                orig_vis = kp.get("nn_vis", kp["visibility"])
-                if orig_vis < warp_fallback_thresh:
-                    low_vis_corners.append(f"{kp['name']}={orig_vis:.2f}")
+                vis = kp["visibility"]
+                if vis < warp_fallback_thresh:
+                    low_vis_corners.append(f"{kp['name']}={vis:.2f}")
             if low_vis_corners:
-                _log(f"    Photo #{photo_id}: WARNING low-confidence corners "
-                      f"[{', '.join(low_vis_corners)}], "
-                      f"falling back to simple crop")
-                do_warp = False
+                # Try CV rescue before giving up on warp
+                rescued = rescue_low_vis_corners(
+                    image, [res],
+                    vis_threshold=warp_fallback_thresh,
+                    min_visible_corners=4,
+                )
+                # Check if rescue fixed the problem
+                kps = rescued[0].get("keypoints", [])
+                kp_by_name = {kp["name"]: kp for kp in kps} if kps else {}
+                still_low = [f"{kp['name']}={kp['visibility']:.2f}"
+                             for kp in kps
+                             if kp["visibility"] < warp_fallback_thresh]
+                if still_low:
+                    _log(f"    Photo #{photo_id}: WARNING low-confidence corners "
+                          f"[{', '.join(still_low)}] after rescue, "
+                          f"falling back to simple crop")
+                    do_warp = False
+                else:
+                    _log(f"    Photo #{photo_id}: CV rescue recovered corners — proceeding with warp")
+                    # Update res with rescued keypoints for the warp
+                    res["keypoints"] = kps
+                    res["center"] = rescued[0].get("center", res.get("center"))
 
         # Determine the effective crop tag for the filename
         if do_warp:
@@ -3258,8 +3535,6 @@ def infer_single(detection_session, pose_session, image_path: str,
                  center_bias: bool = False,
                  cv_refine: bool = False,
                  cv_refine_radius: int = 40,
-
-                 auto_refine: bool = False,
                  coords: str = None,
                  debug: bool = False,
                  no_image: bool = False,
@@ -3278,6 +3553,7 @@ def infer_single(detection_session, pose_session, image_path: str,
     _raw_image = Image.open(image_path)
     _source_exif = _raw_image.info.get("exif")
     image = _raw_image.convert("RGB")
+    image.load()  # Force pixel data into memory for thread-safe cropping
     orig_w, orig_h = image.size
 
     sweep_params = None  # filled in if sweep is used
@@ -3309,53 +3585,31 @@ def infer_single(detection_session, pose_session, image_path: str,
             center_bias=center_bias,
             cv_refine=cv_refine,
             cv_refine_radius=cv_refine_radius,
-
-            auto_refine=auto_refine,
         )
 
     # ── Post-sweep CV refinement ──
-    # When sweep is used, cv_refine and auto_refine don't run inside
-    # pipeline() — apply them here on the sweep results instead.
-    #
-    # Optimization: If the sweep found all corners with vis >= 0.5, CV
-    # refinement is unlikely to help (it only affects low-vis corners).
-    # Skip it to save ~280ms per image on "easy" results.
-    _CV_SKIP_VIS = 0.5
-    if (do_pose_sweep_xy or do_pose_sweep):
-        # Check whether all corners are already confident enough
+    # When sweep is used, cv_refine doesn't run inside pipeline() —
+    # apply it here on the sweep results instead.
+    if (do_pose_sweep_xy or do_pose_sweep) and cv_refine:
+        # Optimization: If all corners are already confident, skip
+        _CV_SKIP_VIS = 0.5
         all_corners_good = all(
             kp.get("visibility", 0) >= _CV_SKIP_VIS
             for res in results
             for kp in res.get("keypoints", [])
         )
         if all_corners_good:
-            if cv_refine:
-                _log(f"  Skipping cv-refine: all corners vis >= {_CV_SKIP_VIS:.2f} after sweep")
-                cv_refine = False
-            if auto_refine:
-                _log(f"  Skipping auto-refine: all corners vis >= {_CV_SKIP_VIS:.2f} after sweep")
-                auto_refine = False
-
-        # Apply CV refinement (if not skipped above)
-        if cv_refine:
+            _log(f"  Skipping cv-refine: all corners vis >= {_CV_SKIP_VIS:.2f} after sweep")
+        else:
             results = refine_corners_cv(image, results,
                                          search_radius=cv_refine_radius)
             _log(f"  Post-sweep cv-refine applied")
-        elif auto_refine:
-            _AUTO_REFINE_VIS_THRESH = 0.3
-            _MIN_VISIBLE_CORNERS = 3
-            needs_refine = any(
-                sum(1 for kp in res.get("keypoints", [])
-                    if kp["visibility"] >= _AUTO_REFINE_VIS_THRESH)
-                < _MIN_VISIBLE_CORNERS
-                for res in results
-            )
-            if needs_refine:
-                results = refine_corners_cv(image, results,
-                                             search_radius=cv_refine_radius)
-                _log(f"  Post-sweep auto-refine applied")
-            else:
-                _log(f"  Skipping auto-refine: all photos have >= {_MIN_VISIBLE_CORNERS} visible corners")
+
+    # ── Post-sweep rescue of low-visibility corners ──
+    # Always on — same as the rescue in pipeline(), but applied here
+    # for sweep results that bypass pipeline().
+    if do_pose_sweep_xy or do_pose_sweep:
+        results = rescue_low_vis_corners(image, results)
 
     # ── Geometric corner refinement ──
     # After pose (+ optional CV refinement), refine corner positions using
@@ -3371,12 +3625,19 @@ def infer_single(detection_session, pose_session, image_path: str,
             cr_detect = detection_session if cr_pose is None else None
         _log(f"  Corner refinement: {corner_refine_iterations} iteration(s) "
              f"(model: {corner_refine_model})")
-        for res in results:
-            refine_corners_geometric(image, res,
-                                      pose_session=cr_pose,
-                                      detection_session=cr_detect,
-                                      iterations=corner_refine_iterations,
-                                      conf_threshold=corner_refine_conf)
+        # Run corner refinement in parallel — each photo is independent.
+        # ONNX Runtime sessions are thread-safe for concurrent run() calls.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(refine_corners_geometric, image, res,
+                            pose_session=cr_pose,
+                            detection_session=cr_detect,
+                            iterations=corner_refine_iterations,
+                            conf_threshold=corner_refine_conf)
+                for res in results
+            ]
+            for f in futures:
+                f.result()  # Propagate any exceptions
         _log(f"  Corner refinement complete")
 
     # Print results
@@ -3391,8 +3652,6 @@ def infer_single(detection_session, pose_session, image_path: str,
         mode += " + center-bias"
     if cv_refine:
         mode += " + cv-refine"
-    if auto_refine:
-        mode += " + auto-refine"
     if corner_refine:
         mode += " + corner-refine"
     _log(f"Mode: {mode}")
@@ -3513,8 +3772,6 @@ def infer_batch(detection_session, pose_session, image_dir: str,
                center_bias: bool = False,
                cv_refine: bool = False,
                cv_refine_radius: int = 40,
-
-               auto_refine: bool = False,
                coords: str = None,
                debug: bool = False,
                no_image: bool = False,
@@ -3566,8 +3823,6 @@ def infer_batch(detection_session, pose_session, image_dir: str,
             center_bias=center_bias,
             cv_refine=cv_refine,
             cv_refine_radius=cv_refine_radius,
-
-            auto_refine=auto_refine,
             coords=coords,
             debug=debug,
             no_image=no_image,
@@ -3607,50 +3862,94 @@ def infer_batch(detection_session, pose_session, image_dir: str,
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Presets — named combinations of settings for common use cases
+# Presets — detection/refinement tiers (crop method is separate)
 # ---------------------------------------------------------------------------
+# Presets control ONLY how corners are detected and refined.
+# The --crop argument controls the output crop method independently.
+# Valid combinations are checked by _validate_preset_crop() which
+# warns (not errors) on questionable pairings.
 
 _PRESETS = {
     "quick": {
-        "description": "Fast detection + pose, no refinement or cropping",
+        "description": "Fast detection + pose, no refinement",
         "args": {},
     },
-    "crop": {
-        "description": "Detect + adaptive corner crop (fast, auto-refine, adaptive margin)",
+    "standard": {
+        "description": "Pose-refine + adaptive margin (good balance of speed and accuracy)",
         "args": {
-            "auto_refine": True,
-            "crop": "simple-corners",
-            "crop_margin": 0.02,
+            "pose_refine": True,
             "adaptive_margin": True,
         },
     },
-    "warp": {
-        "description": "Detect + perspective warp with white fill (fast, auto-refine, adaptive margin)",
-        "args": {
-            "auto_refine": True,
-            "crop": "warp-stretch",
-            "crop_margin": 0.02,
-            "border_fill": "white",
-            "adaptive_margin": True,
-        },
-    },
-    "best": {
-        "description": "Full pipeline: corner-refine → sweep → cv-refine → auto-refine → warp "
+    "thorough": {
+        "description": "Full refinement: pose-refine → corner-refine → cv-refine → adaptive margin "
                        "(best quality, recovers invisible corners)",
         "args": {
+            "pose_refine": True,
             "corner_refine": True,
             "corner_refine_iterations": 2,
             "corner_refine_model": "pose",
-            "pose_sweep_xy": True,
             "cv_refine": True,
-            "auto_refine": True,
-            "crop": "warp-stretch",
-            "crop_margin": 0.02,
-            "border_fill": "white",
             "adaptive_margin": True,
         },
     },
 }
+
+# Crop defaults that pair well with each preset (used when --crop is
+# specified alongside a preset but individual crop settings like
+# --crop-margin are left at defaults).
+_PRESET_CROP_DEFAULTS = {
+    "quick": {
+        "crop_margin": 0.02,
+    },
+    "standard": {
+        "crop_margin": 0.02,
+    },
+    "thorough": {
+        "crop_margin": 0.02,
+        "border_fill": "white",
+    },
+}
+
+
+def _validate_preset_crop(preset_name: str, crop_mode: str | None):
+    """Check for questionable preset + crop method combinations.
+
+    Returns (errors, warnings) where:
+      errors:   list of error messages (combine is invalid, should abort)
+      warnings: list of warning messages (combine is questionable but allowed)
+    """
+    errors = []
+    warnings = []
+
+    if preset_name and crop_mode:
+        # thorough + simple: refinement effort wasted on a loose crop
+        if preset_name == "thorough" and crop_mode == "simple":
+            warnings.append(
+                f"Preset 'thorough' with --crop simple: thorough refinement "
+                f"is wasted on a detection-bbox crop that doesn't use corner "
+                f"positions. Consider --crop simple-corners or --crop warp-stretch."
+            )
+        # quick + warp variants: imprecise corners + perspective warp
+        if preset_name == "quick" and crop_mode.startswith("warp"):
+            warnings.append(
+                f"Preset 'quick' with --crop {crop_mode}: no corner refinement, "
+                f"so warp accuracy depends on raw pose keypoints. Consider "
+                f"--preset standard or --preset thorough for better corners."
+            )
+
+    if crop_mode and preset_name is None:
+        # --crop specified with no preset — valid use case
+        pass
+
+    if preset_name and crop_mode is None:
+        # Preset specified but no --crop: bad usage — no output will be produced
+        errors.append(
+            f"Preset '{preset_name}' requires --crop. "
+            f"Specify a crop method: --crop simple-corners or --crop warp-stretch."
+        )
+
+    return errors, warnings
 
 
 def _apply_preset(parser, args):
@@ -3690,12 +3989,29 @@ def _apply_preset(parser, args):
         if cli_val != default_val:
             user_explicit[action.dest] = cli_val
 
-    # Apply preset values
+    # Apply preset values (detection/refinement only, no crop settings)
     preset_args = preset["args"]
     for key, val in preset_args.items():
         # Only apply preset value if the user didn't explicitly override it
         if key not in user_explicit:
             setattr(args, key, val)
+
+    # Apply preset-crop defaults when --crop is used alongside a preset.
+    # These provide sensible margins/fills for the crop method without
+    # hardcoding them in the detection-only preset.
+    crop_mode = getattr(args, "crop", None)
+    crop_defaults = _PRESET_CROP_DEFAULTS.get(preset_name, {})
+    if crop_mode and crop_defaults:
+        for key, val in crop_defaults.items():
+            if key not in user_explicit:
+                setattr(args, key, val)
+
+    # Validate preset + crop combination
+    errors, warnings = _validate_preset_crop(preset_name, crop_mode)
+    for w in warnings:
+        _log(f"Warning: {w}")
+    for e in errors:
+        parser.error(e)
 
     return args
 
@@ -3713,24 +4029,29 @@ Basic Usage:
   # Folder of images → folder of results
   photocrop --image ./scans/ --output ./crops/
 
-Presets:
-  Presets are named combinations of settings for common use cases.
-  Any individual setting can override a preset value.
+Presets + Crop Method:
+  Presets control detection/refinement SPEED and ACCURACY only.
+  The --crop argument controls the OUTPUT CROP METHOD separately.
+  Use them together for the best results.
 
-  # Quick — just detect + pose (~5s)
-  photocrop --image scan.jpg --preset quick
+  # Quick — detect + pose, no refinement (~5s)
+  photocrop --image scan.jpg --preset quick --crop simple-corners
 
-  # Crop — detect + tight corner crop with auto-refine (~7s)
-  photocrop --image scan.jpg --preset crop
+  # Standard — pose-refine + adaptive margin (~7s)
+  photocrop --image scan.jpg --preset standard --crop simple-corners
+  photocrop --image scan.jpg --preset standard --crop warp-stretch --border-fill white
 
-  # Warp — detect + perspective warp with white fill (~5s)
-  photocrop --image scan.jpg --preset warp
+  # Thorough — full pipeline, best corner accuracy (~15s)
+  photocrop --image scan.jpg --preset thorough --crop warp-stretch --border-fill white
 
-  # Best — full pipeline for tight layouts (~15s, includes sweep + cv-refine)
-  photocrop --image scan.jpg --preset best
+  # Quick + warp — works but corners may be less accurate (warning issued)
+  photocrop --image scan.jpg --preset quick --crop warp-stretch
 
-  # Best preset but override the crop margin
-  photocrop --image scan.jpg --preset best --crop-margin 0.03
+  # Override preset defaults
+  photocrop --image scan.jpg --preset thorough --crop warp-stretch --crop-margin 0.03
+
+  # Detection only — preset without --crop (no files saved, warning issued)
+  photocrop --image scan.jpg --preset standard
 
 Recommended for photos close together:
   When photos are close together on the scanner bed, the pose model can
@@ -3739,11 +4060,11 @@ Recommended for photos close together:
   this issue. It adds ~3x processing time but significantly improves
   corner detection on tight layouts:
 
-  # Add sweep to any preset or command
-  photocrop --image scan.jpg --preset warp --pose-sweep-xy
+  # Add sweep to any preset + crop combination
+  photocrop --image scan.jpg --preset standard --crop warp-stretch --pose-sweep-xy
 
-  # Or use the --preset best which includes sweep
-  photocrop --image scan.jpg --preset best
+  # Thorough + sweep for the most challenging layouts
+  photocrop --image scan.jpg --preset thorough --crop warp-stretch --pose-sweep-xy
 
 CV Refinement (manual):
   # Edge detection + line intersection (Enhancements 1+2)
@@ -3777,7 +4098,7 @@ Coordinates Only (scripting-friendly):
   photocrop --image scan.jpg --coords text --no-image
 
   # Debug: save annotated detection image with boxes and keypoints
-  photocrop --image scan.jpg --preset warp --debug
+  photocrop --image scan.jpg --preset standard --crop warp-stretch --debug
 
   # Coordinates + debug image
   photocrop --image scan.jpg --coords json --debug
@@ -3799,11 +4120,14 @@ Coordinates Only (scripting-friendly):
     parser.add_argument(
         "--preset", type=str, default=None,
         choices=list(_PRESETS.keys()),
-        help="Named preset for common use cases. Sets multiple options at "
-             "once; any individual option can override the preset. "
-             "quick=detect+pose only, crop=auto-refine+corner crop, "
-             "warp=auto-refine+perspective warp, "
-             "best=sweep+cv-refine+auto-refine+warp. (default: none)",
+        help="Detection/refinement preset. Controls how corners are found, "
+             "NOT the output crop method (use --crop for that). "
+             "quick=detect+pose only, standard=+pose-refine+adaptive-margin, "
+             "thorough=+pose-refine+corner-refine+cv-refine+adaptive-margin. "
+             "Note: low-visibility corner rescue (CV edge detection) is always "
+             "on — it runs automatically when corners are invisible. "
+             "Always pair with --crop to save output. "
+             "(default: none)",
     )
     parser.add_argument(
         "--output", "-o", type=str, default=None,
@@ -3900,14 +4224,6 @@ Coordinates Only (scripting-friendly):
         help="Search radius (pixels) around each NN-predicted corner "
              "for CV refinement. Larger values handle corners that are "
              "further from the true position. (default: 40)",
-    )
-    parser.add_argument(
-        "--auto-refine", action="store_true",
-        help="Automatically apply CV corner refinement to photos with "
-             "fewer than 3 visible corners. This prevents degenerate crops "
-             "(e.g., 'strip' crops from only 2 visible corners) without "
-             "the cost of running CV refinement on every photo. Recommended "
-             "when cropping — adds ~3s only when needed.",
     )
     parser.add_argument(
         "--imgsz", type=int, default=DEFAULT_IMG_SIZE,
@@ -4116,7 +4432,6 @@ Coordinates Only (scripting-friendly):
             center_bias=args.center_bias,
             cv_refine=args.cv_refine,
             cv_refine_radius=args.cv_refine_radius,
-            auto_refine=args.auto_refine,
             coords=args.coords,
             debug=args.debug,
             no_image=args.no_image,
@@ -4153,7 +4468,6 @@ Coordinates Only (scripting-friendly):
             center_bias=args.center_bias,
             cv_refine=args.cv_refine,
             cv_refine_radius=args.cv_refine_radius,
-            auto_refine=args.auto_refine,
             coords=args.coords,
             debug=args.debug,
             no_image=args.no_image,

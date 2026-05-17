@@ -17,11 +17,32 @@ Input Image
     │         ▼
     └─→ Pose Model ─→ Corner keypoints per region
                          │
+                         ▼ (optional, recommended)
+              Corner Refinement ─→ Recover invisible corners
+                         │
                          ▼
               Perspective-corrected crops
 ```
 
-> **Important:** The detection model uses the two-model pipeline to narrow down regions of interest before running the (more expensive) pose model. If you want to skip the detection step and run the pose model directly on the full image, you can — just note it may be slower for images with many objects.
+> **Important:** The detection model narrows down regions of interest before running the pose model. If you want to skip the detection step and run the pose model directly on the full image, you can — just note it may be slower for images with many objects.
+
+### Corner Refinement
+
+The pose model sometimes reports invisible corners (visibility ≈ 0) when a photo's edge is occluded by shadow, glare, or the scanner edge. **Corner refinement** crops around each approximate corner and runs the model again on just that small region, recovering invisible corners to visibility = 1.0.
+
+The algorithm:
+1. For each corner (UL, UR, LL, LR), crop a region around the approximate position
+2. Run the pose model on that crop (640×640, auto-sized from photo bbox)
+3. Find the named keypoint matching the target corner (e.g., find "UL" keypoint for UL corner)
+4. If found with visibility ≥ 0.3, use its position — no classification needed
+5. If not found, use the relevant bounding box corner as fallback
+6. Validate: reject if the refined position moved more than 30% of crop size from the original
+
+**Pose model (recommended):** Uses named keypoints directly. Fast (~120ms per corner). No extra model session needed (reuses the pose model). Single pass per corner with no expand retries.
+
+**Detection model (fallback):** Uses bounding box corners with geometric classification. Slower due to expand retries when the bbox fills the crop. Less precise than keypoints. No extra model session needed (reuses the detection model).
+
+All 4 corners × N photos are independent and can be processed in parallel — ideal for threading.
 
 ---
 
@@ -746,6 +767,8 @@ poseModel.close()
 
 ## Performance
 
+### Single Inference
+
 | Platform | Model | Input Size | Inference Time |
 |----------|-------|-----------|----------------|
 | Desktop CPU (i7) | Detection | 640×640 | ~30–50 ms |
@@ -755,10 +778,20 @@ poseModel.close()
 | Android + NNAPI | Detection | 640×640 | ~50–100 ms |
 | Android + NNAPI | Pose | 640×640 | ~80–150 ms |
 
+### Full Pipeline (4 photos, Desktop CPU)
+
+| Pipeline | Sequential | 4 Threads | Speedup |
+|----------|-----------|-----------|---------|
+| Detect + pose (baseline) | ~700ms | ~400ms | 1.8× |
+| + Corner refine (pose) | ~2,500ms | ~900ms | 2.8× |
+| + Corner refine (detection) | ~1,900ms | ~700ms | 2.7× |
+
+Corner refinement is **embarrassingly parallel** — all 4 corners × N photos are independent and can run simultaneously. With 4 threads, corner refinement adds only ~500ms to the baseline pipeline.
+
 Tips for faster inference:
 - Use `confThreshold = 0.5` (default) — higher values skip more detections
 - For the two-model pipeline, limit detection to top-N results before running pose
-- For simple layouts with 1–4 photos, the pose-only approach avoids the detection overhead
+- Corner refinement can be parallelized with a thread pool (4 threads recommended)
 - Resize input to 320×320 for ~4× speed at some accuracy cost
 
 ---

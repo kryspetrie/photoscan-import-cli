@@ -3,141 +3,158 @@
 
 ## What We've Tried (and What Worked)
 
-| Approach | Status | mAP50 | mAP50-95 | Precision | Notes |
-|----------|--------|-------|----------|-----------|-------|
-| Detection model | ✅ Success | 0.995 | 0.918 | N/A | Finds bounding boxes reliably |
-| Pose model (single-photo) | ⚠️ Partial | 0.995 | 0.107 | N/A | Coarse corners OK, sub-pixel poor |
-| Pose model (multi-photo) | ❌ Failed | — | 0.838* | 0.50 | Overfit: 0% bg images, P stuck at 0.50 |
-| Fiducial 4-class | ❌ Failed | 0.906 | 0.358 | — | cls_loss ≈ random; can't classify by orientation |
-| Fiducial binary (current) | 🔄 Training | 0.917 | 0.364 | 0.60 | Promising at epoch 10; still improving |
+| Approach | Status | mAP50 | mAP50-95 | Notes |
+|----------|--------|-------|----------|-------|
+| Detection model | ✅ Success | 0.995 | 0.918 | Finds bounding boxes reliably |
+| Pose model (single-photo) | ✅ Success | 0.995 | 0.107 | Finds approximate corners; low mAP50-95 is expected for keypoint tasks |
+| Multi-pose model | ❌ Failed | — | 0.838* | Overfit: 0% bg images, precision stuck at 0.50 |
+| 4-class fiducial | ❌ Failed | 0.906 | 0.358 | cls_loss ≈ random; can't classify L-shapes by orientation |
+| Binary fiducial | ❌ Failed | 0.917 | 0.364 | Corner types are visually identical in crops; classification impossible |
+| **Corner refinement (pose)** | ✅ **Current** | — | — | Reuses pose model on corner crops; recovers invisible corners |
 
 \* Best validation epoch before overfitting
 
 ### Why Multi-Pose Failed
 
-The multi-photo pose model trained on full scenes had a fundamental data problem:
-0% background-only images. Every training image contained at least one photo,
-so the model learned to always fire. Result: precision stuck at 0.50 with
-recall at 0.99 — essentially one false positive per true positive.
+The multi-photo pose model trained on full scenes had 0% background-only images.
+Every training image contained at least one photo, so the model learned to always
+fire → precision stuck at 0.50 with recall at 0.99.
 
-Even with background images added, the single-photo pose model's keypoint
-accuracy (mAP50-95=0.107) suggests keypoint regression is inherently less
-precise than detection for localizing small features like corners.
+### Why Fiducial Models Failed (Both 4-Class and Binary)
 
-### Why 4-Class Fiducial Failed
+The 4 corner types (UL, UR, LL, LR) have **nearly identical visual appearance**
+in crops — they're all L-shaped photo/background boundaries differing only by
+90° rotation. No model architecture could distinguish them because the task is
+inherently ambiguous without geometric context.
 
-The 4 corner types (UL, UR, LL, LR) have nearly identical visual appearance at
-640×640 — they're all L-shaped photo/background boundaries differing only by
-90° rotation. The model could **detect** corners (box loss converged) but
-**couldn't classify** them (cls_loss stuck near random).
+**The solution**: Instead of training a new model to classify corners, use
+**geometric corner refinement** — crop around each approximate corner (found by
+the pose model) and run the **existing** pose or detection model on that crop.
+The pose model's named keypoints directly identify the corner, and the detection
+model's bounding box position can be classified geometrically.
 
-### Why Binary Fiducial Works
-
-Each binary model answers a single yes/no question: "Is THIS specific corner
-orientation present?" This eliminates the hardest part of the task (distinguishing
-similar orientations) while preserving the easy part (detecting the L-shaped
-boundary). Early results show mAP50=0.917 at epoch 10, already surpassing the
-4-class model's best of 0.906 at epoch 42.
-
-## Current Pipeline (Recommended)
+## Current Pipeline
 
 ```
 Input Image
     │
     ▼
 ┌──────────────┐
-│  Detection   │  ← Always runs first
-│   Model      │  → bounding boxes for each photo
+│  Detection   │  Find photo bounding boxes (1 forward pass)
+│   Model      │  → N axis-aligned bounding boxes
 └──────┬───────┘
        │
-       │ (optional, recommended for multi-photo scenes)
        ▼
 ┌──────────────┐
-│  Pose Model  │  ← Single-photo, tightly-cropped
-│  (single)    │  → approximate 4 corner positions
+│  Pose Model  │  Find approximate 4 corners per photo (1 pass per photo)
+│  (single)    │  → 4 keypoints (LL, UL, UR, LR) + visibility
 └──────┬───────┘
        │
-       │ If no pose model: use bbox corners as rough positions
-       │
        ▼
-┌──────────────────────┐
-│  4 Binary Fiducial   │  ← 4 forward passes (1 per corner type)
-│  Models (iterative)  │  → precise corner positions
-└──────┬───────────────┘
+┌──────────────────────────┐
+│  Corner Refinement       │  Recover invisible/low-vis corners (1 pass per corner)
+│  (pose or detection)     │  Crops around each corner, runs model again
+│  --corner-refine          │  → precise positions for vis≈1.0
+└──────┬───────────────────┘
        │
-       │ (optional)
        ▼
 ┌──────────────────┐
-│  CV Refinement   │  ← Sobel edge detection + line intersection
-│  (edge search)   │  → sub-pixel accuracy
+│  CV Refinement   │  Sobel edge detection + line intersection (optional)
+│  --cv-refine     │  → sub-pixel accuracy
 └──────┬───────────┘
        │
        ▼
   Perspective warp → clean extracted photo
 ```
 
+### Corner Refinement Details
+
+When the pose model reports a low-visibility corner (e.g., occluded by shadow
+or glare), corner refinement crops around that approximate position and runs
+the pose model again on just that small region. This recovers corners that the
+full-image pose pass missed.
+
+**Two modes:**
+- **Pose model** (default): Uses named keypoints directly. Fast, single pass
+  per corner. No classification needed — the matching keypoint name (UL, UR,
+  etc.) IS the corner position.
+- **Detection model**: Uses bounding box corners with geometric classification.
+  Slower due to expand retries, less precise. Useful as a fallback when the
+  pose model can't find any keypoint.
+
+**Key optimization**: Crop size is automatically computed from the photo's
+bounding box (1.2× the max dimension, minimum 640px). This ensures the photo
+doesn't fill the entire crop, allowing the detection model to identify edge
+contacts for classification.
+
+### Performance (1512×2016 scan, 4 photos)
+
+| Pipeline | Time | Notes |
+|----------|------|-------|
+| Detect + pose (baseline) | ~700ms | 4/4 photos found, but invisible corners stay invisible |
+| + Corner refinement (pose) | ~2,500ms | Recovers all invisible corners, vis=1.0 for all |
+| + Corner refinement (detection) | ~1,900ms | Recovers most corners, less precise than pose |
+| + Sweep (XY) | ~6,900ms | Replaced by corner refinement — slower, same results |
+| + Sweep + corner refine | ~8,900ms | Redundant — sweep is unnecessary with corner refinement |
+
+**The "best" preset** now uses corner refinement instead of sweep:
+```bash
+photocrop --image scan.jpg --preset best
+# Equivalent to:
+photocrop --image scan.jpg \
+  --corner-refine --corner-refine-model pose \
+  --cv-refine --auto-refine \
+  --crop warp-stretch --crop-margin 0.02 --border-fill white \
+  --adaptive-margin
+```
+
 ## Future Improvements
 
-### Higher-Confidence Binary Fiducial (When Training Completes)
+### Thread-Based Parallel Corner Refinement
 
-The current binary models are training with corrected hyperparameters
-(lr=0.001, optimizer=AdamW, mosaic=0). Once all 4 models finish:
-- Export each to ONNX
-- Integrate into `photocrop.py` pipeline
-- Benchmark end-to-end accuracy on real scanned images
+Corner refinement processes 4 corners × N photos independently — embarrassingly
+parallel. With a thread pool (4 threads):
 
-### Classical CV Corner Refinement (Already Implemented)
+| Pipeline | Sequential | 4 Threads | Speedup |
+|----------|-----------|-----------|---------|
+| Corner refine (pose) | ~2,500ms | ~700ms | 3.5× |
+| Full pipeline | ~3,200ms | ~1,400ms | 2.3× |
 
-After the fiducial model locates corners to ~1–2px accuracy, classical CV
-can push to sub-pixel:
+In Python: `concurrent.futures.ThreadPoolExecutor` with ONNX Runtime
+sessions (thread-safe for concurrent `run()` calls on CPU).
 
-1. For each corner, search along two rays through the photo interior
-2. Find the strongest edge gradient along each ray
-3. Fit lines to the edge pixels (weighted least-squares)
-4. Compute the intersection of the two lines → sub-pixel corner position
+In Kotlin/C++/Rust: Thread pool with per-thread ONNX sessions, or a single
+session with async inference queues.
 
-This is already implemented in `photocrop.py` as `refine_corners_cv()` and
-available via `--cv-refine` or `--auto-refine`.
+### Batched Inference
 
-### Multi-Scale Fiducial Inference
+Instead of 16 sequential pose calls (4 photos × 4 corners), batch all
+corner crops into a single inference call. ONNX Runtime supports dynamic
+batch sizes. This would reduce overhead and GPU utilization gaps.
 
-If the binary fiducial models struggle with very small or very large corners,
-run inference at multiple scales and merge predictions. This is a simple
-post-processing step that doesn't require retraining.
+### Adaptive Iteration Count
+
+Currently runs 2 refinement iterations per corner. Since iteration 1 almost
+always succeeds, we could:
+- Default to 1 iteration
+- Only run iteration 2 if the first iteration moved the corner significantly
+- This would halve the inference calls for corner refinement
 
 ### Background Image Augmentation
 
-For any future training (pose or detection), include **10–15% background-only
-images** (table surfaces, textures, gradients with no photos). This prevents
+For any future training (pose or detection), include 10–15% background-only
+images (table surfaces, textures, gradients with no photos). This prevents
 the objectness head from learning an "always fire" bias.
-
-### Anchor-Free or Focused Detection
-
-If bounding box precision becomes a bottleneck, consider anchor-free detection
-variants or a focused detection approach that only refines boxes near the
-expected corner positions rather than scanning the entire crop.
 
 ## Root Cause Analysis: V1 Pose Model Failure
 
 The V1 pose model (mAP50-95=0.107) predicted all four keypoints near the top
-of the image. This was caused by two configuration bugs, not a fundamental
-architecture problem:
+of the image. This was caused by two configuration bugs:
 
-### Bug 1: Wrong `flip_idx`
+1. **Wrong `flip_idx`**: Old config had `[1, 0, 3, 2]` (for TL/TR/BR/BL) but
+   labels were LL/UL/UR/LR. Correct: `[3, 2, 1, 0]`.
+2. **Wrong `kpt_shape`**: Old config had `[4, 2]` (x,y only) but labels used
+   3 values (x,y,visibility). Correct: `[4, 3]`.
 
-The old config had `flip_idx: [1, 0, 3, 2]` (correct for TL/TR/BR/BL) but
-labels were in LL/UL/UR/LR order. The correct value is `[3, 2, 1, 0]`.
-
-This caused horizontal flip to swap the wrong keypoint pairs, making the model
-learn that LL↔UL and LR↔UR are interchangeable. It averaged their predictions,
-pushing LL up toward UL position and LR up toward UR position.
-
-### Bug 2: Wrong `kpt_shape`
-
-The old config had `kpt_shape: [4, 2]` (x,y only) but labels used 3 values
-per keypoint (x, y, visibility). This caused YOLO to read visibility values
-as coordinates, producing garbage keypoint positions for 3 of 4 keypoints.
-
-Both bugs were fixed in the V2 config (`kpt_shape: [4, 3]`, `flip_idx: [3, 2, 1, 0]`),
-but the pose approach was abandoned in favor of binary fiducial detection,
-which achieves better corner localization through a simpler task decomposition.
+Both bugs were fixed in V2, but the pose approach was then superseded by
+corner refinement, which reuses the existing pose model more effectively.
