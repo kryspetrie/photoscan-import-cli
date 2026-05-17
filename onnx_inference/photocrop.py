@@ -161,9 +161,9 @@ DEFAULT_DETECTION_MODEL = _SCRIPT_DIR / ".." / "models" / "detection_ep47.onnx"
 DEFAULT_POSE_MODEL = _SCRIPT_DIR / ".." / "models" / "pose_single_ep42.onnx"
 
 # Corner refinement: crop size and edge-contact classification
-CORNER_CROP_SIZE = 640    # Crop size for corner refinement
-CORNER_CROP_EXPAND = 1.5  # Factor to expand crop when bbox fills frame or no detection
-EDGE_MARGIN = 80    # Margin for inscribed-rect edge classification (~12.5% of 640px crop)          # Pixels from crop edge to count as "touching" that edge
+CORNER_CROP_SIZE_MIN = 640   # Minimum crop size for corner refinement
+CORNER_CROP_EXPAND = 1.5     # Max factor to expand crop when detection fails
+EDGE_MARGIN = 80              # Margin for inscribed-rect edge classification
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +478,7 @@ def run_pose(session, crop: Image.Image, conf_threshold: float = 0.5,
 # ---------------------------------------------------------------------------
 
 
-def _corner_crop(image: Image.Image, x, y, crop_size: int = CORNER_CROP_SIZE):
+def _corner_crop(image: Image.Image, x, y, crop_size: int = CORNER_CROP_SIZE_MIN):
     """Extract a square crop centered on (x, y) from a PIL Image.
 
     If the crop would extend beyond the image boundary, it is shifted
@@ -610,37 +610,72 @@ def classify_corner_by_edges(box: dict, crop_w: int, crop_h: int,
     return nearest
 
 
+def _adaptive_crop_size(box: dict, image_size: tuple, min_size: int = CORNER_CROP_SIZE_MIN,
+                        scale: float = 1.2) -> int:
+    """Compute an adaptive crop size based on the detected photo's bbox.
+
+    The crop needs to be large enough that the photo doesn't fill it entirely
+    (so the detection model can identify edge contacts). We scale the bbox
+    size by `scale` and ensure there's room for background context. The result
+    is clamped to [min_size, min(img_w, img_h)] and rounded to a multiple of 32
+    for efficient inference.
+
+    Args:
+        box: Detection bounding box dict with x1, y1, x2, y2.
+        image_size: (width, height) of the full image.
+        min_size: Minimum crop size (default CORNER_CROP_SIZE_MIN=640).
+        scale: Factor to scale the bbox by (default 1.2, i.e. 20% margin).
+
+    Returns:
+        Crop size in pixels (multiple of 32).
+    """
+    img_w, img_h = image_size
+    bbox_w = box["x2"] - box["x1"]
+    bbox_h = box["y2"] - box["y1"]
+
+    # The crop should be large enough that the photo bbox doesn't fill it.
+    # We want at least `scale` × the max bbox dimension so there's background.
+    ideal = max(bbox_w, bbox_h) * scale
+    crop_size = max(min_size, int(ideal))
+
+    # Clamp to image dimensions
+    crop_size = min(crop_size, img_w, img_h)
+
+    # Round up to multiple of 32 for efficient inference
+    crop_size = ((crop_size + 31) // 32) * 32
+
+    return crop_size
+
+
 def refine_corners_geometric(image: Image.Image, result: dict,
                               pose_session=None, detection_session=None,
                               iterations: int = 2,
                               conf_threshold: float = 0.5,
-                              crop_size: int = CORNER_CROP_SIZE,
+                              crop_size: int = 0,
                               max_expand: float = CORNER_CROP_EXPAND):
-    """Refine the 4 corners of a detected photo using geometric edge classification.
+    """Refine the 4 corners of a detected photo using corner-crop inference.
 
     Uses either the pose model (default, higher quality) or the detection model
     to refine corner positions by cropping around each approximate corner.
 
-    With the pose model (default):
-      - Runs the pose model on each corner crop
-      - Finds the detection whose bounding box edge-contacts match the target corner
-      - Uses the NAMED KEYPOINT matching the target corner for sub-pixel precision
-      - Falls back to bbox corner if keypoint has low visibility
-      - Also supports direct keypoint matching (no edge classification needed)
-        when the target keypoint is clearly visible in the crop
+    **Pose model** (default):
+      - Crops around each approximate corner, runs pose inference.
+      - Finds the target keypoint (UL/UR/LL/LR) by name — no classification needed.
+      - If the target keypoint is visible, uses it directly for sub-pixel precision.
+      - If not visible, falls back to the bbox corner for that keypoint name.
+      - No expand retries needed: the named keypoint IS our answer, regardless
+        of crop framing.
 
-    With the detection model (--corner-refine-model detection):
-      - Runs the detection model on each corner crop
-      - Classifies corner type by which crop edges the bbox touches (pure geometry)
-      - Uses the relevant bbox corner as approximate fiducial position
+    **Detection model** (--corner-refine-model detection):
+      - Crops around each approximate corner, runs detection.
+      - Classifies which corner by finding which bbox corner is nearest to the
+        crop center.
+      - Uses the relevant bbox corner to approximate the fiducial position.
+      - If no detection or bbox fills the crop, expands and retries.
 
-    For each corner:
-      1. Crop a region around the approximate corner position
-      2. Run the pose/detection model to find objects in that crop
-      3. Match the detection to the target corner (edge classification or keypoint)
-      4. Extract the corner position from keypoints (pose) or bbox corner (detection)
-      5. If no match found or bbox fills the frame, expand the crop and retry
-      6. Iterate: re-crop around the detected position for higher precision
+    Crop size is automatically computed from the photo's bbox dimensions
+    (1.2× the max dimension, at least 640px) so the photo doesn't fill the
+    entire crop — ensuring the detection model can identify edge contacts.
 
     Args:
         image: Full input PIL Image
@@ -649,8 +684,9 @@ def refine_corners_geometric(image: Image.Image, result: dict,
         detection_session: ONNX inference session for the detection model.
         iterations: Number of refinement iterations (default 2)
         conf_threshold: Minimum detection confidence (default 0.5)
-        crop_size: Initial crop size in pixels (default 640)
-        max_expand: Maximum factor to expand crop when retrying (default 1.5)
+        crop_size: Crop size override. 0 = auto-compute from bbox (recommended).
+        max_expand: Max factor to expand crop when detection fails (detection model only)
+        iterations: Number of refinement iterations (default 2)
 
     Returns:
         The same result dict with updated keypoint coordinates and
@@ -665,6 +701,18 @@ def refine_corners_geometric(image: Image.Image, result: dict,
 
     kps = {kp["name"]: kp for kp in result.get("keypoints", [])}
     box = result["detection"]["box"]
+
+    # Compute adaptive crop size based on bbox dimensions.
+    # The pose model works best at the minimum size (640px) — it just needs
+    # to see the corner clearly with enough context. The detection model
+    # needs a larger crop so the photo's bbox doesn't fill the entire frame.
+    if crop_size <= 0:
+        if use_pose:
+            crop_size = CORNER_CROP_SIZE_MIN
+        else:
+            crop_size = _adaptive_crop_size(box, image.size)
+    _log(f"  Corner refinement: crop_size={crop_size}px (photo bbox "
+         f"{box['x2']-box['x1']:.0f}×{box['y2']-box['y1']:.0f}, model={model_name})")
 
     # Bbox corner positions as fallback starting points
     bbox_corners = {
@@ -683,113 +731,123 @@ def refine_corners_geometric(image: Image.Image, result: dict,
             approx_corners[name] = bbox_corners[name]
 
     refined_corners = {}
+    max_shift = crop_size * 0.3  # Reject refinements that move >30% of crop size
 
     for corner_name, (ax, ay) in approx_corners.items():
-        best_detection = None
+        orig_x, orig_y = ax, ay  # Remember original position for validation
 
         for iteration in range(iterations):
-            # Try progressively wider crops if detection fails or bbox fills frame.
             found = False
-            expand_factors = [1.0]
-            if max_expand > 1.0:
-                expand_factors.append(round((1.0 + max_expand) / 2, 2))
-                expand_factors.append(max_expand)
 
-            for expand in expand_factors:
-                this_crop_size = int(crop_size * expand)
-                crop, offset_x, offset_y = _corner_crop(image, ax, ay, this_crop_size)
+            if use_pose:
+                # ── Pose model: single pass, named keypoints ──
+                # The pose model returns named keypoints (UL, UR, LL, LR).
+                # The keypoint matching our target corner IS the answer.
+                # No classification needed — we already know which corner we want.
+                crop, offset_x, offset_y = _corner_crop(image, ax, ay, crop_size)
+                results = run_pose(model_session, crop,
+                                   conf_threshold=conf_threshold,
+                                   img_size=DEFAULT_IMG_SIZE)
 
-                # Run the appropriate model
-                if use_pose:
-                    results = run_pose(model_session, crop,
-                                       conf_threshold=conf_threshold,
-                                       img_size=DEFAULT_IMG_SIZE)
+                for det in sorted(results, key=lambda d: d["confidence"], reverse=True):
+                    if "keypoints" not in det:
+                        continue
+                    det_kps = {kp["name"]: kp for kp in det["keypoints"]}
+                    target_kp = det_kps.get(corner_name)
+
+                    if target_kp and target_kp["visibility"] >= 0.3:
+                        # Found the target keypoint with good visibility.
+                        new_x = target_kp["x"] + offset_x
+                        new_y = target_kp["y"] + offset_y
+                        # Validate: reject if refinement moved too far
+                        if (abs(new_x - orig_x) > max_shift or
+                                abs(new_y - orig_y) > max_shift):
+                            _log(f"  {corner_name}: pose refinement moved too far "
+                                 f"({new_x:.0f},{new_y:.0f}) vs "
+                                 f"({orig_x:.0f},{orig_y:.0f}), skipping")
+                            break
+                        ax, ay = new_x, new_y
+                        found = True
+                        break
+
+                    # Target keypoint not visible — use bbox corner as fallback
+                    det_box = det["box"]
+                    cx, cy = _bbox_corner_coord(det_box, corner_name)
+                    new_x = cx + offset_x
+                    new_y = cy + offset_y
+                    if (abs(new_x - orig_x) <= max_shift and
+                            abs(new_y - orig_y) <= max_shift):
+                        ax, ay = new_x, new_y
+                        found = True
+                        break
+
+                if found:
+                    break  # Stop iterating — refinement succeeded
                 else:
+                    _log(f"  {corner_name}: no matching keypoint found (pose model)")
+                    break  # No point retrying — same crop will give same result
+
+            else:
+                # ── Detection model: best detection's bbox corner ──
+                # We already know which corner we're looking for. The
+                # highest-confidence detection in the crop is most likely our
+                # photo. Use the relevant bbox corner directly — no edge
+                # classification needed, since we crop around the approximate
+                # position and the best detection is almost certainly "ours".
+                expand_factors = [1.0]
+                if max_expand > 1.0:
+                    expand_factors.append(round((1.0 + max_expand) / 2, 2))
+                    expand_factors.append(max_expand)
+
+                for expand in expand_factors:
+                    this_crop_size = int(crop_size * expand)
+                    crop, offset_x, offset_y = _corner_crop(image, ax, ay, this_crop_size)
+
                     results = run_detection(model_session, crop,
                                              conf_threshold=conf_threshold,
                                              img_size=DEFAULT_IMG_SIZE)
 
-                if not results:
-                    if expand < expand_factors[-1]:
-                        continue  # Try wider crop
-                    else:
-                        break  # No results even at max expand
+                    if not results:
+                        if expand < expand_factors[-1]:
+                            continue
+                        else:
+                            break
 
-                # Check for detections matching our target corner
-                for det in sorted(results, key=lambda d: d["confidence"], reverse=True):
+                    # Take the highest-confidence detection, use the bbox
+                    # corner that corresponds to our target corner name.
+                    det = max(results, key=lambda d: d["confidence"])
                     det_box = det["box"]
 
-                    if use_pose and "keypoints" in det:
-                        # ── Pose model: use named keypoints for matching ──
-                        # The pose model gives us named keypoints (UL, UR, LL, LR).
-                        # The keypoint matching our target corner name IS the corner
-                        # we're looking for — no edge classification needed for
-                        # matching. We still use edge classification as a secondary
-                        # validation signal, but the primary match is the keypoint name.
-                        det_kps = {kp["name"]: kp for kp in det["keypoints"]}
-                        target_kp = det_kps.get(corner_name)
+                    if _bbox_fills_crop(det_box, this_crop_size, this_crop_size):
+                        _log(f"  {corner_name}: bbox fills crop at {this_crop_size}px, "
+                             f"expanding")
+                        continue  # Try wider crop
 
-                        if target_kp and target_kp["visibility"] >= 0.3:
-                            # Found the target corner keypoint with good visibility.
-                            # Use its position directly — no edge classification needed.
-                            ax = target_kp["x"] + offset_x
-                            ay = target_kp["y"] + offset_y
-                            best_detection = det
-                            found = True
-                            break
-                        else:
-                            # Target keypoint not visible — try edge classification
-                            # as fallback to identify which detection is ours
-                            corner_type = classify_corner_by_edges(
-                                det_box, this_crop_size, this_crop_size)
-                            if corner_type == corner_name:
-                                # Edge classification matches — use bbox corner
-                                cx, cy = _bbox_corner_coord(det_box, corner_name)
-                                ax = cx + offset_x
-                                ay = cy + offset_y
-                                best_detection = det
-                                found = True
-                                break
-                            # else: not our corner, check next detection
-                    else:
-                        # ── Detection model: use edge classification ──
-                        # No keypoints available — classify by which edges the
-                        # bbox touches.
-                        if _bbox_fills_crop(det_box, this_crop_size, this_crop_size):
-                            _log(f"  {corner_name}: bbox fills crop at {this_crop_size}px, "
-                                 f"expanding")
-                            continue
+                    cx, cy = _bbox_corner_coord(det_box, corner_name)
+                    new_x = cx + offset_x
+                    new_y = cy + offset_y
 
-                        corner_type = classify_corner_by_edges(
-                            det_box, this_crop_size, this_crop_size)
+                    # Validate: reject if refinement moved too far
+                    if (abs(new_x - orig_x) > max_shift or
+                            abs(new_y - orig_y) > max_shift):
+                        _log(f"  {corner_name}: detection refinement moved too far "
+                             f"({new_x:.0f},{new_y:.0f}) vs "
+                             f"({orig_x:.0f},{orig_y:.0f}), skipping")
+                        break
 
-                        if corner_type == corner_name:
-                            # Found a matching corner — use bbox corner
-                            cx, cy = _bbox_corner_coord(det_box, corner_name)
-                            ax = cx + offset_x
-                            ay = cy + offset_y
-                            best_detection = det
-                            found = True
-                            break
-                        elif corner_type is not None:
-                            _log(f"  {corner_name}: edge classification gave {corner_type}, "
-                                 f"expected {corner_name}")
+                    ax, ay = new_x, new_y
+                    found = True
+                    break  # Don't try wider crops
 
                 if found:
-                    break  # Don't try wider crops if we found a match
+                    break  # Stop iterating — refinement succeeded
+                else:
+                    _log(f"  {corner_name}: no matching detection found (detection model)")
+                    break  # Give up on this corner
 
-            if not found:
-                _log(f"  {corner_name}: no matching detection found ({model_name} model)")
-                break  # Give up on this corner for this iteration
-
-        if best_detection is not None:
-            refined_corners[corner_name] = (ax, ay)
-        else:
-            # Keep the original (unrefined) position
-            refined_corners[corner_name] = approx_corners[corner_name]
+        refined_corners[corner_name] = (ax, ay)
 
     # Update the result dict with refined positions
-    any_refined = False
     for name in ["UL", "UR", "LL", "LR"]:
         if name in refined_corners:
             rx, ry = refined_corners[name]
@@ -797,7 +855,6 @@ def refine_corners_geometric(image: Image.Image, result: dict,
                 kps[name]["x"] = rx
                 kps[name]["y"] = ry
                 kps[name]["visibility"] = 1.0
-                any_refined = True
             else:
                 result.setdefault("keypoints", []).append({
                     "name": name,
@@ -805,7 +862,6 @@ def refine_corners_geometric(image: Image.Image, result: dict,
                     "y": ry,
                     "visibility": 1.0,
                 })
-                any_refined = True
 
     return result
 # Stage 3: Pose-based deduplication
@@ -3579,9 +3635,12 @@ _PRESETS = {
         },
     },
     "best": {
-        "description": "Full pipeline: sweep → cv-refine → auto-refine → warp "
-                       "(slow, best quality for tight layouts)",
+        "description": "Full pipeline: corner-refine → sweep → cv-refine → auto-refine → warp "
+                       "(best quality, recovers invisible corners)",
         "args": {
+            "corner_refine": True,
+            "corner_refine_iterations": 2,
+            "corner_refine_model": "pose",
             "pose_sweep_xy": True,
             "cv_refine": True,
             "auto_refine": True,
@@ -3951,11 +4010,11 @@ Coordinates Only (scripting-friendly):
     )
     parser.add_argument(
         "--corner-refine", action="store_true", default=False,
-        help="Enable geometric corner refinement after pose detection. "
-             "Uses the detection model to refine corner positions by cropping "
-             "around each corner and classifying which edges of the crop the "
-             "detected bounding box touches. No separate model needed — "
-             "reuses the detection model. Default: disabled.",
+        help="Enable corner refinement after pose detection. Crops around "
+             "each approximate corner and runs pose or detection model to "
+             "find a more precise position. Pose model uses named keypoints; "
+             "detection model uses bbox corners with geometric classification. "
+             "Crop size is auto-computed from the photo's bbox. Default: disabled.",
     )
     parser.add_argument(
         "--corner-refine-iterations", type=int, default=2,
@@ -3971,9 +4030,10 @@ Coordinates Only (scripting-friendly):
     parser.add_argument(
         "--corner-refine-model", type=str, default="pose",
         choices=["pose", "detection"],
-        help="Model to use for corner refinement. 'pose' uses the pose model "
-             "(default, higher quality — provides keypoints for sub-pixel precision). "
-             "'detection' uses the detection model (relevant bbox corner, less precise than keypoints).",
+        help="Model to use for corner refinement. 'pose' (default) uses named "
+             "keypoints — fast single-pass per corner, no classification needed. "
+             "'detection' uses bbox corners with geometric classification — may "
+             "need expanded crops if initial classification fails.",
     )
 
     args = parser.parse_args()
