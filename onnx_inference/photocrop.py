@@ -159,15 +159,11 @@ _VIS_THRESH_SWEEP = 0.30      # visibility threshold for sweep scoring
 _SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DETECTION_MODEL = _SCRIPT_DIR / ".." / "models" / "detection_ep47.onnx"
 DEFAULT_POSE_MODEL = _SCRIPT_DIR / ".." / "models" / "pose_single_ep42.onnx"
-DEFAULT_FIDUCIAL_MODEL = _SCRIPT_DIR / ".." / "models" / "fiducial_corner.onnx"
 
-# Fiducial corner class IDs (4-class detection model)
-FIDUCIAL_CLASS_UL = 0
-FIDUCIAL_CLASS_UR = 1
-FIDUCIAL_CLASS_LL = 2
-FIDUCIAL_CLASS_LR = 3
-FIDUCIAL_CLASS_NAMES = {0: 'UL', 1: 'UR', 2: 'LL', 3: 'LR'}
-FIDUCIAL_CROP_SIZE = 640   # Input size for the fiducial model
+# Corner refinement: crop size and edge-contact classification
+CORNER_CROP_SIZE = 640    # Crop size for corner refinement
+CORNER_CROP_EXPAND = 1.5  # Factor to expand crop when bbox fills frame or no detection
+EDGE_MARGIN = 80    # Margin for inscribed-rect edge classification (~12.5% of 640px crop)          # Pixels from crop edge to count as "touching" that edge
 
 
 # ---------------------------------------------------------------------------
@@ -395,9 +391,11 @@ def run_pose(session, crop: Image.Image, conf_threshold: float = 0.5,
     """
     Run the pose model on a cropped photo region.
 
-    Returns list of dicts with keys: 'confidence', 'keypoints' (list of
-    dicts with 'name', 'x', 'y', 'visibility' in crop pixel coords),
-    or empty list if no detection.
+    Returns list of dicts with keys:
+        confidence: detection confidence
+        keypoints: list of dicts with 'name', 'x', 'y', 'visibility' in crop pixel coords
+        box: dict with x1, y1, x2, y2 in crop pixel coords (bounding box)
+    Or empty list if no detection.
     """
     crop_w, crop_h = crop.size
     input_arr, _, _ = preprocess_crop(crop, img_size)
@@ -406,6 +404,7 @@ def run_pose(session, crop: Image.Image, conf_threshold: float = 0.5,
     output = session.run(None, {input_name: input_arr})[0]
 
     # Output: [1, 300, 18] — NMS-enabled
+    # Columns: x1, y1, x2, y2, conf, cls, kp0_x, kp0_y, kp0_vis, ...
     rows = output[0]
 
     results = []
@@ -414,9 +413,15 @@ def run_pose(session, crop: Image.Image, conf_threshold: float = 0.5,
         if conf < conf_threshold:
             continue
 
-        # Map keypoints from 640×640 → crop pixel coords
+        # Map from 640×640 → crop pixel coords
         scale_x = crop_w / img_size
         scale_y = crop_h / img_size
+
+        # Bounding box in crop pixel coords
+        box_x1 = float(row[0] * scale_x)
+        box_y1 = float(row[1] * scale_y)
+        box_x2 = float(row[2] * scale_x)
+        box_y2 = float(row[3] * scale_y)
 
         keypoints = []
         for k in range(4):
@@ -433,126 +438,47 @@ def run_pose(session, crop: Image.Image, conf_threshold: float = 0.5,
         results.append({
             "confidence": float(conf),
             "keypoints": keypoints,
+            "box": {
+                "x1": box_x1,
+                "y1": box_y1,
+                "x2": box_x2,
+                "y2": box_y2,
+            },
         })
 
     return results
 
 
+
 # ---------------------------------------------------------------------------
-# Stage 2b: Fiducial corner detection
+# Stage 2b: Geometric corner refinement
 # ---------------------------------------------------------------------------
 #
-# The fiducial model is a single 4-class YOLO detector (UL, UR, LL, LR)
-# that finds precise corner positions from the L-shaped photo/background
-# boundary pattern. It can be used standalone (detection → fiducial) or
-# combined with the pose model for better initial corner estimates
-# (detection → pose → fiducial).
+# Instead of a 4-class corner detection model (which failed: cls_loss stuck
+# near random baseline), we use the EXISTING detection model (mAP50=0.995)
+# to find bounding boxes in corner crops, then classify the corner type
+# purely from geometry — which edges of the crop the bbox touches.
 #
-# Recommended pipeline for maximum accuracy:
-#   detection → pose (approximate corners) → fiducial (precise refinement) → warp
+# Pipeline:
+#   detection → pose (approximate corners) → geometric refinement → warp
+#
+# How it works:
+#   1. Crop a region around each approximate corner from the pose model
+#   2. Run the detection model to find bounding boxes in that crop
+#   3. Classify the corner type by which crop edges the bbox touches:
+#        Left + Top    → LR   Right + Top    → LL
+#        Left + Bottom → UR   Right + Bottom → UL
+#   4. If no detection found or bbox fills the frame (touches all edges),
+#      expand the crop and retry
+#   5. Iterate: re-crop around the detected position for higher precision
+#
+# This eliminates the need for a separate fiducial corner model entirely.
+# The detection model already sees "things going off the edge of the frame"
+# perfectly well — it's just object detection, not orientation classification.
 # ---------------------------------------------------------------------------
 
-def run_fiducial(session, crop: Image.Image, conf_threshold: float = 0.5,
-                 img_size: int = FIDUCIAL_CROP_SIZE):
-    """Run the fiducial corner detection model on a PIL Image crop.
 
-    The model detects corners and classifies them as UL(0), UR(1), LL(2), LR(3).
-
-    Args:
-        session: ONNX inference session for the fiducial model.
-        crop: PIL Image crop (typically centered near a corner).
-        conf_threshold: Minimum confidence to keep a detection.
-        img_size: Model input size (default 640).
-
-    Returns:
-        list of dict with keys:
-            box: dict with x1, y1, x2, y2 in original crop pixel coords
-            confidence: detection confidence
-            class_id: 0=UL, 1=UR, 2=LL, 3=LR
-            center_x, center_y: bbox center (≈ corner position) in crop coords
-    """
-    crop_w, crop_h = crop.size
-    input_arr, scale_info = preprocess_letterbox(crop, img_size)
-
-    input_name = session.get_inputs()[0].name
-    output = session.run(None, {input_name: input_arr})[0]
-
-    ratio = scale_info["ratio"]
-    pad_w = scale_info["pad_w"]
-    pad_h = scale_info["pad_h"]
-
-    results = []
-
-    # Handle two output formats:
-    #   Per-row: (1, N, 6) with [x_center, y_center, w, h, conf, class]
-    #   Per-column: (1, 6, N) with [x1, y1, x2, y2, conf, class]
-    if len(output.shape) == 3 and output.shape[2] == 6:
-        # Per-row format
-        for i in range(output.shape[1]):
-            cx = output[0, i, 0]
-            cy = output[0, i, 1]
-            w = output[0, i, 2]
-            h = output[0, i, 3]
-            conf = output[0, i, 4]
-            cls = output[0, i, 5]
-
-            if conf < conf_threshold:
-                continue
-
-            # Map from letterboxed model space → original crop coords
-            orig_cx = (cx - pad_w) / ratio
-            orig_cy = (cy - pad_h) / ratio
-            orig_w = w / ratio
-            orig_h = h / ratio
-
-            results.append({
-                "box": {
-                    "x1": orig_cx - orig_w / 2,
-                    "y1": orig_cy - orig_h / 2,
-                    "x2": orig_cx + orig_w / 2,
-                    "y2": orig_cy + orig_h / 2,
-                },
-                "confidence": float(conf),
-                "class_id": int(cls),
-                "center_x": orig_cx,
-                "center_y": orig_cy,
-            })
-    elif len(output.shape) == 3 and output.shape[1] == 6:
-        # Per-column format (1, 6, N)
-        num_anchors = output.shape[2]
-        for i in range(num_anchors):
-            x1 = output[0, 0, i]
-            y1 = output[0, 1, i]
-            x2 = output[0, 2, i]
-            y2 = output[0, 3, i]
-            conf = output[0, 4, i]
-            cls = output[0, 5, i]
-
-            if conf < conf_threshold:
-                continue
-
-            ox1 = (x1 - pad_w) / ratio
-            oy1 = (y1 - pad_h) / ratio
-            ox2 = (x2 - pad_w) / ratio
-            oy2 = (y2 - pad_h) / ratio
-
-            results.append({
-                "box": {
-                    "x1": float(ox1),
-                    "y1": float(oy1),
-                    "x2": float(ox2),
-                    "y2": float(oy2),
-                },
-                "confidence": float(conf),
-                "class_id": int(cls),
-                "center_x": float((ox1 + ox2) / 2),
-                "center_y": float((oy1 + oy2) / 2),
-            })
-
-    return results
-
-
-def extract_fiducial_crop(image: Image.Image, x, y, crop_size: int = FIDUCIAL_CROP_SIZE):
+def _corner_crop(image: Image.Image, x, y, crop_size: int = CORNER_CROP_SIZE):
     """Extract a square crop centered on (x, y) from a PIL Image.
 
     If the crop would extend beyond the image boundary, it is shifted
@@ -599,32 +525,144 @@ def extract_fiducial_crop(image: Image.Image, x, y, crop_size: int = FIDUCIAL_CR
     return crop, x1, y1
 
 
-def refine_corners_fiducial(image: Image.Image, result: dict,
-                             fiducial_session, iterations: int = 2,
-                             conf_threshold: float = 0.5):
-    """Refine the 4 corners of a detected photo using the fiducial model.
+def _bbox_corner_coord(box: dict, corner_name: str) -> tuple:
+    """Return the bbox corner that approximates the fiducial position.
+
+    For a detection model (no keypoints), the relevant bbox corner is a
+    better approximation of the photo corner than the bbox center:
+      UL → (x1, y1)    UR → (x2, y1)
+      LL → (x1, y2)    LR → (x2, y2)
+    """
+    cx = box["x1"] if corner_name in ("UL", "LL") else box["x2"]
+    cy = box["y1"] if corner_name in ("UL", "UR") else box["y2"]
+    return cx, cy
+
+
+def _bbox_fills_crop(box: dict, crop_w: int, crop_h: int,
+                     margin: int = EDGE_MARGIN) -> bool:
+    """Check if a bounding box fills the entire crop (touches all 4 edges).
+
+    If the detected object fills the entire frame, it's likely the whole
+    photo region rather than just a corner. We need to retry with a wider crop.
+    """
+    touches_left   = box["x1"] < margin
+    touches_right  = box["x2"] > crop_w - margin
+    touches_top    = box["y1"] < margin
+    touches_bottom = box["y2"] > crop_h - margin
+    return touches_left and touches_right and touches_top and touches_bottom
+
+
+def classify_corner_by_edges(box: dict, crop_w: int, crop_h: int,
+                              margin: int = EDGE_MARGIN) -> str | None:
+    """Classify a corner type by which crop quadrant the bbox near-corner is in.
+
+    When we crop a region around a corner of a photo, the detected object's
+    bbox has one corner that is closest to the crop center — that corner IS
+    the photo corner. We find which of the 4 bbox corners is nearest to the
+    crop center, and the quadrant it falls in tells us the corner type:
+
+        Near-corner in top-left quadrant     → UL
+        Near-corner in top-right quadrant    → UR
+        Near-corner in bottom-left quadrant  → LL
+        Near-corner in bottom-right quadrant → LR
+
+    This approach is robust even when the bbox fills most of the crop
+    (which causes binary edge-crossing to find 3-4 edges). The bbox corner
+    nearest to the crop center is always the photo's actual corner point.
+
+    Args:
+        box: Bounding box dict with keys x1, y1, x2, y2 in crop pixel coords.
+        crop_w: Width of the crop in pixels.
+        crop_h: Height of the crop in pixels.
+        margin: Unused (kept for API compatibility).
+
+    Returns:
+        Corner name string ('UL', 'UR', 'LL', 'LR') or None on failure.
+    """
+    cx, cy = crop_w / 2, crop_h / 2  # crop center
+
+    # Compute distance from each bbox corner to the crop center.
+    # The nearest one is the photo's actual corner point.
+    bbox_corners = {
+        "UL": (box["x1"], box["y1"]),
+        "UR": (box["x2"], box["y1"]),
+        "LL": (box["x1"], box["y2"]),
+        "LR": (box["x2"], box["y2"]),
+    }
+    dists = {name: ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+             for name, (x, y) in bbox_corners.items()}
+
+    nearest = min(dists, key=dists.get)
+    nearest_dist = dists[nearest]
+
+    # Check that the nearest corner is reasonably close to the center.
+    # If it's farther than half the crop diagonal, the detection is likely
+    # not aligned with any corner we care about.
+    max_dist = (crop_w ** 2 + crop_h ** 2) ** 0.5 * 0.5
+    if nearest_dist > max_dist:
+        _log(f"Edge classification failed: nearest bbox corner {nearest} is too far "
+             f"from crop center ({nearest_dist:.0f} > {max_dist:.0f}), "
+             f"dists: {', '.join(f'{k}={v:.0f}' for k, v in sorted(dists.items(), key=lambda x: x[1]))}")
+        return None
+
+    _log(f"  Edge classification: nearest bbox corner {nearest} (dist={nearest_dist:.0f}) "
+         f"[dists: {', '.join(f'{k}={v:.0f}' for k, v in sorted(dists.items(), key=lambda x: x[1]))}]")
+    return nearest
+
+
+def refine_corners_geometric(image: Image.Image, result: dict,
+                              pose_session=None, detection_session=None,
+                              iterations: int = 2,
+                              conf_threshold: float = 0.5,
+                              crop_size: int = CORNER_CROP_SIZE,
+                              max_expand: float = CORNER_CROP_EXPAND):
+    """Refine the 4 corners of a detected photo using geometric edge classification.
+
+    Uses either the pose model (default, higher quality) or the detection model
+    to refine corner positions by cropping around each approximate corner.
+
+    With the pose model (default):
+      - Runs the pose model on each corner crop
+      - Finds the detection whose bounding box edge-contacts match the target corner
+      - Uses the NAMED KEYPOINT matching the target corner for sub-pixel precision
+      - Falls back to bbox corner if keypoint has low visibility
+      - Also supports direct keypoint matching (no edge classification needed)
+        when the target keypoint is clearly visible in the crop
+
+    With the detection model (--corner-refine-model detection):
+      - Runs the detection model on each corner crop
+      - Classifies corner type by which crop edges the bbox touches (pure geometry)
+      - Uses the relevant bbox corner as approximate fiducial position
 
     For each corner:
-      1. Extract a 640×640 crop around the approximate corner position
-      2. Run the fiducial model to detect the corner
-      3. Map the detected corner back to full image coordinates
-      4. Optionally iterate: re-crop around the detected position
-
-    The initial corner positions come from the pose model keypoints
-    in the result dict. The fiducial model refines them to pixel precision.
+      1. Crop a region around the approximate corner position
+      2. Run the pose/detection model to find objects in that crop
+      3. Match the detection to the target corner (edge classification or keypoint)
+      4. Extract the corner position from keypoints (pose) or bbox corner (detection)
+      5. If no match found or bbox fills the frame, expand the crop and retry
+      6. Iterate: re-crop around the detected position for higher precision
 
     Args:
         image: Full input PIL Image
         result: Pipeline result dict with 'keypoints' list and 'detection'/'box'
-        fiducial_session: ONNX model session for the fiducial model
+        pose_session: ONNX inference session for the pose model (preferred)
+        detection_session: ONNX inference session for the detection model.
         iterations: Number of refinement iterations (default 2)
-        conf_threshold: Minimum detection confidence for the fiducial model
+        conf_threshold: Minimum detection confidence (default 0.5)
+        crop_size: Initial crop size in pixels (default 640)
+        max_expand: Maximum factor to expand crop when retrying (default 1.5)
 
     Returns:
         The same result dict with updated keypoint coordinates and
         visibility boosted to 1.0 for successfully refined corners.
-        Corners that couldn't be refined are left unchanged.
     """
+    if pose_session is None and detection_session is None:
+        raise ValueError("Either pose_session or detection_session must be provided")
+
+    use_pose = pose_session is not None
+    model_session = pose_session if use_pose else detection_session
+    model_name = "pose" if use_pose else "detection"
+
     kps = {kp["name"]: kp for kp in result.get("keypoints", [])}
     box = result["detection"]["box"]
 
@@ -644,41 +682,105 @@ def refine_corners_fiducial(image: Image.Image, result: dict,
         else:
             approx_corners[name] = bbox_corners[name]
 
-    expected_classes = {
-        "UL": FIDUCIAL_CLASS_UL,
-        "UR": FIDUCIAL_CLASS_UR,
-        "LL": FIDUCIAL_CLASS_LL,
-        "LR": FIDUCIAL_CLASS_LR,
-    }
-
     refined_corners = {}
 
     for corner_name, (ax, ay) in approx_corners.items():
-        expected_class = expected_classes[corner_name]
         best_detection = None
 
         for iteration in range(iterations):
-            crop, offset_x, offset_y = extract_fiducial_crop(image, ax, ay)
+            # Try progressively wider crops if detection fails or bbox fills frame.
+            found = False
+            expand_factors = [1.0]
+            if max_expand > 1.0:
+                expand_factors.append(round((1.0 + max_expand) / 2, 2))
+                expand_factors.append(max_expand)
 
-            detections = run_fiducial(fiducial_session, crop,
-                                       conf_threshold=conf_threshold)
+            for expand in expand_factors:
+                this_crop_size = int(crop_size * expand)
+                crop, offset_x, offset_y = _corner_crop(image, ax, ay, this_crop_size)
 
-            if not detections:
-                break
+                # Run the appropriate model
+                if use_pose:
+                    results = run_pose(model_session, crop,
+                                       conf_threshold=conf_threshold,
+                                       img_size=DEFAULT_IMG_SIZE)
+                else:
+                    results = run_detection(model_session, crop,
+                                             conf_threshold=conf_threshold,
+                                             img_size=DEFAULT_IMG_SIZE)
 
-            # Prefer detections matching the expected class
-            class_matches = [d for d in detections if d["class_id"] == expected_class]
+                if not results:
+                    if expand < expand_factors[-1]:
+                        continue  # Try wider crop
+                    else:
+                        break  # No results even at max expand
 
-            if class_matches:
-                best = max(class_matches, key=lambda d: d["confidence"])
-            else:
-                # Fallback: use highest confidence detection of any class
-                best = max(detections, key=lambda d: d["confidence"])
+                # Check for detections matching our target corner
+                for det in sorted(results, key=lambda d: d["confidence"], reverse=True):
+                    det_box = det["box"]
 
-            # Map back to full image coordinates
-            ax = best["center_x"] + offset_x
-            ay = best["center_y"] + offset_y
-            best_detection = best
+                    if use_pose and "keypoints" in det:
+                        # ── Pose model: use named keypoints for matching ──
+                        # The pose model gives us named keypoints (UL, UR, LL, LR).
+                        # The keypoint matching our target corner name IS the corner
+                        # we're looking for — no edge classification needed for
+                        # matching. We still use edge classification as a secondary
+                        # validation signal, but the primary match is the keypoint name.
+                        det_kps = {kp["name"]: kp for kp in det["keypoints"]}
+                        target_kp = det_kps.get(corner_name)
+
+                        if target_kp and target_kp["visibility"] >= 0.3:
+                            # Found the target corner keypoint with good visibility.
+                            # Use its position directly — no edge classification needed.
+                            ax = target_kp["x"] + offset_x
+                            ay = target_kp["y"] + offset_y
+                            best_detection = det
+                            found = True
+                            break
+                        else:
+                            # Target keypoint not visible — try edge classification
+                            # as fallback to identify which detection is ours
+                            corner_type = classify_corner_by_edges(
+                                det_box, this_crop_size, this_crop_size)
+                            if corner_type == corner_name:
+                                # Edge classification matches — use bbox corner
+                                cx, cy = _bbox_corner_coord(det_box, corner_name)
+                                ax = cx + offset_x
+                                ay = cy + offset_y
+                                best_detection = det
+                                found = True
+                                break
+                            # else: not our corner, check next detection
+                    else:
+                        # ── Detection model: use edge classification ──
+                        # No keypoints available — classify by which edges the
+                        # bbox touches.
+                        if _bbox_fills_crop(det_box, this_crop_size, this_crop_size):
+                            _log(f"  {corner_name}: bbox fills crop at {this_crop_size}px, "
+                                 f"expanding")
+                            continue
+
+                        corner_type = classify_corner_by_edges(
+                            det_box, this_crop_size, this_crop_size)
+
+                        if corner_type == corner_name:
+                            # Found a matching corner — use bbox corner
+                            cx, cy = _bbox_corner_coord(det_box, corner_name)
+                            ax = cx + offset_x
+                            ay = cy + offset_y
+                            best_detection = det
+                            found = True
+                            break
+                        elif corner_type is not None:
+                            _log(f"  {corner_name}: edge classification gave {corner_type}, "
+                                 f"expected {corner_name}")
+
+                if found:
+                    break  # Don't try wider crops if we found a match
+
+            if not found:
+                _log(f"  {corner_name}: no matching detection found ({model_name} model)")
+                break  # Give up on this corner for this iteration
 
         if best_detection is not None:
             refined_corners[corner_name] = (ax, ay)
@@ -687,28 +789,25 @@ def refine_corners_fiducial(image: Image.Image, result: dict,
             refined_corners[corner_name] = approx_corners[corner_name]
 
     # Update the result dict with refined positions
+    any_refined = False
     for name in ["UL", "UR", "LL", "LR"]:
         if name in refined_corners:
             rx, ry = refined_corners[name]
             if name in kps:
-                # Update existing keypoint
                 kps[name]["x"] = rx
                 kps[name]["y"] = ry
-                if best_detection is not None or name in kps:
-                    kps[name]["visibility"] = 1.0  # Fiducial-refined corners are high-confidence
+                kps[name]["visibility"] = 1.0
+                any_refined = True
             else:
-                # Add missing keypoint
                 result.setdefault("keypoints", []).append({
                     "name": name,
                     "x": rx,
                     "y": ry,
                     "visibility": 1.0,
                 })
+                any_refined = True
 
     return result
-
-
-# ---------------------------------------------------------------------------
 # Stage 3: Pose-based deduplication
 # ---------------------------------------------------------------------------
 
@@ -3112,9 +3211,10 @@ def infer_single(detection_session, pose_session, image_path: str,
                  adaptive_margin_thresh: float = 0.5,
                  adaptive_margin_max: float = 0.03,
                  warp_fallback_thresh: float = 0.3,
-                 fiducial_session=None,
-                 fiducial_iterations: int = 2,
-                 fiducial_conf: float = 0.5):
+                 corner_refine: bool = False,
+                 corner_refine_iterations: int = 2,
+                 corner_refine_conf: float = 0.5,
+                 corner_refine_model: str = "pose"):
     """Run the full pipeline on a single image."""
 
     # Open image and capture EXIF before converting (convert creates
@@ -3201,17 +3301,27 @@ def infer_single(detection_session, pose_session, image_path: str,
             else:
                 _log(f"  Skipping auto-refine: all photos have >= {_MIN_VISIBLE_CORNERS} visible corners")
 
-    # ── Fiducial corner refinement ──
-    # After pose (+ optional CV refinement), run the fiducial corner model
-    # to refine corner positions to pixel precision. Each corner is localized
-    # by cropping around it and detecting the L-shaped boundary pattern.
-    if fiducial_session is not None and results:
-        _log(f"  Fiducial refinement: {fiducial_iterations} iteration(s)")
+    # ── Geometric corner refinement ──
+    # After pose (+ optional CV refinement), refine corner positions using
+    # pose model (default) or detection model with geometric edge classification.
+    # Each corner is localized by cropping around it and checking which edges
+    # of the crop the detected bounding box touches.
+    if corner_refine and results:
+        cr_pose = pose_session if corner_refine_model == "pose" else None
+        cr_detect = detection_session if corner_refine_model == "detection" else None
+        if cr_pose is None and cr_detect is None:
+            # Fallback: use whichever session is available
+            cr_pose = pose_session
+            cr_detect = detection_session if cr_pose is None else None
+        _log(f"  Corner refinement: {corner_refine_iterations} iteration(s) "
+             f"(model: {corner_refine_model})")
         for res in results:
-            refine_corners_fiducial(image, res, fiducial_session,
-                                     iterations=fiducial_iterations,
-                                     conf_threshold=fiducial_conf)
-        _log(f"  Fiducial refinement complete")
+            refine_corners_geometric(image, res,
+                                      pose_session=cr_pose,
+                                      detection_session=cr_detect,
+                                      iterations=corner_refine_iterations,
+                                      conf_threshold=corner_refine_conf)
+        _log(f"  Corner refinement complete")
 
     # Print results
     mode = "2-stage" if detection_session else "1-stage (pose only)"
@@ -3227,8 +3337,8 @@ def infer_single(detection_session, pose_session, image_path: str,
         mode += " + cv-refine"
     if auto_refine:
         mode += " + auto-refine"
-    if fiducial_session is not None:
-        mode += " + fiducial"
+    if corner_refine:
+        mode += " + corner-refine"
     _log(f"Mode: {mode}")
     _log(f"\n{'=' * 60}")
     _log(f"Image: {image_path}")
@@ -3356,9 +3466,10 @@ def infer_batch(detection_session, pose_session, image_dir: str,
                adaptive_margin_thresh: float = 0.5,
                adaptive_margin_max: float = 0.03,
                warp_fallback_thresh: float = 0.3,
-               fiducial_session=None,
-               fiducial_iterations: int = 2,
-               fiducial_conf: float = 0.5):
+               corner_refine: bool = False,
+               corner_refine_iterations: int = 2,
+               corner_refine_conf: float = 0.5,
+               corner_refine_model: str = "pose"):
 
     image_dir = Path(image_dir)
     extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
@@ -3408,11 +3519,11 @@ def infer_batch(detection_session, pose_session, image_dir: str,
             adaptive_margin_thresh=adaptive_margin_thresh,
             adaptive_margin_max=adaptive_margin_max,
             warp_fallback_thresh=warp_fallback_thresh,
-            fiducial_session=fiducial_session,
-            fiducial_iterations=fiducial_iterations,
-            fiducial_conf=fiducial_conf,
+            corner_refine=corner_refine,
+            corner_refine_iterations=corner_refine_iterations,
+            corner_refine_conf=corner_refine_conf,
+            corner_refine_model=corner_refine_model,
         )
-        pose_ok = sum(1 for r in results if r.get("keypoints"))
         summary.append({
             "image": img_path.name,
             "photos": len(results),
@@ -3839,23 +3950,30 @@ Coordinates Only (scripting-friendly):
              "Set to 0 to disable warp fallback (default: 0.3).",
     )
     parser.add_argument(
-        "--fiducial-model", type=str, default=None,
-        help="Path to fiducial corner ONNX model. When provided, runs "
-             "fiducial corner refinement after pose detection to refine "
-             "corner positions to pixel precision. Each corner is localized "
-             "by cropping around it and detecting the L-shaped boundary pattern. "
-             "Default: disabled (no fiducial refinement).",
+        "--corner-refine", action="store_true", default=False,
+        help="Enable geometric corner refinement after pose detection. "
+             "Uses the detection model to refine corner positions by cropping "
+             "around each corner and classifying which edges of the crop the "
+             "detected bounding box touches. No separate model needed — "
+             "reuses the detection model. Default: disabled.",
     )
     parser.add_argument(
-        "--fiducial-iterations", type=int, default=2,
-        help="Number of fiducial refinement iterations. Each iteration re-crops "
+        "--corner-refine-iterations", type=int, default=2,
+        help="Number of corner refinement iterations. Each iteration re-crops "
              "around the detected corner position for higher precision. "
              "(default: 2)",
     )
     parser.add_argument(
-        "--fiducial-conf", type=float, default=0.5,
-        help="Confidence threshold for the fiducial corner detection model. "
+        "--corner-refine-conf", type=float, default=0.5,
+        help="Confidence threshold for corner refinement detection model. "
              "(default: 0.5)",
+    )
+    parser.add_argument(
+        "--corner-refine-model", type=str, default="pose",
+        choices=["pose", "detection"],
+        help="Model to use for corner refinement. 'pose' uses the pose model "
+             "(default, higher quality — provides keypoints for sub-pixel precision). "
+             "'detection' uses the detection model (relevant bbox corner, less precise than keypoints).",
     )
 
     args = parser.parse_args()
@@ -3884,16 +4002,6 @@ Coordinates Only (scripting-friendly):
     # Load pose model
     _log(f"Loading pose model: {pose_model_path}")
     pose_session = load_onnx_model(str(pose_model_path))
-
-    # Load fiducial model (optional)
-    fiducial_session = None
-    if args.fiducial_model:
-        fiducial_model_path = Path(args.fiducial_model).resolve()
-        if not fiducial_model_path.exists():
-            _log(f"Error: Fiducial model not found: {fiducial_model_path}")
-            sys.exit(1)
-        _log(f"Loading fiducial model: {fiducial_model_path}")
-        fiducial_session = load_onnx_model(str(fiducial_model_path))
 
     # Validate image path and auto-detect file vs directory mode
     image_path = Path(args.image)
@@ -3956,9 +4064,10 @@ Coordinates Only (scripting-friendly):
             adaptive_margin_thresh=args.adaptive_margin_thresh,
             adaptive_margin_max=args.adaptive_margin_max,
             warp_fallback_thresh=args.warp_fallback_thresh,
-            fiducial_session=fiducial_session,
-            fiducial_iterations=args.fiducial_iterations,
-            fiducial_conf=args.fiducial_conf,
+            corner_refine=args.corner_refine,
+            corner_refine_iterations=args.corner_refine_iterations,
+            corner_refine_conf=args.corner_refine_conf,
+            corner_refine_model=args.corner_refine_model,
         )
     else:
         infer_single(
@@ -3992,9 +4101,10 @@ Coordinates Only (scripting-friendly):
             adaptive_margin_thresh=args.adaptive_margin_thresh,
             adaptive_margin_max=args.adaptive_margin_max,
             warp_fallback_thresh=args.warp_fallback_thresh,
-            fiducial_session=fiducial_session,
-            fiducial_iterations=args.fiducial_iterations,
-            fiducial_conf=args.fiducial_conf,
+            corner_refine=args.corner_refine,
+            corner_refine_iterations=args.corner_refine_iterations,
+            corner_refine_conf=args.corner_refine_conf,
+            corner_refine_model=args.corner_refine_model,
         )
 
 
