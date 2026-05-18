@@ -52,6 +52,25 @@ Input Image
        │
        ▼
 ┌──────────────────────────┐
+│  Pose Refinement         │  (optional, --pose-refine)
+│                          │  Refines approximate pose keypoints
+└──────┬───────────────────┘
+       │
+       ▼
+┌──────────────┐
+│  Dedup       │  Remove duplicate detections / overlapping poses
+└──────┬───────┘
+       │
+       ▼
+┌──────────────────────────┐
+│  Rescue (always on)      │  Sobel edge detection + line intersection
+│                          │  Recovers invisible/low-visibility corners when
+│                          │  a photo has < 3 visible corners
+│                          │  → inferred corner positions from edge geometry
+└──────┬───────────────────┘
+       │
+       ▼
+┌──────────────────────────┐
 │  Corner Refinement       │  Recover invisible/low-vis corners (1 pass per corner)
 │  (pose or detection)     │  Crops around each corner, runs model again
 │  --corner-refine          │  → precise positions for vis≈1.0
@@ -64,8 +83,20 @@ Input Image
 └──────┬───────────┘
        │
        ▼
-  Perspective warp → clean extracted photo
+  Crop / Warp → clean extracted photo
 ```
+
+### Automatic Rescue
+
+The **rescue stage** always runs after dedup. It uses Sobel edge detection and
+line intersection to recover invisible or low-visibility corners when a photo
+has fewer than 3 visible corners. This is a geometric fallback — no ML
+inference required — that reconstructs missing corners from the photo's edge
+structure.
+
+Rescue is always on (no flag needed) because it has **zero cost** when all 4
+corners are already visible. When a photo has < 3 visible corners, rescue adds
+only ~280ms to recover the missing corners from edge geometry.
 
 ### Corner Refinement Details
 
@@ -92,6 +123,7 @@ contacts for classification.
 | Pipeline | Time | Notes |
 |----------|------|-------|
 | Detect + pose (baseline) | ~700ms | 4/4 photos found, but invisible corners stay invisible |
+| + Rescue (if triggered) | ~280ms | Only when a photo has < 3 visible corners; zero cost otherwise |
 | + Corner refinement (pose) | ~2,500ms | Recovers all invisible corners, vis=1.0 for all |
 | + Corner refinement (detection) | ~1,900ms | Recovers most corners, less precise than pose |
 | + Sweep (XY) | ~6,900ms | Replaced by corner refinement — slower, same results |
@@ -102,11 +134,13 @@ contacts for classification.
 photocrop --image scan.jpg --preset best
 # Equivalent to:
 photocrop --image scan.jpg \
+  --pose-refine \
   --corner-refine --corner-refine-model pose \
-  --cv-refine --auto-refine \
+  --cv-refine \
   --crop warp-stretch --crop-margin 0.02 --border-fill white \
   --adaptive-margin
 ```
+Auto-rescue is always on (no flag needed).
 
 ## Future Improvements
 

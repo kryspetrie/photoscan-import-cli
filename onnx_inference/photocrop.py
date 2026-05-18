@@ -3,22 +3,36 @@
 photocrop — Detect & Extract Photos from Multi-Photo Scans
 ===========================================================
 
-Two-stage pipeline for detecting photo corners in multi-photo images:
+Pipeline for detecting photo corners in multi-photo images:
 
   Stage 1 (Detection):  Detect photo bounding boxes in the full image
-  Stage 2 (Pose):       Crop each detected box → detect 4 corner keypoints
-                        Map keypoints back to original image coordinates
-  Stage 3 (Dedup):      Greedy deduplication by keypoint-center proximity
+  Stage 2 (Pose):        Crop each detected box → detect 4 corner keypoints
+                         Map keypoints back to original image coordinates
+  Stage 2b (Refine):     [optional, --pose-refine] Re-run pose on tighter crop
+  Stage 3 (Dedup):       Greedy deduplication by keypoint-center proximity
+  Stage 4 (Rescue):      [automatic] Recover invisible/low-vis corners using
+                         Sobel edge detection + line intersection. Only runs
+                         on photos with < 3 visible corners — zero cost on
+                         well-detected images.
 
-Optional Stage 2b (Refine): --pose-refine
-  After the first pose pass, derive a tighter bounding box from the detected
-  keypoints and re-run the pose model with a smaller crop. This helps when
-  the detection box is loose or misaligned — the second pass gets a crop that's
-  tightly centered on the actual photo, improving corner visibility.
+Optional post-rescue stages:
+  --corner-refine:       Crop around each corner → re-run model for vis=1.0
+  --cv-refine:           Sobel edge refinement on ALL corners (sub-pixel)
 
-  The first pass uses --pose-crop-expand (default 15%) to give the pose model
-  enough context. The refine pass uses --pose-refine-expand (default 5%) since
-  the keypoint-derived box is already well-centered.
+The rescue stage (always on) prevents degenerate crops (e.g., "strip" crops
+from only 2 visible corners) and avoids warp→simple fallback when edges are
+visible but the neural network missed the corner position.
+
+Pose Refine (--pose-refine)
+---------------------------
+After the first pose pass, derive a tighter bounding box from the detected
+keypoints and re-run the pose model with a smaller crop. This helps when
+the detection box is loose or misaligned — the second pass gets a crop that's
+tightly centered on the actual photo, improving corner visibility.
+
+The first pass uses --pose-crop-expand (default 15%) to give the pose model
+enough context. The refine pass uses --pose-refine-expand (default 5%) since
+the keypoint-derived box is already well-centered.
 
 Overlapping Detections
 ---------------------

@@ -1,6 +1,6 @@
 # Photo Pose Detector
 
-Detect the corners of physical photographs in camera-scanned images, extract each photo, and correct perspective distortion — powered by detection + pose models with geometric corner refinement.
+Detect the corners of physical photographs in camera-scanned images, extract each photo, and correct perspective distortion — powered by detection + pose models with geometric corner refinement and automatic rescue.
 
 ## The Problem
 
@@ -15,7 +15,7 @@ The goal: **automatically detect each photo, locate its four corners precisely, 
 
 ## Current Architecture
 
-Two models work together in a pipeline, with optional corner refinement and CV post-processing:
+Two models work together in a pipeline, with an always-on rescue stage and optional corner refinement / CV post-processing:
 
 ```
 Input Image
@@ -33,9 +33,25 @@ Input Image
 └──────┬───────┘
        │
        ▼ (optional, recommended)
+┌──────────────┐
+│ Pose Refine  │  Crop around each corner → re-run model for better localization
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│   Dedup      │  Remove duplicate detections
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│   Rescue     │  Always on — Sobel edge detection + line intersection
+│ (automatic)  │  Recovers invisible/low-visibility corners when < 3 visible
+└──────┬───────┘
+       │
+       ▼ (optional)
 ┌──────────────────────────┐
-│  Corner Refinement       │  Recover invisible/low-vis corners
-│  (--corner-refine)        │  Crops around each corner → runs model again
+│  Corner Refinement       │  Crop around each corner → run model again
+│  (--corner-refine)        │  Recover remaining invisible/low-vis corners
 └──────┬───────────────────┘
        │
        ▼ (optional)
@@ -47,6 +63,10 @@ Input Image
        ▼
   Perspective warp → clean extracted photo
 ```
+
+### Automatic Rescue
+
+The pipeline includes an **always-on rescue stage** that requires no flags or configuration. When a photo has fewer than 3 visible corners, the rescue stage uses Sobel edge detection and line intersection analysis to recover invisible or low-visibility corners. This replaces the previous `--auto-refine` flag — rescue is now always active.
 
 ### Why Corner Refinement
 
@@ -90,9 +110,10 @@ photocrop --image scan.jpg --coords json --no-image
 | Preset | What it does | Time | Use when |
 |--------|-------------|------|----------|
 | **quick** | Detect + pose only, no cropping | ~1s | You only need coordinates, no crops |
-| **crop** | + auto-refine + adaptive margin + simple-corners crop | ~1s | You want rectangular crops with margin |
-| **warp** | + auto-refine + adaptive margin + perspective warp | ~1s | You want perspective-corrected crops |
-| **best** | + corner-refine + cv-refine + auto-refine + adaptive margin + warp | ~3s | Invisible corners or maximum quality |
+| **standard** | + pose-refine + adaptive margin + crop | ~1s | You want good-quality crops with margin |
+| **thorough** | + pose-refine + corner-refine + cv-refine + adaptive margin + warp | ~3s | Invisible corners or maximum quality |
+
+> The rescue stage always runs regardless of preset — no flag needed.
 
 ## Performance
 

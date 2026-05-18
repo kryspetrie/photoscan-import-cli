@@ -8,7 +8,7 @@ Detect and extract individual photographs from multi-photo scans. Feed it a scan
 # Just detect and output coordinates (~1s)
 photocrop --image scan.jpg --preset quick
 
-# Crop photos with auto-refine (~1s, recommended starting point)
+# Crop photos with adaptive margin (~1s, recommended starting point)
 photocrop --image scan.jpg --preset crop
 
 # Perspective warp with white fill (~1s, clean edges)
@@ -50,21 +50,33 @@ Input Image
 │  3. Dedup            │  Remove duplicate detections
 └─────────────────────┘
     │
+    ▼
+┌─────────────────────┐
+│  4. Rescue           │  Always on — Sobel edge detection +
+│    (automatic)       │  neighbor-anchored projection recovers
+│                      │  invisible/low-visibility corners when
+│                      │  a photo has < 3 visible corners.
+│                      │  Prevents degenerate "strip" crops and
+│                      │  warp→simple fallback. Only runs on
+│                      │  photos that need it — zero cost on
+│                      │  well-detected images.
+└─────────────────────┘
+    │
     ▼ (optional stages)
 ┌─────────────────────┐
-│  4. Corner Refinement│  Recover invisible/low-vis corners
+│  5. Corner Refinement│  Recover invisible/low-vis corners
 │    (--corner-refine) │  Crops around each corner → runs model again
 └─────────────────────┘
     │
     ▼
 ┌─────────────────────┐
-│  5. CV Refinement    │  Edge detection + line intersection
-│     (auto or manual)│  Fixes inaccurate NN-predicted corners
+│  6. CV Refinement    │  Edge detection + line intersection
+│     (--cv-refine)    │  Fixes inaccurate NN-predicted corners
 └─────────────────────┘
     │
     ▼
 ┌─────────────────────┐
-│  6. Crop / Warp      │  Extract each photo individually
+│  7. Crop / Warp      │  Extract each photo individually
 └─────────────────────┘
 ```
 
@@ -86,7 +98,7 @@ The most common issues and their solutions:
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | **Invisible corners** | Corners occluded by shadow, glare, or edge | Use `--corner-refine` (included in best preset) |
-| **Tiny "strip" crops** | Fewer than 3 visible corners → crop collapses | Use `--auto-refine` (included in crop/warp/best presets) |
+| **Tiny "strip" crops** | Fewer than 3 visible corners → crop collapses | Automatic — rescue always runs |
 | **Inaccurate corners** | NN prediction is approximate | Use `--cv-refine` (included in best preset) |
 | **Detects wrong photo** | Detection box too large, captures neighbor | Use `--corner-refine` which re-crops around each corner |
 
@@ -94,14 +106,14 @@ The most common issues and their solutions:
 
 ## Presets
 
-Presets bundle common settings. Any individual flag can override a preset value.
+Presets bundle common settings. Any individual flag can override a preset value. The rescue stage runs automatically for all presets — no flag needed.
 
 | Preset | What it does | Time | Use when |
 |--------|-------------|------|----------|
 | **quick** | Detect + pose only, no cropping | ~1s | You only need coordinates, no crops |
-| **crop** | + auto-refine + adaptive margin + simple-corners crop | ~1s | You want rectangular crops with margin |
-| **warp** | + auto-refine + adaptive margin + perspective warp | ~1s | You want perspective-corrected crops |
-| **best** | + corner-refine + cv-refine + auto-refine + adaptive margin + warp | ~3s | Invisible corners or maximum quality |
+| **crop** | + pose-refine + adaptive margin + simple-corners crop | ~1s | You want rectangular crops with margin |
+| **warp** | + pose-refine + adaptive margin + perspective warp | ~1s | You want perspective-corrected crops |
+| **best** | + pose-refine + corner-refine + cv-refine + adaptive margin + warp | ~3s | Invisible corners or maximum quality |
 
 ```bash
 # Crop photos with ~2% margin, auto-fixing bad corners
@@ -214,7 +226,6 @@ After the neural network finds approximate corners, CV refinement uses edge dete
 |------|---------|-------------|
 | `--cv-refine` | off | Apply CV refinement to all photos. Uses orientation-aware Sobel edge filtering + neighbor-anchored projection + strip search |
 | `--cv-refine-radius` | 40 | Search radius (pixels) around each NN-predicted corner |
-| `--auto-refine` | off | Apply CV refinement only to photos with fewer than 3 visible corners. Prevents "strip" crops without the cost of refining every photo |
 
 ### Cropping
 
@@ -361,16 +372,16 @@ photocrop --image scan.jpg \
 
 ---
 
-## Understanding Auto-Refine vs CV-Refine
+## Understanding Rescue vs CV-Refine
 
-| | `--cv-refine` | `--auto-refine` |
+| | **Rescue** | **--cv-refine** |
 |---|---|---|
-| **What** | Run CV edge refinement on every photo | Run CV refinement only on photos with <3 visible corners |
-| **When** | You want maximum accuracy on all corners | You want to fix broken crops without slowing down all photos |
-| **Cost** | Always processes every photo (~3s overhead) | Only runs when needed (0s on well-detected images) |
-| **Included in** | `--preset best` | `--preset crop`, `--preset warp`, `--preset best` |
+| **What** | Automatically applies CV edge refinement to photos with < 3 visible corners | Applies CV refinement to ALL corners on ALL photos |
+| **When** | Always on — runs automatically when needed | You want maximum precision on every corner |
+| **Cost** | Zero cost on well-detected images — only runs on photos that need it | Always processes every photo (~3s overhead) |
+| **Purpose** | Prevents strip crops and warp→simple fallback | Sub-pixel accuracy on every corner |
 
-The `--auto-refine` option is a safety net: if any photo has fewer than 3 visible corners (meaning the crop could collapse to a degenerate shape like a thin "strip"), it automatically runs the full CV refinement pass. On well-separated photos where all 4 corners are detected, it adds zero overhead.
+The **rescue stage** is a safety net that always runs after deduplication. When a photo has fewer than 3 visible corners (e.g., from shadow, glare, or edge clipping), Sobel edge detection and neighbor-anchored projection recover the missing corners. This prevents degenerate "strip" crops and warp→simple fallback. On well-detected images where all 4 corners are visible, rescue adds zero overhead.
 
 ---
 
@@ -486,8 +497,8 @@ Approximate processing times for a 1512×2016 scan with 4 photos:
 | Command | Time | Quality |
 |---------|------|---------|
 | `--preset quick` | ~1s | Annotated output only |
-| `--preset crop` | ~1s | Good crops with auto-refine safety net |
-| `--preset warp` | ~1s | Good perspective warps with auto-refine |
+| `--preset crop` | ~1s | Good crops with rescue safety net |
+| `--preset warp` | ~1s | Good perspective warps with rescue |
 | `--preset best` | ~3s | Maximum quality, recovers invisible corners |
 
 ### Corner Refinement Performance
@@ -532,7 +543,6 @@ results = pipeline(
     corner_refine=True,       # Recover invisible corners
     corner_refine_iterations=2,
     corner_refine_model="pose",  # or "detection"
-    auto_refine=True,         # Auto-fix broken corners
     cv_refine=True,           # CV edge-based corner refinement
 )
 
@@ -568,7 +578,7 @@ save_crops(
 
 | Symptom | Cause | Solution |
 |----------|-------|----------|
-| "Strip" crop (e.g., 64×888) | Only 2 corners detected, crop collapses | Use `--auto-refine` or `--preset crop/warp/best` |
+| "Strip" crop (e.g., 64×888) | Only 2 corners detected, crop collapses | Automatic — rescue always runs |
 | Corners on wrong photo | Crop expand includes adjacent photo | Use `--pose-sweep-xy` or `--preset best` |
 | Missing corners (low visibility) | Photo edges unclear or cropped | Use `--cv-refine` for edge-based detection |
 | Too many duplicate detections | Detection model finds overlapping boxes | Lower `--det-conf` or adjust `--dedup-dist` |
