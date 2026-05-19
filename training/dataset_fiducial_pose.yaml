@@ -1,0 +1,36 @@
+# YOLO Fiducial Pose Dataset Configuration
+# ==========================================
+# Multi-pose corner segment detection on 640×640 crops.
+#
+# Each instance is a visible photo boundary segment with 2 keypoints
+# (segment endpoints). A single class "photo_segment" is used —
+# geometric grouping determines which segments belong to the same
+# quadrilateral.
+#
+# Label format (11 columns per instance):
+#   class_id x_center y_center width height kp0x kp0y kp0v kp1x kp1y kp1v
+#
+# Keypoint order: kp0 = first endpoint, kp1 = second endpoint
+# Visibility: 2 = visible endpoint, 0 = off-screen (boundary intersection)
+#
+# Scene modes:
+#   - one_corner:     1 photo with 1 corner visible (2 edges, L-shape)
+#   - grid:           2-4 photos in grid layout, each max 2 edges visible
+#   - two_corners:    1 photo with 2 adjacent corners visible
+#   - no_photo:       background only (0 instances)
+#
+# Usage:
+#   python3 train_fiducial_pose.py
+#   (or: python3 train_fiducial_pose.py --data dataset_fiducial_pose.yaml)
+
+path: /Users/krys.petrie/dev/photo-pose-detector/data_fiducial_pose
+train: images/train
+val: images/val
+
+nc: 1
+names:
+  0: photo_segment
+
+# Keypoint configuration: 2 keypoints per instance (segment endpoints)
+kpt_shape: [2, 3]
+flip_idx: [1, 0]

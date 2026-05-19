@@ -12,6 +12,7 @@ test/
 tests/
 data_fiducial/
 data_fiducial_binary/
+data_fiducial_pose/
 
 REMOVED/
 
