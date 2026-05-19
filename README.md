@@ -15,7 +15,7 @@ The goal: **automatically detect each photo, locate its four corners precisely, 
 
 ## Current Architecture
 
-Two models work together in a pipeline, with an always-on rescue stage and optional corner refinement / CV post-processing:
+Two production models work together in a pipeline, with an always-on rescue stage and optional corner refinement / CV post-processing. A third model (fiducial-pose segments) is in development:
 
 ```
 Input Image
@@ -124,21 +124,23 @@ Approximate processing times for a 1512×2016 scan with 4 photos:
 | Baseline (detect + pose) | ~700ms | May miss invisible corners |
 | + Corner refine (pose) | ~2,500ms | All 4/4 corners with vis=1.0 |
 | + Corner refine (detection) | ~1,900ms | Most corners recovered |
-| ~~Sweep~~ (superseded) | ~~6,900ms~~ | Same as corner refine but slower |
 
-## Training Status
+## Models
 
-| Model | Status | Best mAP50 | Notes |
-|-------|--------|-----------|-------|
-| Detection | ✅ Complete | 0.995 | Epoch 47 |
-| Pose (single) | ✅ Complete | 0.995 | Keypoint accuracy limited (mAP50-95=0.107) |
+| Model | File | Status | Best mAP50 | Notes |
+|-------|------|--------|-----------|-------|
+| Detection | `models/detection_ep47.onnx` | ✅ Production | 0.995 | Epoch 47 |
+| Pose (single) | `models/pose_single_ep42.onnx` | ✅ Production | 0.995 | Foundation of the pipeline |
+| Fiducial-pose segments | (training in progress) | 🔄 In development | TBD | Detects visible edge segments for corner assembly |
 
-### Failed Approaches (Archived in `REMOVED/`)
+### Failed Approaches
+
+Previous attempts to classify corners directly all failed due to the inherent visual ambiguity of L-shaped photo corners:
 
 | Approach | Why It Failed |
 |----------|--------------|
-| **Multi-pose model** | 0% background images → precision stuck at 0.50; overfitting after epoch 19 |
-| **4-class fiducial** | Corner orientations visually indistinguishable → cls_loss ≈ random |
+| **Multi-pose model** | 0% background images → precision stuck at 0.50 |
+| **4-class fiducial** | Corner orientations visually indistinguishable |
 | **Binary fiducial** | Same problem — crop-level classification inherently ambiguous |
 
 ### Key Insight: Geometric Corner Refinement
@@ -149,21 +151,42 @@ Instead of training a new model to classify corners (which failed repeatedly), w
 
 ```
 photo-pose-detector/
-├── download_oxford.py              # Download Oxford Buildings Dataset
-├── download_textures.py           # Download DTD textures (backgrounds)
-├── data_generator/                # Generate training data
-├── training/                       # Model training scripts
-├── models/                         # Exported ONNX models
-│   ├── detection_ep47.onnx        # Detection model (recommended)
-│   └── pose_single_ep42.onnx      # Pose model (recommended)
-├── onnx_inference/                 # Main inference pipeline & CLI
-│   └── photocrop.py                # Single-file pipeline (all stages)
+├── data_generator/                # Synthetic training data generators
+│   ├── generate_common.py        #   Shared utilities (backgrounds, textures, shadows)
+│   ├── generate_detection.py     #   Detection model data generator
+│   ├── generate_pose.py          #   ★ Pose model data generator
+│   └── generate_fiducial_pose.py #   Fiducial-pose segment generator
+├── data_detection/               # Detection training data (gitignored, regenerateable)
+├── data_pose/                    # ★ Pose training data (gitignored, regenerateable)
+├── data_fiducial_pose/           # Fiducial-pose training data (gitignored, in dev)
+├── training/                     # Model training scripts & configs
+│   ├── train_detection.py        #   Detection model trainer
+│   ├── train_pose.py             #   ★ Pose model trainer
+│   ├── train_fiducial_pose.py    #   Fiducial-pose trainer
+│   ├── dataset_detection.yaml    #   Detection dataset config
+│   ├── dataset_pose.yaml         #   ★ Pose dataset config
+│   └── dataset_fiducial_pose.yaml#   Fiducial-pose dataset config
+├── models/                       # Exported ONNX + PyTorch models
+│   ├── detection_ep47.onnx       #   Active detection model
+│   ├── detection_ep47.pt         #   Active detection model (PyTorch)
+│   ├── pose_single_ep42.onnx     #   ★ Active pose model
+│   └── pose_single_ep42.pt       #   ★ Active pose model (PyTorch)
+├── onnx_inference/               # Main inference pipeline & CLI
+│   └── photocrop.py              #   Single-file pipeline (all stages)
+├── export/
+│   └── export_onnx.py            # ONNX model export
+├── tests/                        # Unit tests
 ├── docs/
-│   ├── PHOTOCROP_USAGE.md          # Full CLI reference
-│   ├── KOTLIN_USAGE.md             # Kotlin/Android integration
-│   └── FUTURE_IMPROVEMENTS.md      # Architecture evolution & future work
-└── REMOVED/                         # Archived failed approaches
+│   ├── ARCHITECTURE.md           # Pipeline architecture & data flow
+│   ├── PHOTOCROP_USAGE.md        # Full CLI reference
+│   ├── KOTLIN_USAGE.md           # Kotlin/Android integration
+│   └── FUTURE_IMPROVEMENTS.md    # Architecture evolution & future work
+├── setup.sh                      # Installation script
+├── pyproject.toml                # Package config
+└── requirements.txt              # Python dependencies
 ```
+
+★ = critical production pipeline component
 
 ## Full CLI Reference
 
@@ -175,6 +198,29 @@ See [`docs/PHOTOCROP_USAGE.md`](docs/PHOTOCROP_USAGE.md) for complete documentat
 - Adaptive margin
 - Python API usage
 - Troubleshooting
+
+## Training
+
+Each model has its own generator, dataset, and trainer:
+
+```bash
+# Generate data
+cd data_generator
+python generate_detection.py --mode batch
+python generate_pose.py --mode batch
+python generate_fiducial_pose.py --mode batch
+
+# Train
+cd training
+python train_detection.py --epochs 100
+python train_pose.py --epochs 100
+python train_fiducial_pose.py --epochs 150
+
+# Export to ONNX
+python export/export_onnx.py --model runs/pose/photo-corner-detector/weights/best.pt
+```
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full data flow diagram.
 
 ## Requirements
 

@@ -11,6 +11,7 @@
 | 4-class fiducial | ❌ Failed | 0.906 | 0.358 | cls_loss ≈ random; can't classify L-shapes by orientation |
 | Binary fiducial | ❌ Failed | 0.917 | 0.364 | Corner types are visually identical in crops; classification impossible |
 | **Corner refinement (pose)** | ✅ **Current** | — | — | Reuses pose model on corner crops; recovers invisible corners |
+| **Fiducial-pose segments** | 🔄 **In Dev** | — | — | YOLO pose model detects visible edge segments; assembles corners geometrically |
 
 \* Best validation epoch before overfitting
 
@@ -32,6 +33,9 @@ inherently ambiguous without geometric context.
 the pose model) and run the **existing** pose or detection model on that crop.
 The pose model's named keypoints directly identify the corner, and the detection
 model's bounding box position can be classified geometrically.
+
+> **Note**: The previous `REMOVED/` directory that held failed approach code
+> has been deleted. Those implementations are preserved only in git history.
 
 ## Current Pipeline
 
@@ -118,6 +122,51 @@ bounding box (1.2× the max dimension, minimum 640px). This ensures the photo
 doesn't fill the entire crop, allowing the detection model to identify edge
 contacts for classification.
 
+## Fiducial-Pose Segment Model (In Development)
+
+**Status**: 🔄 Training in progress (epoch 22/150 as of 2026-05-19)
+
+The fiducial-pose segment model takes a fundamentally different approach to corner
+detection. Instead of trying to detect corners directly, it detects the **visible
+segments of each photo edge** (fiducial segments) using a YOLO pose model. Each
+segment is represented as a pose object with keypoints at its two endpoints.
+
+### Why Detect Segments Instead of Corners?
+
+The core insight is that **corners are often invisible** (occluded by shadow,
+glare, overlap, or cropping), but **edges are usually at least partially visible**.
+A photo with 0 directly visible corners may still have 6+ visible edge segments
+(2 along each visible edge). By detecting these segments and assembling them
+geometrically, we can infer corner positions even when no corner is directly
+visible — without relying on the current Sobel/line-intersection rescue fallback.
+
+### How It Works
+
+1. **Segment detection**: A YOLO pose model detects each visible edge segment as
+   a separate object. Each segment has two keypoints — one at each endpoint.
+2. **Geometric assembly**: Detected segments are grouped by edge (top, bottom,
+   left, right) and their endpoint positions are combined to reconstruct the
+   photo's corner positions. Segments along the same edge provide redundant
+   evidence, making the assembly robust even when some segments are missed.
+3. **Invisible corner recovery**: Where segments from two edges meet, a corner
+   is inferred — even if no keypoint was directly detected at that intersection.
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `data_generator/generate_fiducial_pose.py` | Generates training data with edge-segment annotations |
+| `training/train_fiducial_pose.py` | Trains the fiducial-pose YOLO model |
+
+### Motivation vs. Current Pipeline
+
+| Aspect | Current Pipeline | Fiducial-Pose Segments |
+|--------|-----------------|----------------------|
+| Invisible corners | Sobel rescue + corner refinement (multi-pass) | Geometric assembly from detected segments (single pass) |
+| Inference passes | 1 detection + 1 pose + N corner refinements | 1 detection + 1 fiducial-pose (potentially) |
+| Robustness to occlusion | Degrades when edges are also occluded | Multiple segments per edge provide redundancy |
+| Speed | ~3,200ms with corner refinement | TBD — potentially much faster (fewer passes) |
+
 ### Performance (1512×2016 scan, 4 photos)
 
 | Pipeline | Time | Notes |
@@ -143,6 +192,28 @@ photocrop --image scan.jpg \
 Auto-rescue is always on (no flag needed).
 
 ## Future Improvements
+
+### Integrate Fiducial-Pose Segment Model into Inference Pipeline
+
+Once training completes and validates well, the fiducial-pose segment model
+could replace or complement the current rescue + corner refinement stages:
+
+- **Primary corner source**: Use segment-based geometric assembly as the
+  primary method for determining corner positions, reducing reliance on
+  multi-pass corner refinement.
+- **Hybrid pipeline**: Run fiducial-pose segments alongside the existing pose
+  model. Use segments for corners where the pose model reports low visibility,
+  and trust the pose model for high-visibility corners. This gives the best
+  of both approaches.
+- **Replace Sobel rescue**: Segment-based corner inference is more robust than
+  Sobel edge detection + line intersection, especially in low-contrast or
+  noisy scans. Evaluate whether fiducial segments can fully replace the
+  current rescue stage.
+- **Single-pass inference**: If the fiducial-pose model can detect both
+  photos (via bounding boxes) and their edge segments (via keypoints) in
+  one forward pass, it could replace both the detection and pose models,
+  collapsing the entire pipeline to a single inference call + geometric
+  assembly.
 
 ### Thread-Based Parallel Corner Refinement
 

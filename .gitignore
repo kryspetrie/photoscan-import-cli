@@ -1,20 +1,14 @@
 # Source images (large, not part of repo)
-data_generator/images
+data_generator/images/
 
-# Generated training data (large, regenerate-able)
+# Generated training data (large, regenerateable)
 data/
-../data/
-data_generator/test/
 data_detection/
 data_pose/
 data_pose_multi/
-test/
-tests/
 data_fiducial/
 data_fiducial_binary/
 data_fiducial_pose/
-
-REMOVED/
 
 # Python
 __pycache__/
@@ -31,13 +25,14 @@ build/
 training_env/
 
 # ML/Training
-runs/
+training/runs/
 wandb/
 logs/
 *.pt
 *.pth
 *.h5
 *.ckpt
+*.npy
 
 # IDE
 .vscode/
