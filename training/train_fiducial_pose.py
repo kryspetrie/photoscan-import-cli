@@ -20,7 +20,17 @@ Augmentation is reduced compared to detection training because:
   - Keypoints must track through augmentations (no mixup/copy_paste)
   - flip_idx=[1, 0] handles horizontal flip (swaps kp0↔kp1)
   - No vertical flip (would change orientation semantics)
-  - Moderate mosaic (segments at various positions need context)
+  - Mosaic is DISABLED — synthetic data already contains multi-photo
+    grid scenes with varied backgrounds; adding mosaic creates false
+    segment boundaries at composite seams.
+
+V2 Changes (from V1 analysis):
+  - mosaic=0.0 (was 0.3) — synthetic data has built-in compositing
+  - close_mosaic=0 (was 10) — no mosaic to phase out
+  - cls=0.0 (was 0.5) — single class, no classification gradient needed
+  - rle=0.3 (was 1.0) — was 47% of loss; keypoints are simple (2/inst)
+  - optimizer=AdamW (was auto) — explicit control, no lr0 override
+  - lr0=0.001 (was 0.001 but auto overrode to 0.002)
 
 USAGE
 -----
@@ -29,7 +39,7 @@ USAGE
     python3 train_fiducial_pose.py --data /path/to/dataset_fiducial_pose.yaml
 
 Author: Photo Pose Detector Project
-Version: 1 - Fiducial Pose Training
+Version: 2 - Fiducial Pose Training (loss rebalanced, mosaic off)
 """
 
 import os
@@ -63,16 +73,23 @@ def train(
     cache: str = "ram",
     model: str = "yolo26s-pose.pt",
     project: str = "runs/pose",
-    name: str = "fiducial-pose-segments",
-    # Optimization
-    optimizer: str = "auto",
+    name: str = "fiducial-pose-v2",
+    # Optimization (V2: explicit AdamW, rebalanced loss weights)
+    optimizer: str = "AdamW",
     lr0: float = 0.001,
     lrf: float = 0.01,
-    momentum: float = 0.937,
+    momentum: float = 0.9,
     weight_decay: float = 0.0005,
     warmup_epochs: float = 3.0,
-    # Augmentation (reduced for keypoint accuracy)
-    mosaic: float = 0.3,       # Moderate — segments need spatial context
+    # Loss weights (V2: cls=0 for nc=1, rle reduced)
+    box: float = 7.5,
+    cls: float = 0.0,          # V2: single class — no classification loss needed
+    dfl: float = 1.5,
+    pose: float = 12.0,
+    kobj: float = 1.0,
+    rle: float = 0.3,          # V2: was 1.0, dominated loss at 47%; 2 keypoints/inst is simple
+    # Augmentation (V2: mosaic OFF — synthetic data has built-in compositing)
+    mosaic: float = 0.0,       # V2: OFF — data already has grid/multi-photo scenes
     mixup: float = 0.0,        # Disabled — would corrupt keypoint positions
     copy_paste: float = 0.0,   # Disabled — would create invalid segment combos
     scale: float = 0.3,        # Moderate — photos can be at various scales
@@ -85,7 +102,7 @@ def train(
     hsv_v: float = 0.3,
     # Training settings
     pretrained: bool = True,
-    close_mosaic: int = 10,
+    close_mosaic: int = 0,    # V2: no mosaic to phase out
     workers: int = 4,
     device: str = "cpu",
     exist_ok: bool = True,
@@ -123,8 +140,12 @@ def train(
     print("  nc = 1  (single class: photo_segment)")
     print("  Geometric grouping determines quadrilateral assignment")
     print()
-    print("Augmentation (reduced for keypoints):")
-    print(f"  scale={scale}  translate={translate}  mosaic={mosaic}")
+    print("Loss Weights (V2 rebalanced):")
+    print(f"  box={box}  cls={cls}  dfl={dfl}  pose={pose}  kobj={kobj}  rle={rle}")
+    print()
+    print("Augmentation (V2: mosaic OFF, synthetic data has composites):")
+    print(f"  mosaic={mosaic}  close_mosaic={close_mosaic}")
+    print(f"  scale={scale}  translate={translate}")
     print(f"  mixup={mixup}  copy_paste={copy_paste}")
     print(f"  degrees={degrees}  fliplr={fliplr}  flipud={flipud}")
     print("=" * 60)
@@ -146,6 +167,12 @@ def train(
         momentum=momentum,
         weight_decay=weight_decay,
         warmup_epochs=warmup_epochs,
+        box=box,
+        cls=cls,
+        dfl=dfl,
+        pose=pose,
+        kobj=kobj,
+        rle=rle,
         mosaic=mosaic,
         mixup=mixup,
         copy_paste=copy_paste,
@@ -189,15 +216,19 @@ def main():
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--model", type=str, default="yolo26s-pose.pt")
     parser.add_argument("--project", type=str, default="runs/pose")
-    parser.add_argument("--name", type=str, default="fiducial-pose-segments")
+    parser.add_argument("--name", type=str, default="fiducial-pose-v2")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--cache", type=str, default="ram")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--mosaic", type=float, default=0.3)
+    parser.add_argument("--mosaic", type=float, default=0.0)
+    parser.add_argument("--close-mosaic", type=int, default=0)
     parser.add_argument("--degrees", type=float, default=5.0)
     parser.add_argument("--scale", type=float, default=0.3)
     parser.add_argument("--lr0", type=float, default=0.001)
+    parser.add_argument("--optimizer", type=str, default="AdamW")
+    parser.add_argument("--cls", type=float, default=0.0)
+    parser.add_argument("--rle", type=float, default=0.3)
 
     args = parser.parse_args()
 
@@ -213,10 +244,14 @@ def main():
         device=args.device,
         workers=args.workers,
         cache=args.cache,
+        optimizer=args.optimizer,
+        lr0=args.lr0,
+        cls=args.cls,
+        rle=args.rle,
         mosaic=args.mosaic,
+        close_mosaic=args.close_mosaic,
         degrees=args.degrees,
         scale=args.scale,
-        lr0=args.lr0,
         resume=args.resume,
     )
 
