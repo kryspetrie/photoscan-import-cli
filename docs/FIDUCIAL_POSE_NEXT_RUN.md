@@ -39,11 +39,7 @@
 
 **Backup**: `training/backups/v2-fiducial-pose-segments/`
 
----
-
-## V3 — Corrected Rebalance
-
-### Changes from V1
+### V3 — Corrected Rebalance (Epochs 1–42+, still running)
 
 | Parameter | V1 | V2 | V3 | Reasoning |
 |-----------|-----|-----|-----|-----------|
@@ -55,17 +51,39 @@
 | `box` | 7.5 | 7.5 | **4.0** | Thin segment bboxes have poor IoU; reduce box dominance |
 | `optimizer` | auto | AdamW | **AdamW** | Explicit control ✅ |
 
-### Expected Loss Budget (approximate)
+**Best results**: Pose mAP50=**0.857**, mAP50-95=**0.851** (epoch 18)
 
-| Loss | V1 % | V2 % | V3 Target % |
-|------|------|------|-------------|
-| box | 14% | 41% | ~25% |
-| pose | 5% | 6% | ~20% |
-| cls | 15% | 0% | ~15% |
-| rle | 61% | 43% | ~30% |
-| kobj | 5% | 9% | ~10% |
+**V3 vs V1 comparison**:
+| Metric | V1 Best | V3 Best | Δ |
+|--------|---------|---------|---|
+| Pose mAP50 | 0.803 | **0.857** | +6.7% |
+| Pose mAP50-95 | 0.812 | **0.851** | +4.8% |
+| Epochs to best | 15 | 9 | 6 fewer |
 
-### Execution
-- Dataset: Same as V1/V2 (no regeneration needed)
-- Command: `python3 train_fiducial_pose.py --epochs 150 --patience 30 --batch 16 --cache ram --workers 4`
-- All V3 defaults are in the script; no CLI overrides needed
+Training plateaued after epoch 18 and was still running at epoch 42+ (early stopping at epoch 48 with patience=30).
+
+**Backup**: `training/backups/v3-fiducial-pose-segments/`
+**ONNX model**: `models/fiducial_pose_v3.onnx` (output shape [1, 300, 12])
+
+---
+
+## V3 Model Integration
+
+The V3 fiducial pose model (2 keypoints per segment) has been integrated into `photocrop.py` in two ways:
+
+### 1. Corner Refinement (`--corner-refine-model segment`)
+Uses the segment model to refine corners by finding convergence clusters of segment endpoints. Added convergence-clustering logic to find where 2+ segments meet at a corner.
+
+### 2. Pose Refinement (`--pose-refine --segment-model`)
+When both `--pose-refine` and `--segment-model` are provided, the refinement stage (Stage 2b) uses the segment model instead of re-running the 4-keypoint pose model. The segment model finds boundary segments, clusters endpoints into corners, and matches them to the initial pose keypoints to refine positions.
+
+**Current status**: Segment refinement shows promise on specific corners (e.g., 2.4px vs 8.7px for some corners) but is not yet consistently better than pose refinement overall. The matching heuristic needs further tuning for robustness.
+
+---
+
+## Potential Future Improvements
+
+- More diverse training data (add `one_edge` scene mode, ~10% coverage)
+- Reduce match distance threshold in segment-based keypoint matching
+- Test segment model on more diverse real-world images
+- Consider training a corner-specific model (4 keypoints) with V3's improved loss weights

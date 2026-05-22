@@ -17,6 +17,8 @@ Pipeline for detecting photo corners in multi-photo images:
 
 Optional post-rescue stages:
   --corner-refine:       Crop around each corner → re-run model for vis=1.0
+                          Models: pose (named keypoints), detection (bbox + edges),
+                          segment (fiducial boundary endpoints)
   --cv-refine:           Sobel edge refinement on ALL corners (sub-pixel)
 
 The rescue stage (always on) prevents degenerate crops (e.g., "strip" crops
@@ -174,6 +176,7 @@ _VIS_THRESH_SWEEP = 0.30      # visibility threshold for sweep scoring
 _SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DETECTION_MODEL = _SCRIPT_DIR / ".." / "models" / "detection_ep47.onnx"
 DEFAULT_POSE_MODEL = _SCRIPT_DIR / ".." / "models" / "pose_single_ep42.onnx"
+DEFAULT_POSE_SEGMENT_MODEL = _SCRIPT_DIR / ".." / "models" / "fiducial_pose_v3.onnx"
 
 # Corner refinement: crop size and edge-contact classification
 CORNER_CROP_SIZE_MIN = 320   # Minimum crop size (half the model input resolution)
@@ -475,6 +478,71 @@ def run_pose(session, crop: Image.Image, conf_threshold: float = 0.5,
     return results
 
 
+def run_pose_segment(session, crop: Image.Image, conf_threshold: float = 0.5,
+                     img_size: int = DEFAULT_IMG_SIZE):
+    """
+    Run the segment pose model on a cropped region.
+
+    The segment model outputs [1, 300, 12]: x1,y1,x2,y2,conf,cls,
+    kp0_x,kp0_y,kp0_vis, kp1_x,kp1_y,kp1_vis — two keypoints per
+    instance representing segment endpoints.
+
+    Returns list of dicts with keys:
+        confidence: detection confidence
+        keypoints: list of 2 dicts with 'x', 'y', 'visibility' in crop pixel coords
+        box: dict with x1, y1, x2, y2 in crop pixel coords
+    Or empty list if no detection.
+    """
+    crop_w, crop_h = crop.size
+    input_arr, _, _ = preprocess_crop(crop, img_size)
+
+    input_name = session.get_inputs()[0].name
+    output = session.run(None, {input_name: input_arr})[0]
+
+    # Output: [1, 300, 12] — NMS-enabled
+    # Columns: x1, y1, x2, y2, conf, cls, ep0_x, ep0_y, ep0_vis, ep1_x, ep1_y, ep1_vis
+    rows = output[0]
+
+    results = []
+    for row in rows:
+        conf = row[4]
+        if conf < conf_threshold:
+            continue
+
+        # Map from 640×640 → crop pixel coords
+        scale_x = crop_w / img_size
+        scale_y = crop_h / img_size
+
+        box_x1 = float(row[0] * scale_x)
+        box_y1 = float(row[1] * scale_y)
+        box_x2 = float(row[2] * scale_x)
+        box_y2 = float(row[3] * scale_y)
+
+        keypoints = []
+        for k in range(2):
+            kx = row[6 + k * 3] * scale_x
+            ky = row[6 + k * 3 + 1] * scale_y
+            kvis = row[6 + k * 3 + 2]
+            keypoints.append({
+                "name": f"ep{k}",
+                "x": kx,
+                "y": ky,
+                "visibility": float(kvis),
+            })
+
+        results.append({
+            "confidence": float(conf),
+            "keypoints": keypoints,
+            "box": {
+                "x1": box_x1,
+                "y1": box_y1,
+                "x2": box_x2,
+                "y2": box_y2,
+            },
+        })
+
+    return results
+
 
 # ---------------------------------------------------------------------------
 # Stage 2b: Geometric corner refinement
@@ -752,13 +820,14 @@ def _corner_crop_min(crop_size: int, pct: float = CORNER_CROP_MIN_PCT,
 
 def refine_corners_geometric(image: Image.Image, result: dict,
                               pose_session=None, detection_session=None,
+                              segment_session=None,
                               iterations: int = 2,
                               conf_threshold: float = 0.5,
                               crop_size: int = 0,
                               max_expand: float = CORNER_CROP_EXPAND):
     """Refine the 4 corners of a detected photo using corner-crop inference.
 
-    Uses either the pose model (default, higher quality) or the detection model
+    Uses either the pose model, detection model, or segment pose model
     to refine corner positions by cropping around each approximate corner.
 
     **Pose model** (default):
@@ -769,6 +838,15 @@ def refine_corners_geometric(image: Image.Image, result: dict,
       - No expand retries needed: the named keypoint IS our answer, regardless
         of crop framing.
 
+    **Segment model** (--corner-refine-model segment):
+      - Crops around each approximate corner, runs the 2-keypoint segment model.
+      - Finds the segment endpoint closest to the crop center — that endpoint
+        IS the corner position.
+      - Uses binary search on crop size, same as pose model, to avoid detecting
+        segments from adjacent photos.
+      - Potentially more accurate than the 4-keypoint pose model because it was
+        specifically trained on visible photo boundary segments.
+
     **Detection model** (--corner-refine-model detection):
       - Crops around each approximate corner, runs detection.
       - Classifies which corner by finding which bbox corner is nearest to the
@@ -777,7 +855,7 @@ def refine_corners_geometric(image: Image.Image, result: dict,
       - If no detection or bbox fills the crop, expands and retries.
 
     Crop size is automatically computed based on the model and photo:
-      - Pose model: proportional to max bbox dimension (70% base), with extra
+      - Pose/segment model: proportional to max bbox dimension (70% base), with extra
         margin for low-confidence detections. Binary search starts from this
         size down to 25% of it, shrinking to exclude adjacent photos.
       - Detection model: 1.2× the max bbox dimension so the photo doesn't fill
@@ -788,6 +866,7 @@ def refine_corners_geometric(image: Image.Image, result: dict,
         result: Pipeline result dict with 'keypoints' list and 'detection'/'box'
         pose_session: ONNX inference session for the pose model (preferred)
         detection_session: ONNX inference session for the detection model.
+        segment_session: ONNX inference session for the segment pose model.
         iterations: Number of refinement iterations (default 2)
         conf_threshold: Minimum detection confidence (default 0.5)
         crop_size: Crop size override. 0 = auto-compute from bbox (recommended).
@@ -798,29 +877,45 @@ def refine_corners_geometric(image: Image.Image, result: dict,
         The same result dict with updated keypoint coordinates and
         visibility boosted to 1.0 for successfully refined corners.
     """
-    if pose_session is None and detection_session is None:
-        raise ValueError("Either pose_session or detection_session must be provided")
+    if pose_session is None and detection_session is None and segment_session is None:
+        raise ValueError("At least one of pose_session, detection_session, or segment_session must be provided")
 
-    use_pose = pose_session is not None
-    model_session = pose_session if use_pose else detection_session
-    model_name = "pose" if use_pose else "detection"
+    # Determine which model to use (priority: segment > pose > detection)
+    use_segment = segment_session is not None
+    use_pose = (not use_segment) and (pose_session is not None)
+    if use_segment:
+        model_session = segment_session
+        model_name = "segment"
+    elif use_pose:
+        model_session = pose_session
+        model_name = "pose"
+    else:
+        model_session = detection_session
+        model_name = "detection"
 
     kps = {kp["name"]: kp for kp in result.get("keypoints", [])}
     box = result["detection"]["box"]
 
     # Compute adaptive crop size based on bbox dimensions and confidence.
-    # For the pose model: crop is proportional to the photo's max dimension,
+    # For the pose/segment model: crop is proportional to the photo's max dimension,
     # with extra margin for low-confidence detections. This ensures large
     # photos get enough context while small photos don't include adjacent ones.
     # For the detection model: crop must be large enough that the photo's
     # bbox doesn't fill the entire frame (so edges are visible for classification).
     confidence = result.get("detection", {}).get("confidence", 0.5)
     if crop_size <= 0:
-        if use_pose:
+        if use_pose or use_segment:
             crop_size = _corner_crop_size(box, confidence, image.size)
         else:
             crop_size = _adaptive_crop_size(box, image.size)
     min_crop_size = _corner_crop_min(crop_size)
+
+    # Segment model needs larger minimum crop (at least 640px) because it was
+    # trained on 640×640 full-photo crops, not tight corner crops. It also
+    # produces lower-confidence detections (0.2–0.4) than the pose model.
+    if use_segment:
+        min_crop_size = max(min_crop_size, 640)
+        conf_threshold = min(conf_threshold, 0.2)
 
     bbox_max_dim = max(box["x2"] - box["x1"], box["y2"] - box["y1"])
     _log(f"  Corner refinement: crop_size={crop_size}px, min_crop={min_crop_size}px "
@@ -974,6 +1069,124 @@ def refine_corners_geometric(image: Image.Image, result: dict,
                          f"at crop={best_crop_size}px")
                 else:
                     _log(f"  {corner_name}: no valid refinement found "
+                         f"(binary search {min_crop_size}-{crop_size}px)")
+                    break
+
+            elif use_segment:
+                # ── Segment pose model: find endpoint convergence clusters ──
+                # The segment model detects visible photo boundary segments,
+                # each with 2 keypoints (segment endpoints). A corner of a
+                # photo is where two segments meet — so at a corner crop we
+                # expect to find 2+ endpoints from different segments that
+                # converge near the crop center. The centroid of that cluster
+                # is our refined corner position.
+                #
+                # This is more robust than picking the single closest endpoint,
+                # which can pick the wrong end of a segment that passes through
+                # the corner without terminating there.
+                #
+                # Binary search on crop size to avoid detecting segments from
+                # adjacent photos.
+                lo = min_crop_size
+                hi = crop_size
+                best_result = None
+                best_crop_size = None
+                best_cluster_size = 0
+
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    mid = ((mid + 31) // 32) * 32
+                    crop, offset_x, offset_y = _corner_crop(image, ax, ay, mid)
+                    seg_results = run_pose_segment(model_session, crop,
+                                                    conf_threshold=conf_threshold,
+                                                    img_size=DEFAULT_IMG_SIZE)
+
+                    if not seg_results:
+                        lo = mid + 32
+                        continue
+
+                    # Collect all visible segment endpoints with their segment index
+                    all_endpoints = []
+                    for det_idx, det in enumerate(sorted(seg_results, key=lambda d: d["confidence"], reverse=True)):
+                        for kp in det.get("keypoints", []):
+                            if kp.get("visibility", 0) < 0.3:
+                                continue
+                            ep_x = kp["x"] + offset_x
+                            ep_y = kp["y"] + offset_y
+                            dist = ((ep_x - ax) ** 2 + (ep_y - ay) ** 2) ** 0.5
+                            all_endpoints.append((ep_x, ep_y, dist, det_idx))
+
+                    if not all_endpoints:
+                        lo = mid + 32
+                        continue
+
+                    # Find convergence cluster: endpoints near the crop center
+                    # that come from different segments. A corner is where ≥2
+                    # segments meet, so we need endpoints from different detections.
+                    max_center_dist = mid * 0.5
+                    near_center = [(x, y, d, idx) for x, y, d, idx in all_endpoints
+                                   if d <= max_center_dist]
+
+                    if not near_center:
+                        _log(f"  {corner_name}: no endpoints near center at crop={mid}px "
+                             f"(closest={min(all_endpoints, key=lambda e: e[2])[2]:.0f}px, "
+                             f"max={max_center_dist:.0f}px)")
+                        hi = mid - 32
+                        continue
+
+                    # Group nearby endpoints into convergence clusters.
+                    # Endpoints within a tolerance radius form a cluster.
+                    # Prefer clusters with endpoints from multiple segments.
+                    cluster_radius = mid * 0.1  # 10% of crop size
+                    best_cluster = None
+                    best_score = -1
+
+                    for anchor in near_center:
+                        ax_c, ay_c, _, _ = anchor
+                        cluster = [e for e in near_center
+                                   if ((e[0] - ax_c) ** 2 + (e[1] - ay_c) ** 2) ** 0.5 <= cluster_radius]
+                        # Score: prefer clusters with more segments (different det_idx)
+                        n_segments = len(set(idx for _, _, _, idx in cluster))
+                        n_endpoints = len(cluster)
+                        # Convergence score: more segments × more endpoints = better corner
+                        score = n_segments * 100 + n_endpoints
+                        if score > best_score:
+                            best_score = score
+                            best_cluster = cluster
+
+                    if best_cluster is None:
+                        hi = mid - 32
+                        continue
+
+                    # Compute cluster centroid (the refined corner position)
+                    cx = sum(e[0] for e in best_cluster) / len(best_cluster)
+                    cy = sum(e[1] for e in best_cluster) / len(best_cluster)
+                    n_segments = len(set(idx for _, _, _, idx in best_cluster))
+
+                    # Validate: centroid shouldn't move too far from original
+                    if (abs(cx - orig_x) > max_shift or abs(cy - orig_y) > max_shift):
+                        _log(f"  {corner_name}: segment cluster moved too far "
+                             f"({cx:.0f},{cy:.0f}) vs ({orig_x:.0f},{orig_y:.0f}) "
+                             f"at crop={mid}px, {n_segments} seg(s), "
+                             f"{len(best_cluster)} endpoint(s)")
+                        break  # Don't shrink — cluster was valid but too far
+
+                    # Valid result — try smaller crop for tighter localization
+                    best_result = (cx, cy)
+                    best_crop_size = mid
+                    best_cluster_size = len(best_cluster)
+                    _log(f"  {corner_name}: cluster at crop={mid}px "
+                         f"({n_segments} seg(s), {len(best_cluster)} endpoint(s), "
+                         f"centroid=({cx:.1f},{cy:.1f}))")
+                    hi = mid - 32
+
+                if best_result is not None:
+                    ax, ay = best_result
+                    found = True
+                    _log(f"  {corner_name}: segment refined to ({ax:.1f},{ay:.1f}) "
+                         f"at crop={best_crop_size}px ({best_cluster_size} endpoints)")
+                else:
+                    _log(f"  {corner_name}: no valid segment cluster "
                          f"(binary search {min_crop_size}-{crop_size}px)")
                     break
 
@@ -1381,6 +1594,377 @@ def _run_pose_on_crop(pose_session, image: Image.Image, box: dict,
     }
 
 
+def _cluster_endpoints_to_corners(endpoints, crop_w, crop_h, min_cluster_size=2,
+                                   cluster_radius_ratio=0.05):
+    """Cluster segment endpoints into convergence points (corners).
+
+    At a photo corner, two segment endpoints converge. This function groups
+    nearby endpoints into clusters and classifies each cluster as a named
+    corner (LL, UL, UR, LR) based on its position relative to the crop center.
+
+    Args:
+        endpoints: list of (x, y, visibility, segment_idx) tuples in crop coords
+        crop_w: crop width in pixels
+        crop_h: crop height in pixels
+        min_cluster_size: minimum endpoints in a cluster to count as a corner (default 2)
+        cluster_radius_ratio: cluster radius as fraction of crop max dimension (default 5%)
+
+    Returns:
+        list of dicts with 'name', 'x', 'y', 'visibility', 'n_segments' keys
+        in crop pixel coordinates
+    """
+    if len(endpoints) < min_cluster_size:
+        return []
+
+    cx, cy = crop_w / 2, crop_h / 2
+    max_dim = max(crop_w, crop_h)
+    cluster_radius = max_dim * cluster_radius_ratio
+
+    # Filter to visible endpoints only
+    visible = [(x, y, vis, idx) for x, y, vis, idx in endpoints if vis >= 0.3]
+    if len(visible) < min_cluster_size:
+        return []
+
+    # Sort by distance to center to prefer central endpoints
+    visible.sort(key=lambda e: ((e[0] - cx) ** 2 + (e[1] - cy) ** 2))
+
+    # Greedy clustering: each endpoint joins the nearest existing cluster
+    # if within cluster_radius; otherwise starts a new cluster
+    clusters = []  # list of (centroid_x, centroid_y, [endpoints])
+    used = set()
+
+    for ei, ep in enumerate(visible):
+        if ei in used:
+            continue
+        # Find all endpoints near this one
+        cluster_members = [ep]
+        used.add(ei)
+
+        # Merge nearby endpoints from different segments
+        for ej, ep2 in enumerate(visible):
+            if ej in used:
+                continue
+            dist = ((ep[0] - ep2[0]) ** 2 + (ep[1] - ep2[1]) ** 2) ** 0.5
+            if dist <= cluster_radius:
+                cluster_members.append(ep2)
+                used.add(ej)
+
+        # Compute centroid
+        mx = sum(m[0] for m in cluster_members) / len(cluster_members)
+        my = sum(m[1] for m in cluster_members) / len(cluster_members)
+        n_segments = len(set(m[3] for m in cluster_members))
+        clusters.append((mx, my, cluster_members, n_segments))
+
+    # Classify each cluster as a corner based on position relative to center
+    # LL = bottom-left, UL = top-left, UR = top-right, LR = bottom-right
+    corners = []
+    for mx, my, members, n_segments in clusters:
+        if my <= cy and mx <= cx:
+            name = "UL"
+        elif my <= cy and mx > cx:
+            name = "UR"
+        elif my > cx and mx <= cx:
+            # Ambiguous: could be LL. Check if definitely bottom-left
+            name = "LL"
+        elif my > cy and mx > cx:
+            name = "LR"
+        else:
+            # Fallback: quadrant classification
+            name = "UL" if mx <= cx and my <= cy else (
+                "UR" if mx > cx and my <= cy else (
+                    "LL" if mx <= cx else "LR"))
+
+        avg_vis = sum(m[2] for m in members) / len(members)
+        corners.append({
+            "name": name,
+            "x": mx,
+            "y": my,
+            "visibility": min(1.0, avg_vis * len(members) / min_cluster_size),
+            "n_segments": n_segments,
+            "n_endpoints": len(members),
+        })
+
+    return corners
+
+
+def _classify_endpoint_cluster(mx, my, cx, cy):
+    """Classify a point relative to the center as LL/UL/UR/LR."""
+    if mx <= cx and my <= cy:
+        return "UL"
+    elif mx > cx and my <= cy:
+        return "UR"
+    elif mx <= cx and my > cy:
+        return "LL"
+    else:
+        return "LR"
+
+
+def _run_segment_on_crop(segment_session, image: Image.Image, box: dict,
+                          pose_conf: float, img_size: int,
+                          expand_ratio: float = None,
+                          expand_ratio_x: float = None,
+                          expand_ratio_y: float = None,
+                          crop_limits: dict = None,
+                          center_bias: bool = False,
+                          initial_keypoints: list = None) -> dict | None:
+    """Run the segment pose model on a detection crop and refine corner positions.
+
+    Similar to ``_run_pose_on_crop`` but uses the 2-keypoint fiducial segment
+    model instead of the 4-keypoint pose model. Detects boundary segments,
+    clusters their endpoints into convergence points, and matches each cluster
+    to the nearest initial pose keypoint to refine its position.
+
+    Unlike the pose model which returns named keypoints directly, the segment
+    model returns segments with endpoints. At each corner of a photo, two
+    segments converge, creating a cluster of nearby endpoints. The centroid
+    of each cluster gives a precise corner position.
+
+    If ``initial_keypoints`` is provided, each cluster is matched to the nearest
+    initial keypoint by position, and only the initial keypoint's position is
+    updated. Unmatched initial keypoints are kept unchanged. This ensures we
+    always return all 4 corners with proper names, even when the segment model
+    doesn't find all convergence points.
+
+    Args:
+        segment_session: ONNX inference session for the segment model
+        image: Full input PIL Image
+        box: Detection bounding box dict with x1, y1, x2, y2
+        pose_conf: Minimum confidence threshold for segment detections
+        img_size: Model input size (640)
+        expand_ratio: Expansion ratio (scalar, legacy mode)
+        expand_ratio_x, expand_ratio_y: Per-axis expansion ratios
+        crop_limits: Dict with 'left', 'right', 'up', 'down' max expansion
+        center_bias: Whether to use center-biased expansion
+        initial_keypoints: List of keypoint dicts from initial pose detection.
+            If provided, clusters are matched to the nearest initial keypoint.
+
+    Returns:
+        Result dict with keypoints in original image coords, or None if
+        no segments found.
+    """
+    orig_w, orig_h = image.size
+    x1, y1 = box["x1"], box["y1"]
+    x2, y2 = box["x2"], box["y2"]
+
+    box_w = x2 - x1
+    box_h = y2 - y1
+
+    # Resolve expansion ratios (same logic as _run_pose_on_crop)
+    if expand_ratio is not None and expand_ratio_x is None and expand_ratio_y is None:
+        expand_px_x = int(max(box_w, box_h) * expand_ratio)
+        expand_px_y = expand_px_x
+    else:
+        rx = expand_ratio_x if expand_ratio_x is not None else (expand_ratio or 0)
+        ry = expand_ratio_y if expand_ratio_y is not None else (expand_ratio or 0)
+        expand_px_x = int(box_w * rx)
+        expand_px_y = int(box_h * ry)
+
+    # Compute crop region
+    if center_bias:
+        crop_x1, crop_y1, crop_x2, crop_y2 = _center_biased_expand(
+            box, orig_w, orig_h, max(expand_px_x, expand_px_y),
+            crop_limits=crop_limits,
+        )
+    else:
+        expand_left = expand_px_x
+        expand_right = expand_px_x
+        expand_up = expand_px_y
+        expand_down = expand_px_y
+        if crop_limits is not None:
+            expand_left = min(expand_px_x, crop_limits["left"])
+            expand_right = min(expand_px_x, crop_limits["right"])
+            expand_up = min(expand_px_y, crop_limits["up"])
+            expand_down = min(expand_px_y, crop_limits["down"])
+
+        crop_x1 = max(0, int(x1) - expand_left)
+        crop_y1 = max(0, int(y1) - expand_up)
+        crop_x2 = min(orig_w, int(x2) + expand_right)
+        crop_y2 = min(orig_h, int(y2) + expand_down)
+
+    crop = image.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+    crop_w, crop_h = crop.size
+
+    # Use lower threshold for segment model (it returns lower confidence than pose)
+    seg_conf = max(pose_conf * 0.4, 0.2)
+    seg_dets = run_pose_segment(segment_session, crop,
+                                 conf_threshold=seg_conf,
+                                 img_size=img_size)
+    if not seg_dets:
+        return None
+
+    # Collect all visible segment endpoints in crop coords
+    endpoints = []
+    for det_idx, det in enumerate(sorted(seg_dets, key=lambda d: d["confidence"], reverse=True)):
+        for kp in det["keypoints"]:
+            if kp.get("visibility", 0) < 0.3:
+                continue
+            endpoints.append((kp["x"], kp["y"], kp["visibility"], det_idx))
+
+    if len(endpoints) < 2:
+        return None
+
+    # Cluster endpoints into convergence points (corners)
+    # At a photo corner, 2 segments converge, so we look for clusters
+    # of endpoints from different segments that are near each other.
+    cx_crop, cy_crop = crop_w / 2, crop_h / 2
+    cluster_radius = max(crop_w, crop_h) * 0.05  # 5% of max dimension
+
+    # Greedy clustering: group nearby endpoints from different segments
+    clusters = []
+    used = set()
+    # Sort by distance to crop center to prefer central clusters
+    endpoints_sorted = sorted(endpoints,
+                               key=lambda e: ((e[0] - cx_crop) ** 2 + (e[1] - cy_crop) ** 2))
+
+    for i, (ex, ey, ev, ei) in enumerate(endpoints_sorted):
+        if i in used:
+            continue
+        members = [(ex, ey, ev, ei)]
+        used.add(i)
+        for j, (ex2, ey2, ev2, ei2) in enumerate(endpoints_sorted):
+            if j in used:
+                continue
+            if ((ex - ex2) ** 2 + (ey - ey2) ** 2) ** 0.5 <= cluster_radius:
+                members.append((ex2, ey2, ev2, ei2))
+                used.add(j)
+        n_segments = len(set(m[3] for m in members))
+        mx = sum(m[0] for m in members) / len(members)
+        my = sum(m[1] for m in members) / len(members)
+        avg_vis = sum(m[2] for m in members) / len(members)
+        clusters.append({
+            "x": mx, "y": my,
+            "n_segments": n_segments,
+            "n_endpoints": len(members),
+            "avg_visibility": avg_vis,
+        })
+
+    # If we have initial keypoints, match each cluster to the nearest one
+    # and update its position. Keep unmatched keypoints unchanged.
+    if initial_keypoints is not None and len(initial_keypoints) > 0:
+        # Map initial keypoints to crop coords for matching
+        init_in_crop = []
+        for kp in initial_keypoints:
+            kx = kp["x"] - crop_x1
+            ky = kp["y"] - crop_y1
+            init_in_crop.append((kx, ky, kp))
+
+        # Match each cluster to the nearest initial keypoint
+        matched_kps = {}  # keypoint name -> cluster
+        used_clusters = set()
+
+        # Sort clusters by number of converging segments (prefer multi-segment clusters)
+        clusters.sort(key=lambda c: c["n_segments"], reverse=True)
+
+        for cluster in clusters:
+            # Only match clusters with 2+ converging segments (a true corner).
+            # Single-segment endpoints are not reliable corner indicators.
+            if cluster["n_segments"] < 2:
+                continue
+            best_dist = float("inf")
+            best_kp_name = None
+            best_kp_idx = None
+            for idx, (ix, iy, kp) in enumerate(init_in_crop):
+                if kp["name"] in matched_kps:
+                    continue
+                d = ((cluster["x"] - ix) ** 2 + (cluster["y"] - iy) ** 2) ** 0.5
+                # Only match if cluster is reasonably near the initial keypoint
+                max_match_dist = max(crop_w, crop_h) * 0.15
+                if d < best_dist and d < max_match_dist:
+                    best_dist = d
+                    best_kp_name = kp["name"]
+                    best_kp_idx = idx
+            if best_kp_name is not None:
+                matched_kps[best_kp_name] = cluster
+                used_clusters.add(id(cluster))
+
+        # Build result: update matched keypoints, keep unmatched ones as-is
+        mapped_keypoints = []
+        visible_xs, visible_ys = [], []
+        for kp in initial_keypoints:
+            if kp["name"] in matched_kps:
+                cluster = matched_kps[kp["name"]]
+                # Boost visibility for converged corners (multiple segments = high confidence)
+                new_vis = min(1.0, cluster["avg_visibility"] * max(1.0, cluster["n_segments"] / 2))
+                mk = {
+                    "name": kp["name"],
+                    "x": cluster["x"] + crop_x1,
+                    "y": cluster["y"] + crop_y1,
+                    "visibility": new_vis,
+                }
+                if "nn_vis" not in kp:
+                    mk["nn_vis"] = kp["visibility"]
+            else:
+                # Keep initial keypoint unchanged
+                mk = dict(kp)
+            mapped_keypoints.append(mk)
+            if mk["visibility"] >= _VIS_THRESH_DEDUP:
+                visible_xs.append(mk["x"])
+                visible_ys.append(mk["y"])
+
+        if len(visible_xs) < 2:
+            return None
+
+        center = (float(np.mean(visible_xs)), float(np.mean(visible_ys)))
+        best_det_conf = max(det["confidence"] for det in seg_dets)
+        vis_count = len(visible_xs)
+        dedup_priority = best_det_conf
+        if vis_count < 3:
+            dedup_priority *= 0.5
+
+        return {
+            "pose_confidence": best_det_conf,
+            "keypoints": mapped_keypoints,
+            "center": center,
+            "dedup_priority": dedup_priority,
+            "crop_box": {
+                "x1": crop_x1, "y1": crop_y1,
+                "x2": crop_x2, "y2": crop_y2,
+            },
+        }
+
+    # Fallback: no initial keypoints, classify clusters by quadrant
+    corners = _cluster_endpoints_to_corners(endpoints, crop_w, crop_h)
+    box_cx = (x2 - x1) / 2 + (x1 - crop_x1)
+    box_cy = (y2 - y1) / 2 + (y1 - crop_y1)
+    for c in corners:
+        c["name"] = _classify_endpoint_cluster(c["x"], c["y"], box_cx, box_cy)
+
+    mapped_keypoints = []
+    visible_xs, visible_ys = [], []
+    for c in corners:
+        mk = {
+            "name": c["name"],
+            "x": c["x"] + crop_x1,
+            "y": c["y"] + crop_y1,
+            "visibility": c["visibility"],
+        }
+        mapped_keypoints.append(mk)
+        if c["visibility"] >= _VIS_THRESH_DEDUP:
+            visible_xs.append(mk["x"])
+            visible_ys.append(mk["y"])
+
+    if len(visible_xs) < 2:
+        return None
+
+    center = (float(np.mean(visible_xs)), float(np.mean(visible_ys)))
+    best_det_conf = max(det["confidence"] for det in seg_dets)
+    vis_count = len(visible_xs)
+    dedup_priority = best_det_conf
+    if vis_count < 3:
+        dedup_priority *= 0.5
+
+    return {
+        "pose_confidence": best_det_conf,
+        "keypoints": mapped_keypoints,
+        "center": center,
+        "dedup_priority": dedup_priority,
+        "crop_box": {
+            "x1": crop_x1, "y1": crop_y1,
+            "x2": crop_x2, "y2": crop_y2,
+        },
+    }
+
+
 def _keypoints_to_bbox(keypoints: list, margin: float = 0,
                        margin_x: float = None, margin_y: float = None) -> dict:
     """
@@ -1426,7 +2010,8 @@ def pipeline(detection_session, pose_session, image: Image.Image,
             dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO,
             center_bias: bool = False,
             cv_refine: bool = False,
-            cv_refine_radius: int = 40):
+            cv_refine_radius: int = 40,
+            segment_session=None):
     """
     Two- or three-stage pipeline: detect → pose → [refine →] dedup → rescue.
 
@@ -1440,6 +2025,13 @@ def pipeline(detection_session, pose_session, image: Image.Image,
         when the first pose pass has low-visibility corners because the
         detection box is too loose or misaligned — the second pass gets
         a crop that's tightly centered on the actual photo.
+
+    Segment refinement (``segment_session`` provided + ``pose_refine=True``):
+        Same as three-stage refine, but uses the segment pose model for
+        the refinement pass instead of the 4-keypoint pose model. The
+        segment model finds boundary segments whose endpoints converge at
+        corners, which can be more precise than the pose model's named
+        keypoints for thin or partially visible photo edges.
 
     CV refinement (optional):
         ``cv_refine``: Sobel edge detection + line intersection on ALL
@@ -1490,16 +2082,26 @@ def pipeline(detection_session, pose_session, image: Image.Image,
         if result is None:
             continue
 
-        # Stage 2b (optional): Refine by re-running pose on a tighter crop
+        # Stage 2b (optional): Refine by re-running on a tighter crop
         # derived from the first pass keypoints. Refine crops are derived
         # from keypoints, not detection boxes, so they don't need crop limits.
         if pose_refine:
             refined_box = _keypoints_to_bbox(result["keypoints"])
             if refined_box is not None:
-                refined = _run_pose_on_crop(
-                    pose_session, image, refined_box,
-                    pose_conf, img_size, pose_refine_expand,
-                )
+                if segment_session is not None:
+                    # Use segment model for refinement: detect boundary segments,
+                    # cluster their endpoints into corners, and match to initial keypoints
+                    refined = _run_segment_on_crop(
+                        segment_session, image, refined_box,
+                        pose_conf, img_size, pose_refine_expand,
+                        initial_keypoints=result["keypoints"],
+                    )
+                else:
+                    # Use standard 4-keypoint pose model for refinement
+                    refined = _run_pose_on_crop(
+                        pose_session, image, refined_box,
+                        pose_conf, img_size, pose_refine_expand,
+                    )
                 if refined is not None:
                     result = refined
 
@@ -3559,7 +4161,8 @@ def infer_single(detection_session, pose_session, image_path: str,
                  corner_refine: bool = False,
                  corner_refine_iterations: int = 2,
                  corner_refine_conf: float = 0.5,
-                 corner_refine_model: str = "pose"):
+                 corner_refine_model: str = "pose",
+                 segment_session=None):
     """Run the full pipeline on a single image."""
 
     # Open image and capture EXIF before converting (convert creates
@@ -3599,6 +4202,7 @@ def infer_single(detection_session, pose_session, image_path: str,
             center_bias=center_bias,
             cv_refine=cv_refine,
             cv_refine_radius=cv_refine_radius,
+            segment_session=segment_session,
         )
 
     # ── Post-sweep CV refinement ──
@@ -3633,7 +4237,8 @@ def infer_single(detection_session, pose_session, image_path: str,
     if corner_refine and results:
         cr_pose = pose_session if corner_refine_model == "pose" else None
         cr_detect = detection_session if corner_refine_model == "detection" else None
-        if cr_pose is None and cr_detect is None:
+        cr_segment = segment_session if corner_refine_model == "segment" else None
+        if cr_pose is None and cr_detect is None and cr_segment is None:
             # Fallback: use whichever session is available
             cr_pose = pose_session
             cr_detect = detection_session if cr_pose is None else None
@@ -3646,6 +4251,7 @@ def infer_single(detection_session, pose_session, image_path: str,
                 pool.submit(refine_corners_geometric, image, res,
                             pose_session=cr_pose,
                             detection_session=cr_detect,
+                            segment_session=cr_segment,
                             iterations=corner_refine_iterations,
                             conf_threshold=corner_refine_conf)
                 for res in results
@@ -3796,7 +4402,8 @@ def infer_batch(detection_session, pose_session, image_dir: str,
                corner_refine: bool = False,
                corner_refine_iterations: int = 2,
                corner_refine_conf: float = 0.5,
-               corner_refine_model: str = "pose"):
+               corner_refine_model: str = "pose",
+               segment_session=None):
 
     image_dir = Path(image_dir)
     extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
@@ -3848,6 +4455,7 @@ def infer_batch(detection_session, pose_session, image_dir: str,
             corner_refine_iterations=corner_refine_iterations,
             corner_refine_conf=corner_refine_conf,
             corner_refine_model=corner_refine_model,
+            segment_session=segment_session,
         )
         summary.append({
             "image": img_path.name,
@@ -4359,11 +4967,18 @@ Coordinates Only (scripting-friendly):
     )
     parser.add_argument(
         "--corner-refine-model", type=str, default="pose",
-        choices=["pose", "detection"],
+        choices=["pose", "detection", "segment"],
         help="Model to use for corner refinement. 'pose' (default) uses named "
              "keypoints — fast single-pass per corner, no classification needed. "
              "'detection' uses bbox corners with geometric classification — may "
-             "need expanded crops if initial classification fails.",
+             "need expanded crops if initial classification fails. "
+             "'segment' uses the fiducial segment pose model — finds segment "
+             "endpoints near the approximate corner for sub-pixel refinement.",
+    )
+    parser.add_argument(
+        "--segment-model", type=str, default=str(DEFAULT_POSE_SEGMENT_MODEL),
+        help="Path to segment pose ONNX model for corner refinement "
+             "(default: ../models/fiducial_pose_v3.onnx)",
     )
 
     args = parser.parse_args()
@@ -4375,6 +4990,7 @@ Coordinates Only (scripting-friendly):
     # Validate models
     detection_model_path = Path(args.detection_model).resolve()
     pose_model_path = Path(args.pose_model).resolve()
+    segment_model_path = Path(args.segment_model).resolve() if args.segment_model else None
 
     if not detection_model_path.exists():
         _log(f"Error: Detection model not found: {detection_model_path}")
@@ -4392,6 +5008,17 @@ Coordinates Only (scripting-friendly):
     # Load pose model
     _log(f"Loading pose model: {pose_model_path}")
     pose_session = load_onnx_model(str(pose_model_path))
+
+    # Load segment model (only if needed for corner refinement)
+    segment_session = None
+    if args.corner_refine and args.corner_refine_model == "segment":
+        if segment_model_path and segment_model_path.exists():
+            _log(f"Loading segment model: {segment_model_path}")
+            segment_session = load_onnx_model(str(segment_model_path))
+        else:
+            _log(f"Error: Segment model not found: {segment_model_path}")
+            _log(f"  (default: {DEFAULT_POSE_SEGMENT_MODEL.resolve()})")
+            sys.exit(1)
 
     # Validate image path and auto-detect file vs directory mode
     image_path = Path(args.image)
@@ -4457,6 +5084,7 @@ Coordinates Only (scripting-friendly):
             corner_refine_iterations=args.corner_refine_iterations,
             corner_refine_conf=args.corner_refine_conf,
             corner_refine_model=args.corner_refine_model,
+            segment_session=segment_session,
         )
     else:
         infer_single(
@@ -4493,6 +5121,7 @@ Coordinates Only (scripting-friendly):
             corner_refine_iterations=args.corner_refine_iterations,
             corner_refine_conf=args.corner_refine_conf,
             corner_refine_model=args.corner_refine_model,
+            segment_session=segment_session,
         )
 
 

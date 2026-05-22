@@ -47,3 +47,6 @@ Thumbs.db
 # Images (generated outputs)
 *.jpg
 *.png
+# Large model files
+*.pt
+*.onnx
