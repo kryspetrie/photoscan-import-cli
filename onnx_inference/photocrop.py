@@ -913,8 +913,11 @@ def refine_corners_geometric(image: Image.Image, result: dict,
     # Segment model needs larger minimum crop (at least 640px) because it was
     # trained on 640×640 full-photo crops, not tight corner crops. It also
     # produces lower-confidence detections (0.2–0.4) than the pose model.
+    # The binary search range is [min_crop_size, crop_size], so crop_size
+    # must also be ≥ 640 for the segment model to work at all.
     if use_segment:
         min_crop_size = max(min_crop_size, 640)
+        crop_size = max(crop_size, 640)
         conf_threshold = min(conf_threshold, 0.2)
 
     bbox_max_dim = max(box["x2"] - box["x1"], box["y2"] - box["y1"])
