@@ -50,3 +50,6 @@ Thumbs.db
 # Large model files
 *.pt
 *.onnx
+
+# Corner regression training data (regenerateable)
+data_corner_regression/
