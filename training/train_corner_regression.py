@@ -171,6 +171,12 @@ def train(
         close_mosaic=close_mosaic,
         workers=workers,
         device=device,
+        cache=cache,
+        verbose=verbose,
+        val=True,
+        plots=True,
+        seed=0,
+        deterministic=True,
     )
 
     print("\n" + "=" * 60)
@@ -194,6 +200,7 @@ def main():
     parser.add_argument("--imgsz", type=int, default=320)
     parser.add_argument("--model", default="yolo26n-pose.pt")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--cache", default="ram")
     parser.add_argument("--name", default="corner-regression-v1")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -206,6 +213,7 @@ def main():
         imgsz=args.imgsz,
         model=args.model,
         device=args.device,
+        cache=args.cache,
         name=args.name,
         resume=args.resume,
     )
