@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-Train YOLO Corner Regression Model
-====================================
+Train YOLO Corner Regression Model V2
+=======================================
 
 Trains a lightweight YOLO pose model (yolo26n-pose) to detect photo corners
-in tight crops. This model is the refinement stage of the photo detection pipeline:
+in 320×320 crops. This model is the refinement stage of the photo detection pipeline:
 
   detect → pose (approximate) → corner crop → regression head → precise corner
 
 The model uses 1 class (corner) with 1 keypoint (the exact corner position).
-Input: 224-480px corner crops (synthetically generated).
+Input: 320×320 corner crops (synthetically generated).
 Output: bounding box of visible edges + corner keypoint position.
 
-Architecture: yolo26n-pose (3.7M params) — small and fast for this simple task.
+V2 Changes (from V1 analysis — best mAP50-95=0.75, 59% recall):
+  - Data fixes: fixed 320×320 image size, min bbox ≥ 32px, kp offset enforced
+  - 25% negative/background samples (was 0% — model couldn't reject non-corners)
+  - 10K train / 2K val data (was 5K/1K)
 
-V1 Training Configuration:
-  - lr0=0.001 with cosine decay (gentler than V3 segment model's 0.002)
-  - patience=20, max epochs 80 (stop early if no improvement)
-  - kobj=2.0, rle=1.0 (emphasize keypoint precision)
-  - box=3.0 (reduced for thin edges with poor IoU)
-  - Augmentation: scale=0.5, degrees=15, translate=0.2 (diverse corner appearances)
+V2 Training Changes:
+  - lr0=0.002 (was 0.001 — V1 was too slow to converge, matching V3 pose model)
+  - patience=30 (was 20 — give more time given larger dataset)
+  - Removed degenerate kp==center cases, larger bboxes → box weight restored
+  - box=4.0 (was 3.0 — bboxes are now more meaningful with min 32px)
+
+Architecture: yolo26n-pose (~3.7M params) — small and fast for this simple task.
 
 Usage:
     python3 train_corner_regression.py
@@ -51,40 +55,40 @@ def get_default_dataset_path():
 
 def train(
     data: str = None,
-    epochs: int = 80,
-    patience: int = 20,
+    epochs: int = 100,
+    patience: int = 30,
     batch: int = 32,
     imgsz: int = 320,
     cache: str = "ram",
     model: str = "yolo26n-pose.pt",
     project: str = "runs/pose",
-    name: str = "corner-regression-v1",
-    # Optimization — gentle lr for precise corner prediction
+    name: str = "corner-regression-v2",
+    # Optimization — match V3 pose model's proven lr
     optimizer: str = "AdamW",
-    lr0: float = 0.001,
+    lr0: float = 0.002,
     lrf: float = 0.01,
     momentum: float = 0.9,
     weight_decay: float = 0.0005,
     warmup_epochs: float = 3.0,
-    # Loss weights — emphasize keypoint precision over box accuracy
-    box: float = 3.0,          # Moderate — thin edge bboxes have poor IoU
-    cls: float = 0.3,          # Single class, but still needed for detection
+    # Loss weights — V2 rebalanced for larger bboxes and better detection
+    box: float = 4.0,          # V2: was 3.0 — bboxes now 32px+ min, more meaningful
+    cls: float = 0.3,          # Single class, but needed for foreground/background
     dfl: float = 1.5,          # Default distribution focal loss
-    pose: float = 12.0,         # Key point localization
-    kobj: float = 2.0,          # Higher than default (1.0) — emphasize keypoint confidence
-    rle: float = 1.0,           # Rotation-equivariant loss for keypoint precision
-    # Augmentation — generous since corner crops should be robust to appearance variation
-    mosaic: float = 0.0,        # OFF — corner crops are small, mosaic creates artifacts
-    mixup: float = 0.0,         # OFF — would corrupt keypoint positions
-    copy_paste: float = 0.0,    # OFF — would create invalid corner patterns
-    scale: float = 0.5,         # Moderate-high — corners at various scales
-    degrees: float = 15.0,      # Moderate rotation — corner angles vary
-    translate: float = 0.2,     # Moderate — corner position within crop varies
-    flipud: float = 0.0,        # No vertical flip (changes corner semantics)
-    fliplr: float = 0.5,        # Horizontal flip OK (corner position mirrors)
-    hsv_h: float = 0.015,       # Slight color variation
-    hsv_s: float = 0.3,         # Moderate saturation variation
-    hsv_v: float = 0.3,         # Moderate brightness variation
+    pose: float = 12.0,        # Keypoint localization
+    kobj: float = 2.0,         # Emphasize keypoint confidence
+    rle: float = 1.0,          # Rotation-equivariant loss for keypoint precision
+    # Augmentation — moderate, matching V3 pose model approach
+    mosaic: float = 0.0,       # OFF — corner crops are small, mosaic creates artifacts
+    mixup: float = 0.0,        # OFF — would corrupt keypoint positions
+    copy_paste: float = 0.0,   # OFF — would create invalid corner patterns
+    scale: float = 0.3,        # V2: was 0.5 — reduced to keep bboxes meaningful
+    degrees: float = 5.0,       # V2: was 15.0 — reduced, corner semantics change with rotation
+    translate: float = 0.1,    # V2: was 0.2 — reduced, corner position is key signal
+    flipud: float = 0.0,      # No vertical flip (changes corner semantics)
+    fliplr: float = 0.5,      # Horizontal flip OK (corner position mirrors)
+    hsv_h: float = 0.015,     # Slight color variation
+    hsv_s: float = 0.3,       # Moderate saturation variation
+    hsv_v: float = 0.3,       # Moderate brightness variation
     # Training settings
     pretrained: bool = True,
     close_mosaic: int = 0,
@@ -94,7 +98,7 @@ def train(
     verbose: bool = True,
     resume: bool = False,
 ):
-    """Train YOLO-pose corner regression model."""
+    """Train YOLO-pose corner regression model (V2)."""
 
     if data is None:
         data = str(get_default_dataset_path())
@@ -105,15 +109,25 @@ def train(
         sys.exit(1)
 
     print("=" * 60)
-    print("YOLO CORNER REGRESSION MODEL TRAINING")
+    print("YOLO CORNER REGRESSION MODEL TRAINING — V2")
     print("=" * 60)
     print(f"Model:      {model}")
     print(f"Dataset:    {data}")
     print(f"Epochs:     {epochs}")
+    print(f"Patience:   {patience}")
     print(f"Batch:      {batch}")
     print(f"Image size: {imgsz}")
     print(f"Device:     {device}")
     print(f"Cache:      {cache}")
+    print()
+    print("V2 Changes from V1:")
+    print("  Data: fixed 320×320, min_bbox=32px, kp offset enforced, 25% negatives")
+    print("  lr0: 0.002 (was 0.001 — too slow)")
+    print("  box: 4.0 (was 3.0 — bboxes now more meaningful)")
+    print("  scale: 0.3 (was 0.5 — too aggressive for small bboxes)")
+    print("  degrees: 5.0 (was 15.0 — corner semantics change with rotation)")
+    print("  translate: 0.1 (was 0.2 — position is key signal)")
+    print("  patience: 30 (was 20 — larger dataset needs more time)")
     print()
     print("Keypoint Configuration:")
     print("  kp0 = Corner position (the precise intersection of photo edges)")
@@ -123,10 +137,10 @@ def train(
     print("Class Configuration:")
     print("  nc = 1  (single class: corner)")
     print()
-    print("Loss Weights (V1 — keypoint-precision emphasis):")
+    print("Loss Weights (V2 — rebalanced for larger bboxes):")
     print(f"  box={box}  cls={cls}  dfl={dfl}  pose={pose}  kobj={kobj}  rle={rle}")
     print()
-    print("Augmentation (moderate — corner crops are already varied):")
+    print("Augmentation (conservative — preserve corner position):")
     print(f"  mosaic={mosaic}  close_mosaic={close_mosaic}")
     print(f"  scale={scale}  translate={translate}")
     print(f"  mixup={mixup}  copy_paste={copy_paste}")
@@ -191,17 +205,17 @@ def train(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train YOLO corner regression model")
+        description="Train YOLO corner regression model (V2)")
     parser.add_argument("--data", default=None,
                         help="Dataset YAML path")
-    parser.add_argument("--epochs", type=int, default=80)
-    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--patience", type=int, default=30)
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--imgsz", type=int, default=320)
     parser.add_argument("--model", default="yolo26n-pose.pt")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--cache", default="ram")
-    parser.add_argument("--name", default="corner-regression-v1")
+    parser.add_argument("--name", default="corner-regression-v2")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 

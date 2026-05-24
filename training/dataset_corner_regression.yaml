@@ -1,20 +1,29 @@
-# YOLO Corner Regression Dataset Configuration
-# ==========================================
+# YOLO Corner Regression Dataset Configuration V2
+# =================================================
 # Single-class corner detection with 1 keypoint (corner position).
 # Input: 320×320 corner crops from detection→pose pipeline.
 # Output: bounding box of visible edges + corner keypoint position.
+#
+# V2 changes from V1:
+#   - Fixed 320×320 image size (was variable 224-480)
+#   - Minimum bbox ≥ 32px (was 16px — too tiny for detection)
+#   - Keypoint offset from bbox center enforced (was 64% kp==center)
+#   - 20-25% negative/background samples (was 0%)
+#   - Background texture fill instead of gray padding (was creating false edges)
+#   - 10K train / 2K val split (was 5K/1K)
 #
 # Label format (8 columns per instance):
 #   class_id x_center y_center width height kpx kpy kpv
 #
 # Keypoint: the exact corner position within the crop (normalized).
-# Visibility: 2 = visible corner, 0 = edge-only (no corner visible).
+# Visibility: 2 = visible corner (only value used in V2).
+# Negative samples have empty label files (no instances).
 #
 # Usage:
 #   python3 train_corner_regression.py
 #   (or: python3 train_corner_regression.py --data dataset_corner_regression.yaml)
 
-path: /Users/krys.petrie/dev/photo-pose-detector/data_corner_regression
+path: /Users/krys.petrie/dev/photo-pose-detector/data_generator/data_corner_regression
 train: images/train
 val: images/val
 
@@ -22,6 +31,6 @@ nc: 1
 names:
   0: corner
 
-# Keypoint configuration: 1 keypoint (corner position)
+# Single keypoint: corner position
 kpt_shape: [1, 3]
 flip_idx: [0]

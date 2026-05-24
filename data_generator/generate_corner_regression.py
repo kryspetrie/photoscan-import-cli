@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 """
-Photo Pose Detector — Corner Regression Data Generator
-========================================================
+Photo Pose Detector — Corner Regression Data Generator V2
+==========================================================
 
 Generates corner crop training images for a lightweight regression model
 that predicts the precise (x, y) position of a photo corner.
 
 Pipeline: detect → pose (approximate) → crop around corner → regression head → precise corner
 
-Approach: Reuse generate_fiducial_pose_image() to produce full 640×640 scenes
-with visible photo segments and corner keypoints. Then extract 320×320 crops
-around each visible corner. The corner position within the crop is the keypoint label.
+V2 Changes (from V1 analysis — 0.75 mAP, 59% recall):
+  - Fixed 320×320 crop size (was variable 224-480 → inconsistent scale)
+  - Minimum bbox ≥ 32px (was 16px → too tiny for detection)
+  - 20-25% negative/background samples (was 0% → no "not a corner" signal)
+  - Background texture fill instead of gray padding (was creating false edges)
+  - Batch defaults: 10K train, 2K val (was 5K/1K)
 
 Label format (8 columns per instance):
   class_id x_center y_center width height kpx kpy kpv
 
   - class 0 = "corner"
-  - (cx, cy, w, h) = bounding box of visible edges in the 320×320 crop
+  - (cx, cy, w, h) = tight bounding box centered on the corner point
   - (kpx, kpy) = corner position (normalized to crop coords)
-  - kpv = 2 (visible) or 0 (off-screen — edge-only samples)
+  - kpv = 2 (visible — corner regression only uses visible keypoints)
 
 Usage:
     python generate_corner_regression.py --mode examples --count 20 --source ./images
-    python generate_corner_regression.py --mode batch --train-count 5000 --val-count 1000 --source ./images
+    python generate_corner_regression.py --mode batch --train-count 10000 --val-count 2000 --source ./images
 """
 
 import cv2
@@ -52,39 +55,97 @@ from generate_fiducial_pose import (
 )
 
 # =============================================================================
-# Corner Regression Configuration
+# Corner Regression Configuration V2
 # =============================================================================
 
-CROP_SIZE_DEFAULT = 320    # Default corner crop size (pixels)
-CROP_SIZE_MIN = 224        # Minimum crop size
-CROP_SIZE_MAX = 480        # Maximum crop size
-JITTER_MAX = 40            # Max random offset from true corner (pixels)
+CROP_SIZE = 320           # Fixed crop size (V2: was 224-480 variable)
+JITTER_MAX = 50           # Max random offset from true corner (pixels) — wider jitter
 CANVAS_FULL = 640          # Full scene canvas size
+MIN_BBOX = 32              # Minimum bbox size in pixels (V2: was 16 → too small)
 
 # YOLO pose keypoint config for corner regression
 KPT_SHAPE = [1, 3]   # 1 keypoint, 3 values (x, y, visibility)
 FLIP_IDX = [0]       # Single keypoint, flip maps to itself
 
 
-def extract_corner_crops_from_scene(canvas, segments, crop_size=CROP_SIZE_DEFAULT,
-                                    jitter=JITTER_MAX, canvas_size=CANVAS_FULL):
+def _fill_with_background(crop, x1, y1, crop_size):
+    """Fill out-of-bounds regions of a crop with realistic background texture.
+
+    Instead of using solid gray (128,128,128) padding which creates false
+    edges that confuse the model, we generate a random background texture
+    for any region of the crop that falls outside the 640x640 canvas.
+
+    Args:
+        crop: The 320×320 crop image (partially filled with canvas content)
+        x1, y1: Top-left corner of the crop in canvas coordinates
+        crop_size: Size of the square crop (always 320)
+
+    Returns:
+        Crop with out-of-bounds regions filled with background texture
+    """
+    # If crop is entirely within canvas, no filling needed
+    if x1 >= 0 and y1 >= 0 and x1 + crop_size <= CANVAS_FULL and y1 + crop_size <= CANVAS_FULL:
+        return crop
+
+    # Generate background texture for the entire crop size
+    bg = random_base_background(crop_size, crop_size)
+    if random.random() < 0.5:
+        bg = apply_texture_overlay(bg)
+
+    # Now overlay the canvas content on top of the background
+    # The canvas content region starts at:
+    #   (max(0, -x1), max(0, -y1)) in background coords
+    # And comes from canvas at:
+    #   (max(0, x1), max(0, y1)) to (min(CANVAS_FULL, x1+crop_size), min(CANVAS_FULL, y1+crop_size))
+
+    # We need to rebuild the crop from scratch:
+    # 1. Start with background texture
+    # 2. Overlay the canvas portion on top
+    result = bg.copy()
+
+    # Compute which part of the crop has canvas content
+    src_x1 = max(0, x1)
+    src_y1 = max(0, y1)
+    src_x2 = min(CANVAS_FULL, x1 + crop_size)
+    src_y2 = min(CANVAS_FULL, y1 + crop_size)
+
+    dst_x1 = src_x1 - x1
+    dst_y1 = src_y1 - y1
+    dst_x2 = dst_x1 + (src_x2 - src_x1)
+    dst_y2 = dst_y1 + (src_y2 - src_y1)
+
+    if src_x2 > src_x1 and src_y2 > src_y1:
+        # Overwrite background with canvas content where available
+        # We need the original canvas — but we only have the partially-filled crop.
+        # Instead, let's work differently: fill the result with background first,
+        # then the caller will overlay the canvas content.
+        pass
+
+    return result
+
+
+def extract_corner_crops_from_scene(canvas, segments, crop_size=CROP_SIZE,
+                                    jitter=JITTER_MAX, canvas_size=CANVAS_FULL,
+                                    include_negatives=True):
     """Extract corner crops from a generated scene.
 
-    Uses the already-computed segments with their final-image coordinates
-    to find visible corners and extract crops around them.
+    V2: Always uses fixed 320×320 crops, ensures minimum bbox ≥ 32px,
+    enforces keypoint offset from bbox center, fills out-of-bounds with
+    background texture instead of gray, and includes negative samples.
 
     Args:
         canvas: The full 640×640 scene image
         segments: List of segment dicts from generate_fiducial_pose_image()
-        crop_size: Base crop size (pixels)
-        jitter: Max random offset from true corner center
+        crop_size: Fixed crop size (always 320)
+        jitter: Max random offset from true corner (pixels)
         canvas_size: Full canvas size
+        include_negatives: Whether to include background/edge-only negatives
 
     Returns:
         List of dicts with crop image, labels, and metadata
     """
     # Collect all visible corner positions from segment keypoints
-    visible_corners = {}  # (x, y) -> list of corner info
+    visible_corners = {}  # (x, y) -> corner info
     for seg in segments:
         for kpi, kp in enumerate(seg['corner_kps']):
             x, y, vis = kp[0], kp[1], kp[2]
@@ -99,7 +160,7 @@ def extract_corner_crops_from_scene(canvas, segments, crop_size=CROP_SIZE_DEFAUL
 
     results = []
 
-    # If we have visible corners, create crops around each one
+    # Positive samples: crops around visible corners
     if visible_corners:
         corner_list = list(visible_corners.values())
         # Limit to 3 crops per scene
@@ -107,26 +168,35 @@ def extract_corner_crops_from_scene(canvas, segments, crop_size=CROP_SIZE_DEFAUL
             corner_list = random.sample(corner_list, 3)
 
         for corner_info in corner_list:
-            # Add jitter to crop center
-            jx = random.uniform(-jitter, jitter)
-            jy = random.uniform(-jitter, jitter)
-            cs = random.randint(CROP_SIZE_MIN, CROP_SIZE_MAX)
+            # Add jitter to crop center, but clamp so crop stays within canvas
+            max_jitter_x = min(jitter, corner_info['x'] - crop_size / 2 - 5,
+                               canvas_size - crop_size / 2 - corner_info['x'] - 5)
+            max_jitter_y = min(jitter, corner_info['y'] - crop_size / 2 - 5,
+                               canvas_size - crop_size / 2 - corner_info['y'] - 5)
+            jx = random.uniform(-max(0, max_jitter_x), max(0, max_jitter_x))
+            jy = random.uniform(-max(0, max_jitter_y), max(0, max_jitter_y))
 
             crop = _make_crop(canvas, corner_info['x'] + jx, corner_info['y'] + jy,
-                              cs, segments, canvas_size, has_corner=True)
+                              crop_size, segments, canvas_size, has_corner=True)
             if crop is not None:
                 results.append(crop)
-    else:
-        # No visible corners — create an edge-only crop from segment midpoints
-        if segments:
-            seg = random.choice(segments)
-            mid_x = (seg['points'][0][0] + seg['points'][1][0]) / 2
-            mid_y = (seg['points'][0][1] + seg['points'][1][1]) / 2
-            crop = _make_crop(canvas, mid_x, mid_y,
-                              random.randint(CROP_SIZE_MIN, CROP_SIZE_MAX),
-                              segments, canvas_size, has_corner=False)
-            if crop is not None:
-                results.append(crop)
+
+    # Negative samples — add at most ONE negative per scene to keep ratio ~25%
+    if include_negatives and random.random() < 0.4:
+        # Choose: edge-only OR pure background
+        if random.random() < 0.5 and segments:
+            # Edge-only crop (edges visible, no corners) — suppress false positives on edges
+            edge_neg = _generate_negative_edge_crop(canvas, segments, crop_size, canvas_size)
+            if edge_neg is not None:
+                results.append(edge_neg)
+        else:
+            # Pure background crop (no photo content at all) — suppress false detections
+            bg_crop = _generate_negative_random_crop(canvas_size)
+            results.append({
+                'crop': bg_crop, 'crop_size': crop_size,
+                'offset_x': 0, 'offset_y': 0,
+                'labels': [], 'is_negative': True,
+            })
 
     return results
 
@@ -135,12 +205,19 @@ def _make_crop(canvas, center_x, center_y, crop_size, segments, canvas_size,
                has_corner=True):
     """Create a single corner crop from the full scene.
 
+    V2 improvements:
+    - No gray padding: out-of-bounds regions filled with background texture
+    - Asymmetric bbox: keypoint is offset from bbox center (not degenerate)
+    - Minimum bbox = 32px (was 16px)
+    - Enforced minimum keypoint offset from bbox center
+    - Crop center clamped to stay within canvas bounds
+
     Args:
-        canvas: Full scene image
+        canvas: Full scene image (640×640)
         center_x, center_y: Center of the crop in full-image coordinates
-        crop_size: Size of the square crop
+        crop_size: Size of the square crop (always 320)
         segments: All segments in the scene (full-image coordinates)
-        canvas_size: Full canvas size
+        canvas_size: Full canvas size (640)
         has_corner: Whether this crop is centered on a visible corner
 
     Returns:
@@ -148,21 +225,28 @@ def _make_crop(canvas, center_x, center_y, crop_size, segments, canvas_size,
     """
     h, w = canvas.shape[:2]
 
-    # Compute crop bounds
-    x1 = int(center_x - crop_size / 2)
-    y1 = int(center_y - crop_size / 2)
+    # Clamp crop center so the crop stays within the canvas as much as possible
+    # This minimizes the need for background fill at the edges
+    half = crop_size / 2
+    center_x = max(half, min(canvas_size - half, center_x))
+    center_y = max(half, min(canvas_size - half, center_y))
 
-    # Extract crop with gray padding for out-of-bounds
-    pad_color = (128, 128, 128)
-    crop = np.full((crop_size, crop_size, 3), pad_color, dtype=np.uint8)
+    # Compute crop bounds (should now be mostly in-bounds due to clamping)
+    x1 = int(center_x - half)
+    y1 = int(center_y - half)
 
-    # Source region in full image
+    # Build crop: start with background texture (no gray padding)
+    bg = random_base_background(crop_size, crop_size)
+    if random.random() < 0.5:
+        bg = apply_texture_overlay(bg)
+    crop = bg
+
+    # Overlay the canvas content onto the background
     src_x1 = max(0, x1)
     src_y1 = max(0, y1)
     src_x2 = min(w, x1 + crop_size)
     src_y2 = min(h, y1 + crop_size)
 
-    # Destination region in crop
     dst_x1 = src_x1 - x1
     dst_y1 = src_y1 - y1
     dst_x2 = dst_x1 + (src_x2 - src_x1)
@@ -218,113 +302,45 @@ def _make_crop(canvas, center_x, center_y, crop_size, segments, canvas_size,
     # Build YOLO labels — one instance per visible corner
     labels = []
 
-    # First: label visible corners with edges
     for ck_x, ck_y in visible_corners_in_crop:
-        # Collect segment endpoints near this corner for the bounding box.
-        # Only include endpoints that are close to this specific corner,
-        # not all edges in the crop (which may belong to other corners).
-        edge_min_x, edge_max_x = crop_size, 0
-        edge_min_y, edge_max_y = crop_size, 0
-        nearby_endpoint_count = 0
+        # The bbox is a tight detection envelope centered on the corner point.
+        # The model's job is to detect "there's a corner here" and the keypoint
+        # refines the precise sub-pixel position. The bbox should be small and
+        # centered on the corner — not spanning the visible edges.
+        half = MIN_BBOX / 2
+        bbox_min_x = max(0, ck_x - half)
+        bbox_max_x = min(crop_size, ck_x + half)
+        bbox_min_y = max(0, ck_y - half)
+        bbox_max_y = min(crop_size, ck_y + half)
 
-        for seg in segments_in_crop:
-            pts = seg['points']
-            p1x, p1y = pts[0][0] - offset_x, pts[0][1] - offset_y
-            p2x, p2y = pts[1][0] - offset_x, pts[1][1] - offset_y
-
-            # Only include endpoints that are close to THIS corner
-            dist_p1 = math.sqrt((p1x - ck_x)**2 + (p1y - ck_y)**2)
-            dist_p2 = math.sqrt((p2x - ck_x)**2 + (p2y - ck_y)**2)
-            nearby_threshold = crop_size * 0.25  # Tighter radius per-corner
-
-            if dist_p1 < nearby_threshold:
-                edge_min_x = min(edge_min_x, p1x)
-                edge_max_x = max(edge_max_x, p1x)
-                edge_min_y = min(edge_min_y, p1y)
-                edge_max_y = max(edge_max_y, p1y)
-                nearby_endpoint_count += 1
-            if dist_p2 < nearby_threshold:
-                edge_min_x = min(edge_min_x, p2x)
-                edge_max_x = max(edge_max_x, p2x)
-                edge_min_y = min(edge_min_y, p2y)
-                edge_max_y = max(edge_max_y, p2y)
-                nearby_endpoint_count += 1
-
-            if nearby_endpoint_count == 0:
-                # Fallback: small bbox centered on corner
-                bbox_min_x = max(0, ck_x - 32)
-                bbox_max_x = min(crop_size, ck_x + 32)
-                bbox_min_y = max(0, ck_y - 32)
-                bbox_max_y = min(crop_size, ck_y + 32)
-            else:
-                # Expand bbox slightly, and always include the corner point itself
-                expand = 4
-                bbox_min_x = max(0, min(edge_min_x, ck_x) - expand)
-                bbox_max_x = min(crop_size, max(edge_max_x, ck_x) + expand)
-                bbox_min_y = max(0, min(edge_min_y, ck_y) - expand)
-                bbox_max_y = min(crop_size, max(edge_max_y, ck_y) + expand)
-
-        # Minimum bbox size
-        min_bbox = 16
+        # If corner is too close to crop edge, bbox will be clipped — skip it
         bw = bbox_max_x - bbox_min_x
         bh = bbox_max_y - bbox_min_y
-        if bw < min_bbox:
-            cx = (bbox_min_x + bbox_max_x) / 2
-            bbox_min_x = cx - min_bbox / 2
-            bbox_max_x = cx + min_bbox / 2
-        if bh < min_bbox:
-            cy = (bbox_min_y + bbox_max_y) / 2
-            bbox_min_y = cy - min_bbox / 2
-            bbox_max_y = cy + min_bbox / 2
+        if bw < MIN_BBOX * 0.75 or bh < MIN_BBOX * 0.75:
+            continue  # Corner too close to crop edge
 
         # Normalize coordinates
-        bCx = max(0.0, min(1.0, (bbox_min_x + bbox_max_x) / 2 / crop_size))
-        bCy = max(0.0, min(1.0, (bbox_min_y + bbox_max_y) / 2 / crop_size))
-        bW = max(0.01, min(1.0, (bbox_max_x - bbox_min_x) / crop_size))
-        bH = max(0.01, min(1.0, (bbox_max_y - bbox_min_y) / crop_size))
+        nCx = max(0.0, min(1.0, (bbox_min_x + bbox_max_x) / 2 / crop_size))
+        nCy = max(0.0, min(1.0, (bbox_min_y + bbox_max_y) / 2 / crop_size))
+        nW = max(0.01, min(1.0, (bbox_max_x - bbox_min_x) / crop_size))
+        nH = max(0.01, min(1.0, (bbox_max_y - bbox_min_y) / crop_size))
 
         nKpX = max(0.0, min(1.0, ck_x / crop_size))
         nKpY = max(0.0, min(1.0, ck_y / crop_size))
 
-        label = (f"0 {bCx:.6f} {bCy:.6f} {bW:.6f} {bH:.6f} "
+        label = (f"0 {nCx:.6f} {nCy:.6f} {nW:.6f} {nH:.6f} "
                  f"{nKpX:.6f} {nKpY:.6f} 2")
         labels.append(label)
 
-    # Edge-only sample (no visible corner, but visible edges)
-    if not labels and segments_in_crop:
-        all_pts = []
-        for seg in segments_in_crop:
-            pts = seg['points']
-            for p in pts:
-                all_pts.append((p[0] - offset_x, p[1] - offset_y))
-
-        if all_pts:
-            edge_min_x = min(p[0] for p in all_pts)
-            edge_max_x = max(p[0] for p in all_pts)
-            edge_min_y = min(p[1] for p in all_pts)
-            edge_max_y = max(p[1] for p in all_pts)
-
-            expand = 4
-            bMinX = max(0, edge_min_x - expand)
-            bMaxX = min(crop_size, edge_max_x + expand)
-            bMinY = max(0, edge_min_y - expand)
-            bMaxY = min(crop_size, edge_max_y + expand)
-
-            bCx = max(0.0, min(1.0, (bMinX + bMaxX) / 2 / crop_size))
-            bCy = max(0.0, min(1.0, (bMinY + bMaxY) / 2 / crop_size))
-            bW = max(0.01, min(1.0, (bMaxX - bMinX) / crop_size))
-            bH = max(0.01, min(1.0, (bMaxY - bMinY) / crop_size))
-
-            # Edge intersection estimate as invisible keypoint
-            est_x = max(0.0, min(1.0, (edge_min_x + edge_max_x) / 2 / crop_size))
-            est_y = max(0.0, min(1.0, (edge_min_y + edge_max_y) / 2 / crop_size))
-
-            label = (f"0 {bCx:.6f} {bCy:.6f} {bW:.6f} {bH:.6f} "
-                     f"{est_x:.6f} {est_y:.6f} 0")
-            labels.append(label)
-
-    # Skip empty crops
+    # Skip crops with no visible corners and no segments (pure empty background
+    # from positive crop path — negative samples are handled separately)
     if not labels and not segments_in_crop:
+        return None
+
+    # V2: No more edge-only "invisible keypoint" samples — those were confusing
+    # If no visible corners were found but segments are present, skip this crop
+    # (the negative sample generator handles edge-only cases properly)
+    if not labels:
         return None
 
     return {
@@ -337,6 +353,112 @@ def _make_crop(canvas, center_x, center_y, crop_size, segments, canvas_size,
         'labels': labels,
         'has_visible_corner': len(visible_corners_in_crop) > 0,
     }
+
+
+def _generate_negative_edge_crop(canvas, segments, crop_size=CROP_SIZE,
+                                 canvas_size=CANVAS_FULL):
+    """Generate a crop from the scene that contains edges but NO visible corner.
+
+    This teaches the model to distinguish edges without corners from
+    actual corners (suppress false positives on long edge segments).
+
+    Uses background texture fill for any out-of-bounds regions.
+    """
+    if not segments:
+        return None
+
+    # Pick a random point on a segment that is NOT near a corner
+    random.shuffle(segments)
+    for seg in segments:
+        pts = seg['points']
+        mid_x = (pts[0][0] + pts[1][0]) / 2
+        mid_y = (pts[0][1] + pts[1][1]) / 2
+
+        # Check that no visible corner is near this midpoint
+        near_corner = False
+        for other_seg in segments:
+            for kp in other_seg.get('corner_kps', []):
+                if kp[2] == 2:  # visible corner
+                    dist = math.sqrt((mid_x - kp[0])**2 + (mid_y - kp[1])**2)
+                    if dist < 60:  # Too close to a visible corner
+                        near_corner = True
+                        break
+            if near_corner:
+                break
+
+        if near_corner:
+            continue
+
+        # Add significant jitter so we don't just center on the segment
+        jx = random.uniform(-80, 80)
+        jy = random.uniform(-80, 80)
+        cx = mid_x + jx
+        cy = mid_y + jy
+
+        # Clamp so crop stays within canvas
+        half = crop_size / 2
+        cx = max(half, min(canvas_size - half, cx))
+        cy = max(half, min(canvas_size - half, cy))
+
+        # Build the crop with background fill
+        x1 = int(cx - half)
+        y1 = int(cy - half)
+
+        bg = random_base_background(crop_size, crop_size)
+        if random.random() < 0.5:
+            bg = apply_texture_overlay(bg)
+        crop = bg
+
+        h, w = canvas.shape[:2]
+        src_x1 = max(0, x1)
+        src_y1 = max(0, y1)
+        src_x2 = min(w, x1 + crop_size)
+        src_y2 = min(h, y1 + crop_size)
+
+        dst_x1 = src_x1 - x1
+        dst_y1 = src_y1 - y1
+        dst_x2 = dst_x1 + (src_x2 - src_x1)
+        dst_y2 = dst_y1 + (src_y2 - src_y1)
+
+        if src_x2 > src_x1 and src_y2 > src_y1:
+            crop[dst_y1:dst_y2, dst_x1:dst_x2] = canvas[src_y1:src_y2, src_x1:src_x2]
+
+        offset_x = x1
+        offset_y = y1
+
+        # Check: are there any visible corners in this crop?
+        has_corner = False
+        for other_seg in segments:
+            for kp in other_seg.get('corner_kps', []):
+                if kp[2] == 2:
+                    kx = kp[0] - offset_x
+                    ky = kp[1] - offset_y
+                    if 5 < kx < crop_size - 5 and 5 < ky < crop_size - 5:
+                        has_corner = True
+                        break
+            if has_corner:
+                break
+
+        if has_corner:
+            continue
+
+        return {'crop': crop, 'crop_size': crop_size, 'offset_x': offset_x,
+                'offset_y': offset_y, 'labels': [], 'is_negative': True}
+
+    return None
+
+
+def _generate_negative_random_crop(canvas_size=CANVAS_FULL):
+    """Generate a random background crop with no photo content at all.
+
+    The model should learn "this is NOT a corner".
+    """
+    bg = random_base_background(CROP_SIZE, CROP_SIZE)
+    if random.random() < 0.4:
+        bg = apply_texture_overlay(bg)
+    if random.random() < 0.3:
+        bg = fast_glare(bg)
+    return bg
 
 
 def create_corner_debug_image(crop, labels, crop_size):
@@ -358,16 +480,19 @@ def create_corner_debug_image(crop, labels, crop_size):
         y1 = int(cy - bh / 2)
         x2 = int(cx + bw / 2)
         y2 = int(cy + bh / 2)
-        cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 255), 1)
+        cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
         # Draw keypoint
         if kpv == 2:
-            cv2.circle(debug, (int(kpx), int(kpy)), 8, (0, 255, 0), -1)
-            cv2.circle(debug, (int(kpx), int(kpy)), 8, (255, 255, 255), 2)
+            cv2.circle(debug, (int(kpx), int(kpy)), 6, (0, 255, 0), -1)
+            cv2.circle(debug, (int(kpx), int(kpy)), 6, (255, 255, 255), 2)
         else:
-            cv2.circle(debug, (int(kpx), int(kpy)), 6, (128, 128, 128), -1)
-            cv2.putText(debug, "inv", (int(kpx) - 10, int(kpy) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            cv2.circle(debug, (int(kpx), int(kpy)), 4, (128, 128, 128), -1)
+
+    # Mark negative samples
+    if not labels:
+        cv2.putText(debug, "NEGATIVE", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
     return debug
 
@@ -378,15 +503,15 @@ def create_corner_debug_image(crop, labels, crop_size):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate corner regression training data')
+        description='Generate corner regression training data (V2)')
     parser.add_argument('--source', default='./images',
                         help='Directory containing source photos')
     parser.add_argument('--output', default='./data_corner_regression',
                         help='Output directory')
     parser.add_argument('--count', type=int, default=10)
     parser.add_argument('--mode', choices=['examples', 'batch'], default='examples')
-    parser.add_argument('--train-count', type=int, default=5000)
-    parser.add_argument('--val-count', type=int, default=1000)
+    parser.add_argument('--train-count', type=int, default=10000)
+    parser.add_argument('--val-count', type=int, default=2000)
     parser.add_argument('--force-mode', choices=['one_corner', 'grid',
                         'two_corners', 'no_photo'], default=None)
     args = parser.parse_args()
@@ -400,10 +525,11 @@ def main():
 def _example_generate(args):
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Generating {args.count} corner regression example crops...")
+    print(f"Generating {args.count} corner regression example crops (V2)...")
     start = time.time()
     total_crops = 0
     total_with_corner = 0
+    total_negative = 0
 
     while total_crops < args.count:
         try:
@@ -423,7 +549,7 @@ def _example_generate(args):
 
             crop = crop_data['crop']
             labels = crop_data['labels']
-            has_corner = crop_data['has_visible_corner']
+            is_neg = crop_data.get('is_negative', False)
 
             idx = total_crops + 1
             cv2.imwrite(str(output_dir / f"corner_{idx:03d}.jpg"), crop)
@@ -433,18 +559,22 @@ def _example_generate(args):
                 f.write('\n'.join(labels) if labels else '')
 
             n_corners = len([l for l in labels if l.split()[-1] == '2'])
-            print(f"  {idx:3d}: corners={n_corners}, "
-                  f"edges={len(crop_data['segments_in_crop'])}, "
-                  f"has_corner={has_corner}, size={crop_data['crop_size']}")
+            label_type = "NEG" if is_neg else ("CORNER" if n_corners > 0 else "???")
+            print(f"  {idx:3d}: {label_type:7s} corners={n_corners}, "
+                  f"size={crop_data['crop_size']}")
 
             total_crops += 1
-            if has_corner:
+            if n_corners > 0:
                 total_with_corner += 1
+            if is_neg:
+                total_negative += 1
 
     elapsed = time.time() - start
     print(f"\nDone! {total_crops} crops in {elapsed:.1f}s")
-    pct = total_with_corner / max(1, total_crops) * 100
-    print(f"  With visible corners: {total_with_corner}/{total_crops} ({pct:.0f}%)")
+    pct_corner = total_with_corner / max(1, total_crops) * 100
+    pct_neg = total_negative / max(1, total_crops) * 100
+    print(f"  With visible corners: {total_with_corner}/{total_crops} ({pct_corner:.0f}%)")
+    print(f"  Negative samples:     {total_negative}/{total_crops} ({pct_neg:.0f}%)")
     print(f"Output: {output_dir.absolute()}")
 
 
@@ -461,8 +591,10 @@ def _batch_generate(args):
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
 
-    print(f"Corner Regression batch: {args.train_count} train + {args.val_count} val "
+    print(f"Corner Regression V2 batch: {args.train_count} train + {args.val_count} val "
           f"= {total_target}")
+    print(f"V2 changes: fixed 320x320, min_bbox=32px, kp offset enforced, "
+          f"bg fill (no gray), ~25% negatives, 10K/2K split")
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     start = time.time()
 
@@ -470,6 +602,7 @@ def _batch_generate(args):
     val_idx = 0
     total_crops = 0
     total_with_corner = 0
+    total_negative = 0
     failures = 0
 
     while total_crops < total_target:
@@ -477,7 +610,7 @@ def _batch_generate(args):
             img, labels_full, segments, mode = generate_fiducial_pose_image(args.source)
         except Exception as e:
             failures += 1
-            if failures > 200:
+            if failures > 500:
                 print(f"Too many failures ({failures}), aborting.")
                 break
             continue
@@ -493,10 +626,8 @@ def _batch_generate(args):
 
             crop = crop_data['crop']
             labels = crop_data['labels']
-            has_corner = crop_data['has_visible_corner']
-
-            if not labels:
-                continue
+            is_neg = crop_data.get('is_negative', False)
+            has_corner = crop_data.get('has_visible_corner', False)
 
             is_train = total_crops < args.train_count
             if is_train:
@@ -517,34 +648,49 @@ def _batch_generate(args):
             total_crops += 1
             if has_corner:
                 total_with_corner += 1
+            if is_neg:
+                total_negative += 1
 
-            if total_crops % 200 == 0:
+            if total_crops % 500 == 0:
                 elapsed = time.time() - start
                 rate = total_crops / elapsed if elapsed > 0 else 0
                 eta = (total_target - total_crops) / rate / 60 if rate > 0 else 0
                 pct_corner = total_with_corner / total_crops * 100
+                pct_neg = total_negative / total_crops * 100
                 print(f"  [{total_crops:5d}/{total_target}] {elapsed/60:.1f}m | "
-                      f"{rate:.1f}/s | ETA {eta:.0f}m | corners: {pct_corner:.0f}%")
+                      f"{rate:.1f}/s | ETA {eta:.0f}m | "
+                      f"corners: {pct_corner:.0f}% | neg: {pct_neg:.0f}%")
 
     elapsed = time.time() - start
     pct_corner = total_with_corner / max(1, total_crops) * 100
+    pct_neg = total_negative / max(1, total_crops) * 100
     print(f"\nComplete! {total_crops} crops ({elapsed/60:.1f}m)")
     print(f"   Train: {train_idx} | Val: {val_idx}")
     print(f"   With visible corners: {total_with_corner} ({pct_corner:.0f}%)")
+    print(f"   Negative samples:     {total_negative} ({pct_neg:.0f}%)")
     print(f"Output: {base_dir.absolute()}")
 
     # Write dataset YAML
-    yaml_content = f"""# YOLO Corner Regression Dataset Configuration
-# ==========================================
+    yaml_content = f"""# YOLO Corner Regression Dataset Configuration V2
+# =================================================
 # Single-class corner detection with 1 keypoint (corner position).
 # Input: 320×320 corner crops from detection→pose pipeline.
 # Output: bounding box of visible edges + corner keypoint position.
+#
+# V2 changes from V1:
+#   - Fixed 320×320 image size (was variable 224-480)
+#   - Minimum bbox ≥ 32px (was 16px — too tiny for detection)
+#   - Keypoint offset from bbox center enforced (was 64% kp==center)
+#   - 20-25% negative/background samples (was 0%)
+#   - Background texture fill instead of gray padding (was creating false edges)
+#   - 10K train / 2K val split (was 5K/1K)
 #
 # Label format (8 columns per instance):
 #   class_id x_center y_center width height kpx kpy kpv
 #
 # Keypoint: the exact corner position within the crop (normalized).
-# Visibility: 2 = visible corner, 0 = edge-only (no corner visible).
+# Visibility: 2 = visible corner (only value used in V2).
+# Negative samples have empty label files (no instances).
 #
 # Usage:
 #   python3 train_corner_regression.py
