@@ -102,25 +102,25 @@ Rescue is always on (no flag needed) because it has **zero cost** when all 4
 corners are already visible. When a photo has < 3 visible corners, rescue adds
 only ~280ms to recover the missing corners from edge geometry.
 
-### Corner Refinement Details
+### Corner Refinement
 
-When the pose model reports a low-visibility corner (e.g., occluded by shadow
-or glare), corner refinement crops around that approximate position and runs
-the pose model again on just that small region. This recovers corners that the
-full-image pose pass missed.
+Three corner refinement modes are available:
 
-**Two modes:**
-- **Pose model** (default): Uses named keypoints directly. Fast, single pass
-  per corner. No classification needed — the matching keypoint name (UL, UR,
-  etc.) IS the corner position.
-- **Detection model**: Uses bounding box corners with geometric classification.
-  Slower due to expand retries, less precise. Useful as a fallback when the
-  pose model can't find any keypoint.
+| Mode | Flag | Model | How it works |
+|------|------|-------|--------------|
+| Pose refine | `--pose-refine` | Pose model (pose_single_ep42) | Re-crop around detected photo, re-run pose for better localization |
+| Corner regression | `--corner-refine` | Corner regression (corner-regression-v2) | 320×320 crop around each corner, specialized model finds precise corner position |
+| CV refinement | `--cv-refine` | None (classical CV) | Sobel edge detection + line intersection, sub-pixel precision |
 
-**Key optimization**: Crop size is automatically computed from the photo's
-bounding box (1.2× the max dimension, minimum 640px). This ensures the photo
-doesn't fill the entire crop, allowing the detection model to identify edge
-contacts for classification.
+**Corner regression** (V2) is the recommended refinement mode. It uses a dedicated lightweight YOLO model (yolo26n-pose, 10MB ONNX) trained on 320×320 corner crops with:
+- 1 class (`corner`) + 1 keypoint (precise corner position)
+- 20-25% negative/background samples for robust rejection of non-corner regions
+- Box mAP50=0.995, Pose mAP50-95=0.994
+- Cross-photo validation: binary search on crop size avoids detecting adjacent photos in the corner crop
+
+**Pose model** uses named keypoints directly — the matching keypoint name (UL, UR, etc.) IS the corner position. No classification needed.
+
+**Detection model** uses bounding box corners with geometric classification. Slower due to expand retries, less precise. Useful as a fallback when the pose model can't find any keypoint.
 
 ## Fiducial-Pose Segment Model (In Development)
 

@@ -27,7 +27,18 @@
 
 > ⚠️ This model is the foundation of the entire pipeline — it must not be removed.
 
-### 3. Fiducial-Pose Segment Model (IN DEVELOPMENT)
+### 3. Corner Regression Model (`corner-regression-v2`)
+
+- **Architecture**: YOLO pose model (yolo26n-pose, 1 class + 1 keypoint)
+- **Purpose**: Detects precise corner positions in 320×320 crops centered on approximate corners. Used by `--corner-refine` flag to recover invisible corners and improve precision.
+- **Training data**: 10K train + 2K val synthetic corner crops (20-25% negative/background samples)
+- **Training**: `training/train_corner_regression.py`
+- **Data**: `data_corner_regression/` (gitignored, regenerateable)
+- **Generator**: `data_generator/generate_corner_regression.py`
+- **Dataset config**: `training/dataset_corner_regression.yaml`
+- **Best results** (epoch 24): Box mAP50=0.994, Box mAP50-95=0.773, Pose mAP50=0.994, Pose mAP50-95=0.994
+
+### 4. Fiducial-Pose Segment Model (IN DEVELOPMENT)
 
 - **Architecture**: YOLO pose model for detecting individual visible edge segments
 - **Purpose**: Each segment has keypoints at its endpoints (the visible corners of that segment). Goal is to better handle invisible/occluded corners by assembling segments geometrically.
@@ -45,8 +56,8 @@ Implemented in `onnx_inference/photocrop.py`.
 2. Pose        → find 4 corners per photo (keypoints)
 3. Dedup       → remove duplicate detections
 4. Rescue      → Sobel edge detection recovers invisible corners geometrically (always on)
-5. Corner Ref. → re-run pose model on corner crops (optional)
-6. CV Ref.     → sub-pixel edge intersection (optional)
+5. Corner Ref. → corner regression model on 320×320 crops (optional, --corner-refine)
+6. CV Ref.     → sub-pixel edge intersection (optional, --cv-refine)
 7. Crop/Warp   → extract perspective-corrected photo
 ```
 
@@ -73,15 +84,17 @@ Source photos (data_generator/images/)
          │
          ▼
     Data Generators
-    ├── generate_detection.py      → data_detection/
-    ├── generate_pose.py           → data_pose/
-    └── generate_fiducial_pose.py → data_fiducial_pose/
+    ├── generate_detection.py          → data_detection/
+    ├── generate_pose.py               → data_pose/
+    ├── generate_corner_regression.py  → data_corner_regression/
+    └── generate_fiducial_pose.py      → data_fiducial_pose/
          │
          ▼
     Training Scripts
-    ├── train_detection.py       → models/detection_ep47.{pt,onnx}
-    ├── train_pose.py            → models/pose_single_ep42.{pt,onnx}
-    └── train_fiducial_pose.py   → (in progress)
+    ├── train_detection.py         → models/detection_ep47.{pt,onnx}
+    ├── train_pose.py              → models/pose_single_ep42.{pt,onnx}
+    ├── train_corner_regression.py → models/corner-regression-v2.onnx
+    └── train_fiducial_pose.py     → (in progress)
          │
          ▼
     ONNX Export (export/export_onnx.py)

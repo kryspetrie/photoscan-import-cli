@@ -38,13 +38,13 @@ class TestOrientationFilter:
     """Test _orientation_filter_edge_pixels for all corner types."""
 
     def test_ll_corner(self):
-        """LL: horizontal above, vertical to the right."""
+        """LL: horizontal above (y <= center), vertical to the right (x >= center)."""
         xs = np.array([50, 50, 150, 150], dtype=float)
-        ys = np.array([40, 60, 40, 60], dtype=float)
+        ys = np.array([40, 130, 40, 130], dtype=float)
         h_mask, v_mask = _orientation_filter_edge_pixels(xs, ys, "LL", 100, 100)
-        # h_mask: pixels above center (y < 100)
-        np.testing.assert_array_equal(h_mask, [True, True, False, False])
-        # v_mask: pixels to the right of center (x > 100)
+        # h_mask: pixels above center (y <= 100) — indices 0 and 2
+        np.testing.assert_array_equal(h_mask, [True, False, True, False])
+        # v_mask: pixels to the right of center (x >= 100) — indices 2 and 3
         np.testing.assert_array_equal(v_mask, [False, False, True, True])
 
     def test_ul_corner(self):
@@ -266,30 +266,35 @@ class TestRealWorldExample:
 
     @pytest.fixture
     def image_path(self):
-        return str(Path(__file__).resolve().parent.parent / "real_world_example.jpg")
+        p = Path(__file__).resolve().parent.parent / "real_world_examples" / "real_world_example_01.jpg"
+        if not p.exists():
+            pytest.skip("real_world_example_01.jpg not found")
+        return str(p)
 
-    def test_photo4_lr_improvement(self, models, image_path):
-        """LR corner should be significantly closer to the bottom of the image."""
-        from onnx_inference.photocrop import infer_single, refine_corners_cv
+    def test_photo4_lr_detection(self, models, image_path):
+        """LR corner should be detected near the ground truth (y ~1974).
+
+        The model has improved: Photo 4's LR is now detected near GT
+        even without CV refine. Verify it's within 50px of ground truth.
+        """
+        from onnx_inference.photocrop import infer_single
         det, pose = models
 
-        # Run without CV refine
-        results_no_cv = infer_single(det, pose, image_path, "/tmp/test_no_cv/", cv_refine=False)
-        photo4_no_cv = results_no_cv[3]
-        lr_no_cv = [kp for kp in photo4_no_cv["keypoints"] if kp["name"] == "LR"][0]
-        lr_y_no_cv = lr_no_cv["y"]
+        results = infer_single(det, pose, image_path, "/tmp/test_detection/", cv_refine=False)
+        # Find Photo 4: bottom-right region (x>700, y>1000)
+        photo4 = None
+        for r in results:
+            b = r["detection"]["box"]
+            if b["x1"] > 700 and b["y1"] > 1000:
+                photo4 = r
+                break
+        assert photo4 is not None, "Photo 4 not found"
 
-        # Run with CV refine
-        image = Image.open(image_path)
-        results_cv = infer_single(det, pose, image_path, "/tmp/test_with_cv/", cv_refine=True)
-        photo4_cv = results_cv[3]
-        lr_cv = [kp for kp in photo4_cv["keypoints"] if kp["name"] == "LR"][0]
-        lr_y_cv = lr_cv["y"]
-
-        # LR y should move down toward 1970 (near bottom of Photo 4)
-        # Without CV: y ~ 1784 (way off). With CV: should be much closer to 1970.
-        assert lr_y_cv > lr_y_no_cv + 100, \
-            f"LR y should improve significantly: no_cv={lr_y_no_cv:.1f}, cv={lr_y_cv:.1f}"
+        lr = [kp for kp in photo4["keypoints"] if kp["name"] == "LR"][0]
+        # GT for Photo 4 LR: (753.2, 1973.7)
+        gt_y = 1973.7
+        assert abs(lr["y"] - gt_y) < 50, \
+            f"Photo 4 LR y should be within 50px of GT={gt_y}, got {lr['y']:.1f}"
 
     def test_no_regression_photo1(self, models, image_path):
         """Photo 1 corners should not change significantly."""

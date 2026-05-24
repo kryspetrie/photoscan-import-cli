@@ -55,21 +55,21 @@ class TestPresetStructure:
 
     def test_standard_preset_has_refinement(self):
         args = _PRESETS["standard"]["args"]
-        assert args.get("auto_refine") is True
+        assert args.get("pose_refine") is True
         assert args.get("adaptive_margin") is True
 
     def test_thorough_preset_has_full_refinement(self):
         args = _PRESETS["thorough"]["args"]
         assert args.get("corner_refine") is True
         assert args.get("cv_refine") is True
-        assert args.get("auto_refine") is True
+        assert args.get("pose_refine") is True
         assert args.get("adaptive_margin") is True
 
     def test_thorough_preset_corner_refine_iterations(self):
         assert _PRESETS["thorough"]["args"]["corner_refine_iterations"] == 2
 
     def test_thorough_preset_corner_refine_model(self):
-        assert _PRESETS["thorough"]["args"]["corner_refine_model"] == "pose"
+        assert _PRESETS["thorough"]["args"]["corner_refine_model"] == "regression"
 
     def test_all_presets_have_descriptions(self):
         for name, preset in _PRESETS.items():
@@ -84,7 +84,7 @@ class TestPresetStructure:
 
     def test_crop_defaults_contain_no_detection_keys(self):
         detection_keys = {
-            "auto_refine", "cv_refine", "corner_refine",
+            "pose_refine", "cv_refine", "corner_refine",
             "corner_refine_iterations", "corner_refine_model",
             "adaptive_margin",
         }
@@ -214,12 +214,14 @@ def _make_minimal_parser():
     p.add_argument("--crop", type=str, default=None)
     p.add_argument("--crop-margin", type=float, default=0)
     p.add_argument("--border-fill", type=str, default="grey")
-    p.add_argument("--auto-refine", action="store_true", default=False)
+    p.add_argument("--pose-refine", action="store_true", default=False)
     p.add_argument("--adaptive-margin", action="store_true", default=False)
     p.add_argument("--corner-refine", action="store_true", default=False)
     p.add_argument("--corner-refine-iterations", type=int, default=1)
-    p.add_argument("--corner-refine-model", type=str, default="pose")
+    p.add_argument("--corner-refine-conf", type=float, default=0.3)
+    p.add_argument("--corner-refine-model", type=str, default="regression")
     p.add_argument("--cv-refine", action="store_true", default=False)
+    p.add_argument("--pose-refine-expand", type=float, default=0.05)
     return p
 
 
@@ -237,7 +239,7 @@ class TestApplyPreset:
         p = _make_minimal_parser()
         args = p.parse_args(["--preset", "quick", "--crop", "simple-corners"])
         result = _apply_preset(p, args)
-        assert result.auto_refine is False
+        assert result.pose_refine is False
         assert result.corner_refine is False
         assert result.cv_refine is False
         assert result.adaptive_margin is False
@@ -246,19 +248,19 @@ class TestApplyPreset:
         p = _make_minimal_parser()
         args = p.parse_args(["--preset", "standard", "--crop", "simple-corners"])
         result = _apply_preset(p, args)
-        assert result.auto_refine is True
+        assert result.pose_refine is True
         assert result.adaptive_margin is True
 
     def test_thorough_preset_applies_all_refinement(self):
         p = _make_minimal_parser()
         args = p.parse_args(["--preset", "thorough", "--crop", "warp-stretch"])
         result = _apply_preset(p, args)
-        assert result.auto_refine is True
+        assert result.pose_refine is True
         assert result.corner_refine is True
         assert result.cv_refine is True
         assert result.adaptive_margin is True
         assert result.corner_refine_iterations == 2
-        assert result.corner_refine_model == "pose"
+        assert result.corner_refine_model == "regression"
 
     def test_preset_does_not_set_crop(self):
         """Presets never set --crop. It must be specified separately.
@@ -373,6 +375,6 @@ class TestCropWithoutPreset:
         p = _make_minimal_parser()
         args = p.parse_args(["--crop", "simple-corners"])
         result = _apply_preset(p, args)
-        assert result.auto_refine is False
+        assert result.pose_refine is False
         assert result.corner_refine is False
         assert result.cv_refine is False

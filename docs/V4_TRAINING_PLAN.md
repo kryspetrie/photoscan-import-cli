@@ -183,12 +183,12 @@ The generator will:
 ### Implementation Plan
 
 1. ✅ Write V4 training strategy doc
-2. ⬜ Create `generate_corner_regression.py` data generator
-3. ⬜ Create `train_corner_regression.py` training script
-4. ⬜ Generate training data
-5. ⬜ Train the corner regression model
-6. ⬜ Integrate into pipeline (corner_refine_model='regression')
-7. ⬜ Benchmark on val set
+2. ✅ Create `generate_corner_regression.py` data generator
+3. ✅ Create `train_corner_regression.py` training script
+4. ✅ Generate training data (10K train + 2K val)
+5. ✅ Train the corner regression model (V2, best epoch 24: box mAP50-95=0.773, pose mAP50-95=0.994)
+6. ✅ Integrate into pipeline (corner regression model via `--corner-refine`)
+7. ✅ Benchmark on val set (cross-photo validation fix, 93 tests pass)
 8. ⬜ Retrain V4 segment model with improved training strategy
 
 ---
