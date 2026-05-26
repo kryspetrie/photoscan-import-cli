@@ -4177,7 +4177,9 @@ def infer_batch(detection_session, pose_session, image_dir: str,
 _PRESETS = {
     "fast": {
         "description": "Fast detection + pose only, no refinement",
-        "args": {},
+        "args": {
+            "warp_recover": True,
+        },
     },
     "pose_refine": {
         "description": "Add pose-refine (re-center crop) + adaptive margin "
@@ -4185,6 +4187,7 @@ _PRESETS = {
         "args": {
             "pose_refine": True,
             "adaptive_margin": True,
+            "warp_recover": True,
         },
     },
     "corner_refine": {
@@ -4197,6 +4200,7 @@ _PRESETS = {
             "corner_refine_conf": 0.3,
             "corner_refine_model": "regression",
             "adaptive_margin": True,
+            "warp_recover": True,
         },
     },
 }
@@ -4634,13 +4638,18 @@ Coordinates (scripting-friendly):
              "(default: ../models/corner-regression-v2.onnx)",
     )
     parser.add_argument(
-        "--warp-recover", action="store_true", default=False,
+        "--warp-recover", action="store_true", default=None,
         help="After pose detection, compute a warp score for each detected "
-             "photo. If some photos have much higher warp than others "
-             "(suggesting misdetection), iteratively re-run the pose model "
-             "with progressively larger crops to recover better detections. "
-             "Uses median warp * outlier-ratio as the threshold. "
-             "(default: disabled)",
+             "photo. If any photo's warp exceeds the absolute threshold "
+             "(default 1.15) or is dramatically worse than its peers, "
+             "iteratively re-run the pose model with progressively larger "
+             "crops to recover better detections. Enabled by default in all "
+             "presets. Use --no-warp-recover to explicitly disable.",
+    )
+    parser.add_argument(
+        "--no-warp-recover", dest="warp_recover", action="store_false",
+        default=None,
+        help="Disable warp recovery, even if the preset enables it.",
     )
     parser.add_argument(
         "--warp-recover-max-iters", type=int, default=WARP_RECOVER_MAX_ITERS,
@@ -4671,6 +4680,11 @@ Coordinates (scripting-friendly):
     # Apply preset (lets individual CLI args override preset values)
     if args.preset:
         args = _apply_preset(parser, args)
+
+    # If --warp-recover was not set by the user or preset, default to False.
+    # (argparse default is None to allow preset override; None means "not set".)
+    if args.warp_recover is None:
+        args.warp_recover = False
 
     # Validate models
     detection_model_path = Path(args.detection_model).resolve()
