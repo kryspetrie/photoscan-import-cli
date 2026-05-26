@@ -1,14 +1,16 @@
-"""Tests for preset/crop separation in photocrop.py.
+"""Tests for preset/crop/border-fill separation in photocrop.py.
 
 Presets control detection/refinement only.
 --crop controls output crop method separately.
-Preset without --crop is an error. Questionable combinations produce warnings.
+--border-fill controls warp fill color (default: edge-extend).
+Both preset and crop have CLI defaults (corner_refine, warp-stretch).
 
 Tests cover:
-- _validate_preset_crop(): error/warning logic for each combination
-- _apply_preset(): preset sets detection args, crop defaults applied when --crop present
+- _validate_preset_crop(): warning logic for questionable combinations
+- _apply_preset(): preset sets detection args, user overrides take precedence
 - Preset dicts contain NO crop-related keys
-- CLI integration: preset + crop combinations via argparse
+- parse_border_fill(): color and edge-extend parsing
+- CLI integration: preset + crop + border_fill combinations via argparse
 """
 
 import sys
@@ -25,6 +27,8 @@ from onnx_inference.photocrop import (
     _PRESET_CROP_DEFAULTS,
     _validate_preset_crop,
     _apply_preset,
+    parse_border_fill,
+    DEFAULT_PRESET,
 )
 
 
@@ -39,7 +43,13 @@ class TestPresetStructure:
     CROP_RELATED_KEYS = {"crop", "crop_margin", "border_fill", "crop_transparent"}
 
     def test_preset_names(self):
-        assert set(_PRESETS.keys()) == {"quick", "standard", "thorough"}
+        assert set(_PRESETS.keys()) == {"fast", "pose_refine", "corner_refine"}
+
+    def test_default_preset_exists(self):
+        assert DEFAULT_PRESET in _PRESETS
+
+    def test_default_preset_is_corner_refine(self):
+        assert DEFAULT_PRESET == "corner_refine"
 
     def test_presets_have_no_crop_keys(self):
         for name, preset in _PRESETS.items():
@@ -50,26 +60,28 @@ class TestPresetStructure:
                     f"Presets should be detection-only."
                 )
 
-    def test_quick_preset_has_no_args(self):
-        assert _PRESETS["quick"]["args"] == {}
+    def test_fast_preset_has_no_args(self):
+        assert _PRESETS["fast"]["args"] == {}
 
-    def test_standard_preset_has_refinement(self):
-        args = _PRESETS["standard"]["args"]
+    def test_pose_refine_preset_has_pose_refine_and_adaptive(self):
+        args = _PRESETS["pose_refine"]["args"]
         assert args.get("pose_refine") is True
         assert args.get("adaptive_margin") is True
+        assert args.get("corner_refine") is False or "corner_refine" not in args
 
-    def test_thorough_preset_has_full_refinement(self):
-        args = _PRESETS["thorough"]["args"]
+    def test_corner_refine_preset_has_all_refinement(self):
+        args = _PRESETS["corner_refine"]["args"]
+        assert args.get("pose_refine") is True
         assert args.get("corner_refine") is True
-        assert args.get("cv_refine") is True
-        assert args.get("pose_refine") is True
         assert args.get("adaptive_margin") is True
+        assert args.get("corner_refine_iterations") == 2
+        assert args.get("corner_refine_model") == "regression"
 
-    def test_thorough_preset_corner_refine_iterations(self):
-        assert _PRESETS["thorough"]["args"]["corner_refine_iterations"] == 2
-
-    def test_thorough_preset_corner_refine_model(self):
-        assert _PRESETS["thorough"]["args"]["corner_refine_model"] == "regression"
+    def test_no_preset_has_cv_refine(self):
+        """No preset includes cv_refine -- Sobel rescue is always automatic."""
+        for name, preset in _PRESETS.items():
+            args = preset["args"]
+            assert args.get("cv_refine") is False or "cv_refine" not in args
 
     def test_all_presets_have_descriptions(self):
         for name, preset in _PRESETS.items():
@@ -104,36 +116,24 @@ class TestValidatePresetCrop:
 
     # --- Valid combinations (no errors, no warnings) ---
 
-    def test_quick_simple_corners_ok(self):
-        errors, warnings = _validate_preset_crop("quick", "simple-corners")
+    def test_fast_simple_corners_ok(self):
+        errors, warnings = _validate_preset_crop("fast", "simple-corners")
         assert errors == [] and warnings == []
 
-    def test_quick_simple_ok(self):
-        errors, warnings = _validate_preset_crop("quick", "simple")
+    def test_fast_simple_ok(self):
+        errors, warnings = _validate_preset_crop("fast", "simple")
         assert errors == [] and warnings == []
 
-    def test_standard_simple_corners_ok(self):
-        errors, warnings = _validate_preset_crop("standard", "simple-corners")
+    def test_pose_refine_warp_stretch_ok(self):
+        errors, warnings = _validate_preset_crop("pose_refine", "warp-stretch")
         assert errors == [] and warnings == []
 
-    def test_standard_warp_stretch_ok(self):
-        errors, warnings = _validate_preset_crop("standard", "warp-stretch")
+    def test_corner_refine_warp_stretch_ok(self):
+        errors, warnings = _validate_preset_crop("corner_refine", "warp-stretch")
         assert errors == [] and warnings == []
 
-    def test_standard_warp_ok(self):
-        errors, warnings = _validate_preset_crop("standard", "warp")
-        assert errors == [] and warnings == []
-
-    def test_thorough_simple_corners_ok(self):
-        errors, warnings = _validate_preset_crop("thorough", "simple-corners")
-        assert errors == [] and warnings == []
-
-    def test_thorough_warp_stretch_ok(self):
-        errors, warnings = _validate_preset_crop("thorough", "warp-stretch")
-        assert errors == [] and warnings == []
-
-    def test_thorough_warp_ok(self):
-        errors, warnings = _validate_preset_crop("thorough", "warp")
+    def test_corner_refine_warp_ok(self):
+        errors, warnings = _validate_preset_crop("corner_refine", "warp")
         assert errors == [] and warnings == []
 
     def test_no_preset_with_crop_ok(self):
@@ -146,59 +146,67 @@ class TestValidatePresetCrop:
 
     # --- Questionable combinations (warnings, no errors) ---
 
-    def test_quick_warp_warns(self):
-        errors, warnings = _validate_preset_crop("quick", "warp")
+    def test_fast_warp_warns(self):
+        errors, warnings = _validate_preset_crop("fast", "warp")
         assert errors == []
         assert len(warnings) == 1
-        assert "quick" in warnings[0].lower()
+        assert "fast" in warnings[0].lower()
         assert "warp" in warnings[0].lower()
 
-    def test_quick_warp_stretch_warns(self):
-        errors, warnings = _validate_preset_crop("quick", "warp-stretch")
+    def test_fast_warp_stretch_warns(self):
+        errors, warnings = _validate_preset_crop("fast", "warp-stretch")
         assert errors == []
         assert len(warnings) == 1
-        assert "quick" in warnings[0].lower()
+        assert "fast" in warnings[0].lower()
 
-    def test_thorough_simple_warns(self):
-        errors, warnings = _validate_preset_crop("thorough", "simple")
-        assert errors == []
-        assert len(warnings) == 1
-        assert "thorough" in warnings[0].lower()
-        assert "simple" in warnings[0].lower()
+    # --- None-type safety: crop_mode=None should not crash ---
 
-    # --- Invalid combinations (errors) ---
+    def test_preset_with_none_crop_ok(self):
+        errors, warnings = _validate_preset_crop("fast", None)
+        assert errors == [] and warnings == []
 
-    def test_preset_without_crop_errors(self):
-        errors, warnings = _validate_preset_crop("quick", None)
-        assert len(errors) == 1
-        assert "--crop" in errors[0]
-        assert warnings == []
+    def test_corner_refine_with_none_crop_ok(self):
+        errors, warnings = _validate_preset_crop("corner_refine", None)
+        assert errors == [] and warnings == []
 
-    def test_standard_without_crop_errors(self):
-        errors, warnings = _validate_preset_crop("standard", None)
-        assert len(errors) == 1
-        assert "--crop" in errors[0]
-        assert warnings == []
 
-    def test_thorough_without_crop_errors(self):
-        errors, warnings = _validate_preset_crop("thorough", None)
-        assert len(errors) == 1
-        assert "--crop" in errors[0]
-        assert warnings == []
+# ---------------------------------------------------------------------------
+# parse_border_fill tests
+# ---------------------------------------------------------------------------
 
-    # --- Boundary: crop IS specified, so no "missing crop" error ---
 
-    def test_no_double_issue_for_thorough_simple(self):
-        """thorough + simple: only 1 warning, NOT also a 'missing --crop' error."""
-        errors, warnings = _validate_preset_crop("thorough", "simple")
-        assert errors == []
-        assert len(warnings) == 1
+class TestParseBorderFill:
 
-    def test_no_double_issue_for_quick_warp(self):
-        """quick + warp: only 1 warning, NOT also a 'missing --crop' error."""
-        errors, warnings = _validate_preset_crop("quick", "warp")
-        assert errors == []
-        assert len(warnings) == 1
+    def test_edge_extend(self):
+        assert parse_border_fill("edge-extend") == "edge-extend"
+
+    def test_edge_extend_underscore(self):
+        assert parse_border_fill("edge_extend") == "edge-extend"
+
+    def test_edge_extend_case_insensitive(self):
+        assert parse_border_fill("Edge-Extend") == "edge-extend"
+
+    def test_white(self):
+        assert parse_border_fill("white") == (255, 255, 255)
+
+    def test_black(self):
+        assert parse_border_fill("black") == (0, 0, 0)
+
+    def test_grey(self):
+        assert parse_border_fill("grey") == (114, 114, 114)
+
+    def test_rgb_tuple(self):
+        assert parse_border_fill("100,150,200") == (100, 150, 200)
+
+    def test_hex_six(self):
+        assert parse_border_fill("#FF8000") == (255, 128, 0)
+
+    def test_hex_three(self):
+        assert parse_border_fill("#F80") == (255, 136, 0)
+
+    def test_invalid_raises(self):
+        with pytest.raises(ValueError):
+            parse_border_fill("magenta")
 
 
 # ---------------------------------------------------------------------------
@@ -207,17 +215,18 @@ class TestValidatePresetCrop:
 
 
 def _make_minimal_parser():
-    """Build a minimal argparse parser that has just the args needed
-    to test _apply_preset. This avoids loading ONNX models."""
+    """Build a minimal argparse parser that matches the real CLI defaults:
+    --preset corner_refine, --crop warp-stretch, --crop-margin 0.02,
+    --border-fill edge-extend."""
     p = argparse.ArgumentParser()
-    p.add_argument("--preset", type=str, default=None)
-    p.add_argument("--crop", type=str, default=None)
-    p.add_argument("--crop-margin", type=float, default=0)
-    p.add_argument("--border-fill", type=str, default="grey")
+    p.add_argument("--preset", type=str, default=DEFAULT_PRESET)
+    p.add_argument("--crop", type=str, default="warp-stretch")
+    p.add_argument("--crop-margin", type=float, default=0.02)
+    p.add_argument("--border-fill", type=str, default="edge-extend")
     p.add_argument("--pose-refine", action="store_true", default=False)
     p.add_argument("--adaptive-margin", action="store_true", default=False)
     p.add_argument("--corner-refine", action="store_true", default=False)
-    p.add_argument("--corner-refine-iterations", type=int, default=1)
+    p.add_argument("--corner-refine-iterations", type=int, default=2)
     p.add_argument("--corner-refine-conf", type=float, default=0.3)
     p.add_argument("--corner-refine-model", type=str, default="regression")
     p.add_argument("--cv-refine", action="store_true", default=False)
@@ -227,86 +236,65 @@ def _make_minimal_parser():
 
 class TestApplyPreset:
 
-    def test_no_preset_returns_args_unchanged(self):
+    def test_default_preset_applies_corner_refine(self):
+        """Default preset (corner_refine) applies pose_refine, corner_refine, adaptive_margin."""
         p = _make_minimal_parser()
-        args = p.parse_args([])
-        args.preset = None
-        original_crop = args.crop
+        args = p.parse_args([])  # defaults: corner_refine preset, warp-stretch crop
         result = _apply_preset(p, args)
-        assert result.crop == original_crop
+        assert result.pose_refine is True
+        assert result.adaptive_margin is True
+        assert result.corner_refine is True
 
-    def test_quick_preset_applies_no_detection_args(self):
+    def test_fast_preset_applies_no_detection_args(self):
         p = _make_minimal_parser()
-        args = p.parse_args(["--preset", "quick", "--crop", "simple-corners"])
+        args = p.parse_args(["--preset", "fast"])
         result = _apply_preset(p, args)
         assert result.pose_refine is False
         assert result.corner_refine is False
         assert result.cv_refine is False
         assert result.adaptive_margin is False
 
-    def test_standard_preset_applies_auto_refine(self):
+    def test_pose_refine_preset(self):
+        """pose_refine = pose_refine + adaptive_margin, no corner_refine."""
         p = _make_minimal_parser()
-        args = p.parse_args(["--preset", "standard", "--crop", "simple-corners"])
+        args = p.parse_args(["--preset", "pose_refine"])
         result = _apply_preset(p, args)
         assert result.pose_refine is True
+        assert result.corner_refine is False
         assert result.adaptive_margin is True
 
-    def test_thorough_preset_applies_all_refinement(self):
+    def test_corner_refine_preset(self):
+        """corner_refine = pose_refine + corner_refine + adaptive_margin."""
         p = _make_minimal_parser()
-        args = p.parse_args(["--preset", "thorough", "--crop", "warp-stretch"])
+        args = p.parse_args(["--preset", "corner_refine"])
         result = _apply_preset(p, args)
         assert result.pose_refine is True
         assert result.corner_refine is True
-        assert result.cv_refine is True
         assert result.adaptive_margin is True
         assert result.corner_refine_iterations == 2
         assert result.corner_refine_model == "regression"
 
-    def test_preset_does_not_set_crop(self):
-        """Presets never set --crop. It must be specified separately.
-        Even with a preset, crop=None means the user must provide --crop."""
+    def test_presets_do_not_set_crop(self):
+        """Presets never override --crop. Crop defaults come from parser."""
         p = _make_minimal_parser()
-        # Without --crop, all presets should error
         for preset_name in _PRESETS:
             args = p.parse_args(["--preset", preset_name])
-            with pytest.raises(SystemExit):
-                _apply_preset(p, args)
+            result = _apply_preset(p, args)
+            assert result.crop == "warp-stretch"
 
-    def test_crop_defaults_applied_when_crop_specified(self):
-        """When --crop is used alongside a preset, crop defaults (margin,
-        border_fill) should be applied."""
+    def test_default_crop_margin_and_border(self):
+        """Parser defaults: crop_margin=0.02, border_fill=edge-extend."""
         p = _make_minimal_parser()
-        args = p.parse_args(["--preset", "thorough", "--crop", "warp-stretch"])
-        result = _apply_preset(p, args)
-        # thorough crop defaults: crop_margin=0.02, border_fill=white
-        assert result.crop_margin == 0.02
-        assert result.border_fill == "white"
-
-    def test_crop_defaults_for_quick(self):
-        p = _make_minimal_parser()
-        args = p.parse_args(["--preset", "quick", "--crop", "simple-corners"])
+        args = p.parse_args([])  # all defaults
         result = _apply_preset(p, args)
         assert result.crop_margin == 0.02
-
-    def test_crop_defaults_for_standard(self):
-        p = _make_minimal_parser()
-        args = p.parse_args(["--preset", "standard", "--crop", "simple-corners"])
-        result = _apply_preset(p, args)
-        assert result.crop_margin == 0.02
-
-    def test_preset_without_crop_errors_before_defaults_applied(self):
-        """Without --crop, _apply_preset errors before crop defaults are applied."""
-        p = _make_minimal_parser()
-        args = p.parse_args(["--preset", "thorough"])
-        with pytest.raises(SystemExit):
-            _apply_preset(p, args)
+        assert result.border_fill == "edge-extend"
 
     def test_user_override_of_crop_margin(self):
-        """User explicitly set --crop-margin; preset default should NOT override."""
+        """User explicitly set --crop-margin; preset should NOT override."""
         p = _make_minimal_parser()
         args = p.parse_args([
-            "--preset", "thorough",
-            "--crop", "warp-stretch",
+            "--preset", "corner_refine",
             "--crop-margin", "0.05",
         ])
         result = _apply_preset(p, args)
@@ -315,12 +303,19 @@ class TestApplyPreset:
     def test_user_override_of_border_fill(self):
         p = _make_minimal_parser()
         args = p.parse_args([
-            "--preset", "thorough",
-            "--crop", "warp-stretch",
+            "--preset", "corner_refine",
             "--border-fill", "black",
         ])
         result = _apply_preset(p, args)
         assert result.border_fill == "black"
+
+    def test_user_override_of_preset(self):
+        """User explicitly set --preset fast; should override default."""
+        p = _make_minimal_parser()
+        args = p.parse_args(["--preset", "fast"])
+        result = _apply_preset(p, args)
+        assert result.pose_refine is False
+        assert result.corner_refine is False
 
     def test_unknown_preset_errors(self):
         p = _make_minimal_parser()
@@ -328,53 +323,53 @@ class TestApplyPreset:
         with pytest.raises(SystemExit):
             _apply_preset(p, args)
 
-    def test_preset_with_crop_warp_issues_warning(self, capsys):
-        """quick + warp should produce a warning on stderr."""
+    def test_fast_with_warp_warns(self, capsys):
+        """fast + warp-stretch should produce a warning."""
         p = _make_minimal_parser()
-        args = p.parse_args(["--preset", "quick", "--crop", "warp"])
-        # _apply_preset calls _log which writes to stderr
+        args = p.parse_args(["--preset", "fast"])
         _apply_preset(p, args)
         captured = capsys.readouterr()
         assert "Warning" in captured.err
-        assert "quick" in captured.err.lower()
-
-    def test_preset_without_crop_errors(self, capsys):
-        """Preset without --crop should produce an error (not a warning)."""
-        p = _make_minimal_parser()
-        args = p.parse_args(["--preset", "standard"])
-        with pytest.raises(SystemExit):
-            _apply_preset(p, args)
-        captured = capsys.readouterr()
-        assert "--crop" in captured.err
+        assert "fast" in captured.err.lower()
 
     def test_valid_combination_no_warning(self, capsys):
         p = _make_minimal_parser()
-        args = p.parse_args(["--preset", "standard", "--crop", "simple-corners"])
+        args = p.parse_args(["--preset", "corner_refine"])
         _apply_preset(p, args)
         captured = capsys.readouterr()
         assert "Warning" not in captured.err
 
 
 # ---------------------------------------------------------------------------
-# CLI-level integration: --crop works without any preset
+# CLI-level integration: --crop and --border-fill work with defaults
 # ---------------------------------------------------------------------------
 
 
-class TestCropWithoutPreset:
+class TestCropWithoutPresetOverride:
 
-    def test_crop_alone_no_warning(self, capsys):
-        """Using --crop without --preset should work silently."""
+    def test_default_crop_is_warp_stretch(self):
+        """Default crop mode is warp-stretch."""
+        p = _make_minimal_parser()
+        args = p.parse_args([])
+        result = _apply_preset(p, args)
+        assert result.crop == "warp-stretch"
+
+    def test_explicit_crop_override(self):
         p = _make_minimal_parser()
         args = p.parse_args(["--crop", "simple-corners"])
         result = _apply_preset(p, args)
         assert result.crop == "simple-corners"
-        captured = capsys.readouterr()
-        assert "Warning" not in captured.err
+        assert result.pose_refine is True  # still gets corner_refine preset
 
-    def test_crop_alone_no_detection_args(self):
+    def test_fast_preset_no_refinement(self):
         p = _make_minimal_parser()
-        args = p.parse_args(["--crop", "simple-corners"])
+        args = p.parse_args(["--preset", "fast"])
         result = _apply_preset(p, args)
         assert result.pose_refine is False
         assert result.corner_refine is False
         assert result.cv_refine is False
+
+    def test_edge_extend_is_default_border_fill(self):
+        p = _make_minimal_parser()
+        args = p.parse_args([])
+        assert args.border_fill == "edge-extend"

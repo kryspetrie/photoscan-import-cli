@@ -82,9 +82,9 @@ Cropping
     --crop-transparent     Save crops as transparent PNG. For simple crops,
                            area outside keypoint quad is transparent. For
                            warp, out-of-bounds areas are transparent.
-    --border-fill COLOR    Fill color for warp background (default: grey).
+    --border-fill COLOR    Fill color for warp background (default: edge-extend).
                            Accepts: R,G,B  #RRGGBB  #RGB  white/black/grey/
-                           red/green/blue. Ignored with --crop-transparent.
+                           red/green/blue/edge-extend. Ignored with --crop-transparent.
 
     Output naming: {original_stem}_{crop_tag}_{photo_id}.{ext}
                   crop_tag: 'warp', 'crop', or 'box' (warp->fallback shows 'crop')
@@ -92,24 +92,29 @@ Cropping
 
 Recommended Commands
 -------------------
-    # Best simple crop -- keypoint-based bbox + 2% margin so edges aren't clipped
-    photocrop --image scan.jpg --crop simple-corners --crop-margin 0.02
+    # Default usage (corner_refine preset, warp-stretch crop, 2% margin, edge-extend fill)
+    photocrop --image scan.jpg
 
-    # Best warp crop -- outward warp + margin + white fill for clean edges
-    photocrop --image scan.jpg --crop warp-stretch \
-                     --crop-margin 0.02 --border-fill white
+    # Fast scan -- detect + pose only, no refinement (~5s)
+    photocrop --image scan.jpg --preset fast
 
-    # Best transparent crop -- corner-based with margin, for compositing
-    photocrop --image scan.jpg --crop simple-corners \
-                     --crop-margin 0.02 --crop-transparent
+    # Pose-refine -- re-center crop for better accuracy (~7s)
+    photocrop --image scan.jpg --preset pose_refine
+
+    # Simple corners crop (no perspective warp)
+    photocrop --image scan.jpg --crop simple-corners
+
+    # Transparent PNG for compositing
+    photocrop --image scan.jpg --crop-transparent
 
     # Crop a whole folder of images
-    photocrop --image ./scans/ --output ./crops/ \
-                     --crop simple-corners --crop-margin 0.02
+    photocrop --image ./scans/ --output ./crops/
 
-    # Best accuracy -- 3-stage refine for improved corner detection
-    photocrop --image scan.jpg --pose-refine \
-                     --crop warp-stretch --crop-margin 0.02 --border-fill white
+    # Crop a folder in parallel (4 workers, each loads own model copy)
+    photocrop --image ./scans/ --workers 4
+
+    # Best accuracy with sweep for tight layouts
+    photocrop --image scan.jpg --preset corner_refine --pose-sweep-xy
 
 Usage
 -----
@@ -183,6 +188,391 @@ CORNER_REGRESSION_SIZE = 320  # Corner regression model input size
 # Corner refinement: crop size and edge-contact classification
 CORNER_CROP_SIZE_MIN = 320   # Minimum crop size for corner regression model
 CORNER_REGRESSION_SIZE = 320  # Corner regression model input size
+
+# Warp recovery defaults
+WARP_RECOVER_MAX_ITERS = 3       # Max re-pose attempts per outlier photo
+WARP_RECOVER_EXPAND_START = 0.10 # Starting crop expand ratio for recovery
+WARP_RECOVER_EXPAND_STEP = 0.08  # How much to increase expand each iteration
+WARP_RECOVER_ABSOLUTE_THRESH = 1.15  # Absolute warp threshold — any photo
+                                      # above this is a candidate for recovery
+                                      # regardless of peer comparison
+WARP_RECOVER_OUTLIER_RATIO = 2.0  # A photo is an outlier relative to peers
+                                  # if its warp exceeds median * this ratio
+
+
+# ---------------------------------------------------------------------------
+# Warp metric & recovery
+# ---------------------------------------------------------------------------
+
+def warp_score(result: dict) -> float:
+    """
+    Compute a metric for how much a detected photo quadrilateral deviates
+    from a perfect rectangle.
+
+    A score of 1.0 means the quad is a perfect rectangle.  Higher values
+    indicate more perspective distortion (warp).  The metric combines:
+
+      1. Aspect-ratio consistency -- ratio of max/min for each pair of
+         opposite edges.  A rectangle has equal opposite edges, so the
+         ratio is 1.0.  A trapezoid might have top=50, bottom=150, giving
+         a ratio of 3.0.
+
+      2. Angle deviation -- the maximum absolute deviation of any interior
+         angle from 90°.  A rectangle has all 90° angles.  A parallelogram
+         might have angles of 75° and 105°, giving a deviation of 15°.
+
+    The final score is ``max(aspect_ratio_disparity, angle_factor)`` where
+    ``angle_factor = 1 + max_angle_deviation / 45`` so that 15° of skew
+    gives an angle_factor of 1.33.
+
+    Args:
+        result: Pipeline result dict with 'keypoints' list (each keypoint
+            has 'name', 'x', 'y', 'visibility').
+
+    Returns:
+        Float >= 1.0.  1.0 = perfect rectangle.  Typical good detections
+        are 1.0-1.05.  Misdetections are often > 1.5.
+    """
+    kps = result.get("keypoints", [])
+    kp_by_name = {kp["name"]: kp for kp in kps}
+
+    # Need all four corners for a meaningful metric
+    required = ["LL", "UL", "UR", "LR"]
+    for name in required:
+        if name not in kp_by_name:
+            return float("inf")  # Can't compute -- treat as worst case
+
+    # Build quad in clockwise order: UL -> UR -> LR -> LL
+    pts = {
+        "UL": np.array([kp_by_name["UL"]["x"], kp_by_name["UL"]["y"]]),
+        "UR": np.array([kp_by_name["UR"]["x"], kp_by_name["UR"]["y"]]),
+        "LR": np.array([kp_by_name["LR"]["x"], kp_by_name["LR"]["y"]]),
+        "LL": np.array([kp_by_name["LL"]["x"], kp_by_name["LL"]["y"]]),
+    }
+
+    # --- Aspect ratio consistency ---
+    # Opposite edges should be equal length for a rectangle
+    w_top = np.linalg.norm(pts["UR"] - pts["UL"])
+    w_bot = np.linalg.norm(pts["LR"] - pts["LL"])
+    h_left = np.linalg.norm(pts["LL"] - pts["UL"])
+    h_right = np.linalg.norm(pts["LR"] - pts["UR"])
+
+    # Handle degenerate edges
+    if min(w_top, w_bot) < 1e-6 or min(h_left, h_right) < 1e-6:
+        return float("inf")
+
+    w_ratio = max(w_top, w_bot) / min(w_top, w_bot)
+    h_ratio = max(h_left, h_right) / min(h_left, h_right)
+    aspect_disparity = max(w_ratio, h_ratio)
+
+    # --- Angle deviation from 90° ---
+    # Compute interior angle at each corner using the dot product formula
+    corner_order = ["UL", "UR", "LR", "LL"]  # clockwise
+    max_angle_dev = 0.0
+
+    for i in range(4):
+        # Angle at corner_order[i], with neighbors corner_order[i-1] and
+        # corner_order[i+1] (modular indexing for the quad)
+        p = pts[corner_order[i]]
+        pa = pts[corner_order[(i - 1) % 4]]  # previous corner
+        pb = pts[corner_order[(i + 1) % 4]]  # next corner
+
+        v1 = pa - p
+        v2 = pb - p
+        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-10)
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+        angle_deg = np.degrees(np.arccos(cos_angle))
+        dev = abs(angle_deg - 90.0)
+        max_angle_dev = max(max_angle_dev, dev)
+
+    angle_factor = 1.0 + max_angle_dev / 45.0
+
+    return max(aspect_disparity, angle_factor)
+
+
+def warp_detail(result: dict) -> dict:
+    """
+    Compute detailed warp diagnostics for a detected photo.
+
+    Returns a dict with per-edge and per-angle breakdown, useful for
+    understanding WHY a photo has high warp and for absolute-threshold
+    checks on individual edge pairs.
+
+    Returns:
+        dict with keys:
+          - 'score': overall warp score (same as warp_score)
+          - 'w_ratio': max(top_width, bottom_width) / min(...)
+          - 'h_ratio': max(left_height, right_height) / min(...)
+          - 'max_angle_dev': largest deviation from 90° (degrees)
+          - 'w_top', 'w_bot', 'h_left', 'h_right': edge lengths
+          - 'bad_edges': list of edge-pair names where ratio exceeds threshold
+    """
+    kps = result.get("keypoints", [])
+    kp_by_name = {kp["name"]: kp for kp in kps}
+
+    required = ["LL", "UL", "UR", "LR"]
+    for name in required:
+        if name not in kp_by_name:
+            return {"score": float("inf"), "bad_edges": ["LL", "UL", "UR", "LR"]}
+
+    pts = {
+        "UL": np.array([kp_by_name["UL"]["x"], kp_by_name["UL"]["y"]]),
+        "UR": np.array([kp_by_name["UR"]["x"], kp_by_name["UR"]["y"]]),
+        "LR": np.array([kp_by_name["LR"]["x"], kp_by_name["LR"]["y"]]),
+        "LL": np.array([kp_by_name["LL"]["x"], kp_by_name["LL"]["y"]]),
+    }
+
+    w_top = np.linalg.norm(pts["UR"] - pts["UL"])
+    w_bot = np.linalg.norm(pts["LR"] - pts["LL"])
+    h_left = np.linalg.norm(pts["LL"] - pts["UL"])
+    h_right = np.linalg.norm(pts["LR"] - pts["UR"])
+
+    w_ratio = max(w_top, w_bot) / (min(w_top, w_bot) + 1e-10)
+    h_ratio = max(h_left, h_right) / (min(h_left, h_right) + 1e-10)
+
+    corner_order = ["UL", "UR", "LR", "LL"]
+    max_angle_dev = 0.0
+    angles = {}
+    for i in range(4):
+        p = pts[corner_order[i]]
+        pa = pts[corner_order[(i - 1) % 4]]
+        pb = pts[corner_order[(i + 1) % 4]]
+        v1 = pa - p
+        v2 = pb - p
+        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-10)
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+        angle_deg = np.degrees(np.arccos(cos_angle))
+        angles[corner_order[i]] = angle_deg
+        max_angle_dev = max(max_angle_dev, abs(angle_deg - 90.0))
+
+    # Identify which edge pairs are significantly mismatched
+    bad_edges = []
+    if w_ratio > WARP_RECOVER_ABSOLUTE_THRESH:
+        bad_edges.append("top/bottom")
+    if h_ratio > WARP_RECOVER_ABSOLUTE_THRESH:
+        bad_edges.append("left/right")
+
+    return {
+        "score": max(w_ratio, h_ratio, 1.0 + max_angle_dev / 45.0),
+        "w_ratio": w_ratio,
+        "h_ratio": h_ratio,
+        "max_angle_dev": max_angle_dev,
+        "angles": angles,
+        "w_top": w_top,
+        "w_bot": w_bot,
+        "h_left": h_left,
+        "h_right": h_right,
+        "bad_edges": bad_edges,
+    }
+
+
+def warp_recovery(pose_session, image: Image.Image, results: list,
+                 detection_session=None,
+                 pose_conf: float = 0.5,
+                 img_size: int = DEFAULT_IMG_SIZE,
+                 max_iters: int = WARP_RECOVER_MAX_ITERS,
+                 expand_start: float = WARP_RECOVER_EXPAND_START,
+                 expand_step: float = WARP_RECOVER_EXPAND_STEP,
+                 absolute_thresh: float = WARP_RECOVER_ABSOLUTE_THRESH,
+                 outlier_ratio: float = WARP_RECOVER_OUTLIER_RATIO,
+                 dedup_min_dist: float = 0,
+                 crop_limits_list: list = None,
+                 det_detections: list = None) -> list:
+    """
+    Recover photos with abnormally high warp by re-running the pose model
+    with progressively larger crops.
+
+    A photo is flagged for recovery when EITHER:
+      - **Absolute threshold**: its warp score exceeds absolute_thresh
+        (default 1.15). A real photo on a flatbed scan is nearly rectangular;
+        any photo where one opposing edge pair is more than 15% longer than
+        the other is likely a misdetection, regardless of what other photos
+        on the page look like.
+      - **Peer outlier**: its warp score exceeds the median of all detected
+        photos × outlier_ratio (default 2.0). This catches cases where all
+        photos are somewhat warped but one is dramatically worse.
+
+    For each flagged photo, iteratively expand the crop and re-run the
+    pose model with progressively larger crops. More context helps the
+    model avoid locking onto edges from adjacent photos. Keep the best
+    result (lowest warp score) across all iterations.
+
+    Args:
+        pose_session: ONNX pose model session
+        image: Source PIL image
+        results: List of pipeline result dicts (mutated in-place)
+        detection_session: Detection model session (for crop limits).
+            If None, uses the detection box from each result.
+        pose_conf: Pose confidence threshold
+        img_size: Model input size
+        max_iters: Maximum retry iterations per outlier
+        expand_start: Initial crop expand ratio for recovery
+        expand_step: Crop expand ratio increase per iteration
+        absolute_thresh: Absolute warp threshold -- any photo above this
+            is flagged for recovery regardless of peer comparison.
+        outlier_ratio: Warp ratio threshold to flag an outlier relative
+            to the median of all detected photos on the page.
+        dedup_min_dist: Minimum center distance for dedup (0 = skip)
+        crop_limits_list: Pre-computed crop limits from detection boxes
+        det_detections: Original detection results (for crop limits)
+
+    Returns:
+        The results list with outlier entries potentially replaced by
+        better detections from expanded-crop re-runs.
+    """
+    if len(results) == 0:
+        return results
+
+    # Step 1: Compute warp scores and details
+    scores = []
+    details = []
+    for res in results:
+        kps = res.get("keypoints", [])
+        vis_count = sum(1 for kp in kps if kp["visibility"] >= _VIS_THRESH_DEDUP)
+        if vis_count < 4:
+            # Not enough visible corners for a reliable warp metric;
+            # these are already problematic -- flag them for recovery.
+            scores.append(float("inf"))
+            details.append({"score": float("inf"), "bad_edges": ["<4 visible corners"]})
+        else:
+            detail = warp_detail(res)
+            scores.append(detail["score"])
+            details.append(detail)
+
+    # Step 2: Determine which photos need recovery
+    # A photo needs recovery if EITHER:
+    #   a) Absolute threshold: warp > absolute_thresh (default 1.15)
+    #      Real photos on flatbed scans are nearly rectangular; any photo
+    #      where opposing edge lengths differ by >15% is suspect.
+    #   b) Peer outlier: warp > median * outlier_ratio AND warp > absolute_thresh
+    #      Even among warped photos, one that's dramatically worse may be
+    #      misdetecting edges from an adjacent photo.
+    finite_scores = [s for s in scores if s != float("inf")]
+
+    if not finite_scores:
+        # All results are degenerate -- try recovery for all
+        median_score = float("inf")
+    else:
+        median_score = float(np.median(finite_scores))
+
+    peer_threshold = median_score * outlier_ratio if finite_scores else float("inf")
+
+    # Log scores and diagnostics
+    score_strs = [f'{s:.3f}' if s != float("inf") else 'inf' for s in scores]
+    _log(f"  Warp recovery: scores={score_strs}")
+    for i, d in enumerate(details):
+        edge_info = ""
+        if d.get("bad_edges"):
+            edge_info = f" bad_edges={d['bad_edges']}"
+        if d.get("w_ratio") is not None:
+            edge_info += f" w_ratio={d['w_ratio']:.3f} h_ratio={d['h_ratio']:.3f}"
+            edge_info += f" angles_dev={d['max_angle_dev']:.1f}°"
+        _log(f"    Photo #{i+1}: {edge_info}")
+    _log(f"  Warp recovery: median={median_score:.3f} "
+         f"absolute_thresh={absolute_thresh} peer_thresh={peer_threshold:.3f}")
+
+    # Step 3: Identify photos needing recovery
+    outlier_indices = []
+    for i, s in enumerate(scores):
+        needs_recovery = False
+        reason = ""
+
+        if s > absolute_thresh:
+            needs_recovery = True
+            reason = f"warp={s:.3f} > absolute_thresh={absolute_thresh}"
+        elif finite_scores and s > peer_threshold and s > absolute_thresh:
+            needs_recovery = True
+            reason = f"warp={s:.3f} > peer_thresh={peer_threshold:.3f}"
+
+        if needs_recovery:
+            outlier_indices.append(i)
+            _log(f"  Warp recovery: Photo #{i+1} flagged for recovery: {reason}")
+
+    if not outlier_indices:
+        _log("  Warp recovery: no photos need recovery")
+        return results
+
+    # Step 4: Iterative recovery for each flagged photo
+    orig_w, orig_h = image.size
+
+    for idx in outlier_indices:
+        res = results[idx]
+        best_warp = scores[idx]
+        best_result = res
+        _log(f"  Warp recovery: Photo #{idx+1} attempting recovery "
+             f"(current warp={best_warp:.3f})")
+
+        # Use the detection box as the base for expanding
+        box = res["detection"]["box"]
+        det_idx = None
+        # Find which detection index this corresponds to (for crop limits)
+        if det_detections is not None:
+            for di, det in enumerate(det_detections):
+                if det is res.get("detection"):
+                    det_idx = di
+                    break
+
+        for iteration in range(max_iters):
+            expand_ratio = expand_start + expand_step * iteration
+            _log(f"    Iteration {iteration+1}/{max_iters}: "
+                 f"expand={expand_ratio:.2f}")
+
+            # Get crop limits for this detection (if available)
+            cl = None
+            if crop_limits_list is not None and det_idx is not None:
+                cl = crop_limits_list[det_idx]
+
+            retry = _run_pose_on_crop(
+                pose_session, image, box,
+                pose_conf, img_size,
+                expand_ratio=expand_ratio,
+                crop_limits=cl,
+            )
+
+            if retry is None:
+                _log(f"      No pose detection at expand={expand_ratio:.2f}")
+                continue
+
+            # Inherit the detection info
+            retry["detection"] = res["detection"]
+
+            retry_warp = warp_score(retry)
+            retry_detail = warp_detail(retry)
+            _log(f"      warp={retry_warp:.3f} "
+                 f"w_ratio={retry_detail['w_ratio']:.3f} "
+                 f"h_ratio={retry_detail['h_ratio']:.3f} "
+                 f"angles_dev={retry_detail['max_angle_dev']:.1f}° "
+                 f"(pose_conf={retry['pose_confidence']:.3f})")
+
+            if retry_warp < best_warp:
+                old_vis = sum(1 for kp in best_result.get("keypoints", [])
+                             if kp["visibility"] >= _VIS_THRESH_DEDUP)
+                new_vis = sum(1 for kp in retry.get("keypoints", [])
+                             if kp["visibility"] >= _VIS_THRESH_DEDUP)
+                _log(f"      Improved! warp {best_warp:.3f}->{retry_warp:.3f} "
+                     f"vis {old_vis}/4->{new_vis}/4")
+                best_warp = retry_warp
+                best_result = retry
+
+                # If we're now below the absolute threshold, stop early
+                if best_warp <= absolute_thresh:
+                    _log(f"      Warp score below absolute threshold -- stopping")
+                    break
+
+        # Replace the outlier with the best recovery
+        if best_result is not res:
+            results[idx] = best_result
+            _log(f"  Warp recovery: Photo #{idx+1} replaced "
+                 f"(warp {scores[idx]:.3f} -> {best_warp:.3f})")
+        else:
+            _log(f"  Warp recovery: Photo #{idx+1} could not improve "
+                 f"(warp still {best_warp:.3f})")
+
+    # Re-deduplicate if we modified any results (centers may have shifted)
+    if dedup_min_dist > 0 and len(results) > 1:
+        results = dedup_pose_results(results, dedup_min_dist)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -757,12 +1147,17 @@ def refine_corners_regression(image: Image.Image, result: dict,
         if best_result is not None:
             ax, ay = best_result[0], best_result[1]
 
-        refined_corners[corner_name] = (ax, ay)
+        # Track regression confidence alongside position
+        if best_result is not None:
+            _, _, cr_conf = best_result
+        else:
+            cr_conf = None
+        refined_corners[corner_name] = (ax, ay, cr_conf)
 
-    # Update the result dict with refined positions    # Update the result dict with refined positions
+    # Update the result dict with refined positions
     for name in ["UL", "UR", "LL", "LR"]:
         if name in refined_corners:
-            rx, ry = refined_corners[name]
+            rx, ry, cr_conf = refined_corners[name]
             if name in kps:
                 # Save original visibility before refinement boosted it to 1.0
                 if "nn_vis" not in kps[name]:
@@ -770,6 +1165,12 @@ def refine_corners_regression(image: Image.Image, result: dict,
                 kps[name]["x"] = rx
                 kps[name]["y"] = ry
                 kps[name]["visibility"] = 1.0
+                # Store regression confidence for adaptive margin:
+                # corner_refine independently validates corner positions,
+                # so even low nn_vis corners should be trusted if cr_conf
+                # is high.
+                if cr_conf is not None:
+                    kps[name]["cr_conf"] = cr_conf
             else:
                 result.setdefault("keypoints", []).append({
                     "name": name,
@@ -777,6 +1178,7 @@ def refine_corners_regression(image: Image.Image, result: dict,
                     "y": ry,
                     "visibility": 1.0,
                     "nn_vis": 0.0,
+                    "cr_conf": cr_conf if cr_conf is not None else 0.0,
                 })
 
     return result
@@ -1146,9 +1548,13 @@ def pipeline(detection_session, pose_session, image: Image.Image,
             dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO,
             center_bias: bool = False,
             cv_refine: bool = False,
-            cv_refine_radius: int = 40):
+            cv_refine_radius: int = 40,
+            warp_recover: bool = False,
+            warp_recover_max_iters: int = WARP_RECOVER_MAX_ITERS,
+            warp_recover_outlier_ratio: float = WARP_RECOVER_OUTLIER_RATIO,
+            warp_recover_absolute_thresh: float = WARP_RECOVER_ABSOLUTE_THRESH):
     """
-    Two- or three-stage pipeline: detect -> pose -> [refine ->] dedup -> rescue.
+    Two- or three-stage pipeline: detect -> pose -> [refine ->] dedup -> [warp recover] -> rescue.
 
     Two-stage (default):
         Detection model finds bounding boxes -> pose model finds corners.
@@ -1160,6 +1566,14 @@ def pipeline(detection_session, pose_session, image: Image.Image,
         when the first pose pass has low-visibility corners because the
         detection box is too loose or misaligned -- the second pass gets
         a crop that's tightly centered on the actual photo.
+
+    Warp recovery (optional, ``warp_recover=True``):
+        After dedup, compute a "warp score" for each detected photo that
+        measures how much its detected quad deviates from a perfect
+        rectangle. If some photos have much higher warp than others
+        (suggesting misdetection), iteratively re-run the pose model with
+        progressively larger crops until the warp score improves. This
+        catches cases where the pose model locks onto wrong edges.
 
     CV refinement (optional):
         ``cv_refine``: Sobel edge detection + line intersection on ALL
@@ -1231,6 +1645,25 @@ def pipeline(detection_session, pose_session, image: Image.Image,
     if detection_session is not None and len(pose_results) > 1:
         min_dist = min(orig_w, orig_h) * dedup_min_dist_ratio
         pose_results = dedup_pose_results(pose_results, min_dist)
+
+    # Stage 3.5 (optional): Warp recovery
+    # When some photos have much higher warp (perspective distortion) than
+    # others, it often indicates misdetection. Re-run pose with progressively
+    # larger crops to give the model more context.
+    if warp_recover and len(pose_results) > 0:
+        min_dist = min(orig_w, orig_h) * dedup_min_dist_ratio
+        pose_results = warp_recovery(
+            pose_session, image, pose_results,
+            detection_session=detection_session,
+            pose_conf=pose_conf,
+            img_size=img_size,
+            max_iters=warp_recover_max_iters,
+            absolute_thresh=warp_recover_absolute_thresh,
+            outlier_ratio=warp_recover_outlier_ratio,
+            dedup_min_dist=min_dist if detection_session is not None else 0,
+            crop_limits_list=crop_limits_list,
+            det_detections=detections,
+        )
 
     # Stage 4 (optional): CV corner refinement on all photos
     if cv_refine:
@@ -2732,7 +3165,7 @@ def _get_keypoints_bbox(result: dict, margin: float = 0):
 def crop_simple(image: Image.Image, result: dict,
                 transparent: bool = False,
                 use_corners: bool = False,
-                margin: float = 0) -> Image.Image:
+                margin: float = 0.02) -> Image.Image:
     """
     Simple crop: extract the detected photo region as an axis-aligned
     rectangle, no geometric transforms.
@@ -2824,9 +3257,9 @@ def crop_simple(image: Image.Image, result: dict,
 def crop_perspective_warp(image: Image.Image, result: dict,
                           min_visibility: float = 0.3,
                           warp_mode: str = "inward",
-                          border_fill: tuple = (114, 114, 114),
+                          border_fill = "edge-extend",
                           transparent: bool = False,
-                          margin: float = 0,
+                          margin: float = 0.02,
                           adaptive_margins: dict = None) -> Image.Image:
     """
     Perspective warp crop: use the 4 detected corner keypoints to
@@ -2846,6 +3279,12 @@ def crop_perspective_warp(image: Image.Image, result: dict,
                 guaranteeing ALL photo content is preserved at the cost
                 of small filler areas in the corners of the output.
 
+    Border fill:
+      "edge-extend" (default) -- Replicates the nearest edge pixel for
+                areas outside the source image. Produces a natural border
+                extension that blends smoothly with the photo edges.
+      RGB tuple (R,G,B) -- Solid color fill for out-of-bounds areas.
+
     Margin:
       When margin > 0, the 4 source corner keypoints are expanded outward
       along the edges of the quadrilateral before computing the homography.
@@ -2861,8 +3300,9 @@ def crop_perspective_warp(image: Image.Image, result: dict,
             if a keypoint is below this threshold.
         warp_mode: 'inward' (average edge lengths) or 'outward'
             (max edge lengths) for output dimension calculation.
-        border_fill: RGB tuple for out-of-bounds fill color used by
-            cv2.warpPerspective. Ignored when transparent=True.
+        border_fill: RGB tuple for solid color fill, or "edge-extend"
+            to replicate the nearest edge pixel for out-of-bounds areas.
+            Ignored when transparent=True.
         transparent: If True, produce an RGBA image with transparent
             background instead of border_fill. The warp is done with
             a transparent (0,0,0,0) border, then converted back to PIL
@@ -2976,28 +3416,48 @@ def crop_perspective_warp(image: Image.Image, result: dict,
         warped_rgba = cv2.cvtColor(warped, cv2.COLOR_BGRA2RGBA)
         return Image.fromarray(warped_rgba)
     else:
-        # Apply warp with specified border fill color
-        border_bgr = (border_fill[2], border_fill[1], border_fill[0])  # RGB -> BGR
-        warped = cv2.warpPerspective(
-            img_cv,
-            M,
-            (out_w, out_h),
-            flags=cv2.INTER_LANCZOS4,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=border_bgr,
-        )
+        # Determine border mode based on border_fill type
+        if border_fill == "edge-extend":
+            # Replicate the nearest edge pixel for a natural border extension
+            warped = cv2.warpPerspective(
+                img_cv,
+                M,
+                (out_w, out_h),
+                flags=cv2.INTER_LANCZOS4,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+        else:
+            # Apply warp with specified solid border fill color
+            border_bgr = (border_fill[2], border_fill[1], border_fill[0])  # RGB -> BGR
+            warped = cv2.warpPerspective(
+                img_cv,
+                M,
+                (out_w, out_h),
+                flags=cv2.INTER_LANCZOS4,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=border_bgr,
+            )
         # Convert back to PIL (BGR -> RGB)
         warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
         return Image.fromarray(warped_rgb)
 
 
-def parse_border_fill(value: str) -> tuple:
-    """Parse a border fill color string into an RGB tuple.
+def parse_border_fill(value):
+    """Parse a border fill specification.
 
-    Accepts: 'R,G,B' (0-255), hex '#RRGGBB', hex '#RGB', or
-    named colors 'white', 'black', 'grey', 'gray', 'red', etc.
+    Returns:
+        tuple (R, G, B) for solid color fills, or the string "edge-extend"
+        for edge replication fill.
+
+    Accepts: 'R,G,B' (0-255), hex '#RRGGBB', '#RGB', named colors
+    (white/black/grey/gray/red/green/blue), or 'edge-extend' which
+    replicates the nearest edge pixel for a natural border extension.
     """
     value = value.strip().lower()
+
+    # Special mode: edge extend (replicate nearest edge pixel)
+    if value in ("edge-extend", "edge_extend", "edgeextend", "replicate"):
+        return "edge-extend"
 
     # Named colors
     named = {
@@ -3008,7 +3468,7 @@ def parse_border_fill(value: str) -> tuple:
         "red": (255, 0, 0),
         "green": (0, 255, 0),
         "blue": (0, 0, 255),
-        "none": (114, 114, 114),  # default grey
+        "none": (114, 114, 114),  # grey fallback
     }
     if value in named:
         return named[value]
@@ -3031,18 +3491,19 @@ def parse_border_fill(value: str) -> tuple:
             pass
 
     raise ValueError(
-        f"Invalid border fill color: {value!r}. "
-        "Use 'R,G,B', '#RRGGBB', '#RGB', or named color (white/black/grey/red/green/blue)."
+        f"Invalid border fill: {value!r}. "
+        "Use 'R,G,B', '#RRGGBB', '#RGB', named color "
+        "(white/black/grey/red/green/blue), or 'edge-extend'."
     )
 
 
 def save_crops(image: Image.Image, results: list, image_path: str,
-               crop_mode: str = "simple", crop_dir: str = None,
+               crop_mode: str = "warp-stretch", crop_dir: str = None,
                transparent: bool = False,
                warp_mode: str = "inward",
-               border_fill: tuple = (114, 114, 114),
+               border_fill = "edge-extend",
                source_exif: bytes = None,
-               margin: float = 0,
+               margin: float = 0.02,
                adaptive_margin: bool = False,
                adaptive_margin_thresh: float = 0.5,
                adaptive_margin_max: float = 0.03,
@@ -3063,8 +3524,8 @@ def save_crops(image: Image.Image, results: list, image_path: str,
                      output format.
         warp_mode: 'inward' (avg edge dims) or 'outward' (max edge
                    dims) for perspective warp output size.
-        border_fill: RGB tuple for warp background fill, or None
-                     for default grey (114,114,114).
+        border_fill: RGB tuple for solid color fill, or "edge-extend" (default)
+                     to replicate the nearest edge pixel for natural borders.
         source_exif: Raw EXIF bytes from the source image to preserve
                      in cropped outputs. If None, no EXIF is written.
         margin: Margins expressed as a fraction of the detected photo's
@@ -3123,18 +3584,39 @@ def save_crops(image: Image.Image, results: list, image_path: str,
         # Convert fraction-of-diagonal margins to absolute pixels
         px_margin = margin * diag
 
-        # Compute adaptive margins for low-confidence corners (in pixels)
-        # Uses original NN visibility (nn_vis) when available -- the CV
-        # refinement boosts visibility artificially, but the original
-        # confidence tells us whether we should trust the corner.
+        # Compute adaptive margins for low-confidence corners (in pixels).
+        # When deciding how much to trust a corner position, we consider
+        # the source of the position estimate:
+        #
+        #   1. If corner_refine (regression model) was applied (cr_conf is
+        #      set), use the regression confidence. Corner_refine independently
+        #      validates positions with high accuracy, so even corners with
+        #      low pose model visibility (nn_vis) are reliable when cr_conf
+        #      is high.
+        #
+        #   2. If only CV edge rescue was applied (nn_vis is set but cr_conf
+        #      is not), use nn_vis. CV rescue finds approximate positions but
+        #      doesn't independently validate them, so low nn_vis corners are
+        #      genuinely uncertain.
+        #
+        #   3. If neither was applied, use the current visibility directly.
         adaptive_margins = None
         if adaptive_margin and kps:
             adaptive_margins = {}
             for name in ["LL", "UL", "UR", "LR"]:
                 kp = kp_by_name.get(name, {})
-                # Use original NN visibility if CV refinement saved it,
-                # otherwise fall back to the current (possibly boosted) value
-                vis = kp.get("nn_vis", kp.get("visibility", 0))
+                # Determine effective confidence for this corner.
+                # cr_conf takes priority: regression model confidence means
+                # the position is accurate regardless of original nn_vis.
+                cr_conf = kp.get("cr_conf")
+                if cr_conf is not None and cr_conf >= 0.5:
+                    # Corner refinement found this corner with good confidence.
+                    # Trust the position — use cr_conf as effective visibility.
+                    vis = cr_conf
+                else:
+                    # No corner_refine (or very low cr_conf) — use original
+                    # NN visibility which reflects the pose model's confidence.
+                    vis = kp.get("nn_vis", kp.get("visibility", 0))
                 if vis < adaptive_margin_thresh:
                     # Linearly scale: vis=0 -> max fraction, vis=thresh -> 0
                     extra_frac = adaptive_margin_max * (1 - vis / adaptive_margin_thresh)
@@ -3258,10 +3740,10 @@ def infer_single(detection_session, pose_session, image_path: str,
                  pose_refine_expand: float = POSE_REFINE_EXPAND,
                  img_size: int = DEFAULT_IMG_SIZE,
                  dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO,
-                 crop_mode: str = None, crop_dir: str = None,
+                 crop_mode: str = "warp-stretch", crop_dir: str = None,
                  transparent: bool = False,
-                 border_fill: tuple = (114, 114, 114),
-                 margin: float = 0,
+                 border_fill = "edge-extend",
+                 margin: float = 0.02,
                  do_pose_sweep: bool = False,
                  sweep_crop_expands: list = None,
                  sweep_refine_expands: list = None,
@@ -3281,7 +3763,11 @@ def infer_single(detection_session, pose_session, image_path: str,
                  corner_refine_iterations: int = 2,
                  corner_refine_conf: float = 0.3,
                  corner_refine_model: str = "regression",
-                 corner_regression_session=None):
+                 corner_regression_session=None,
+                 do_warp_recover: bool = False,
+                 warp_recover_max_iters: int = WARP_RECOVER_MAX_ITERS,
+                 warp_recover_outlier_ratio: float = WARP_RECOVER_OUTLIER_RATIO,
+                 warp_recover_absolute_thresh: float = WARP_RECOVER_ABSOLUTE_THRESH):
     """Run the full pipeline on a single image."""
 
     # Open image and capture EXIF before converting (convert creates
@@ -3321,6 +3807,10 @@ def infer_single(detection_session, pose_session, image_path: str,
             center_bias=center_bias,
             cv_refine=cv_refine,
             cv_refine_radius=cv_refine_radius,
+            warp_recover=do_warp_recover,
+            warp_recover_max_iters=warp_recover_max_iters,
+            warp_recover_outlier_ratio=warp_recover_outlier_ratio,
+            warp_recover_absolute_thresh=warp_recover_absolute_thresh,
         )
 
     # ── Post-sweep CV refinement ──
@@ -3346,6 +3836,30 @@ def infer_single(detection_session, pose_session, image_path: str,
     # for sweep results that bypass pipeline().
     if do_pose_sweep_xy or do_pose_sweep:
         results = rescue_low_vis_corners(image, results)
+
+    # ── Post-sweep warp recovery ──
+    # When sweep is used, pipeline() isn't called, so run warp recovery
+    # here on the sweep results instead.
+    if (do_pose_sweep_xy or do_pose_sweep) and do_warp_recover and results:
+        min_dist = min(orig_w, orig_h) * dedup_min_dist_ratio
+        # Re-run detection to get crop limits (sweep doesn't preserve them)
+        detections_for_limits = run_detection(
+            detection_session, image, det_conf, iou_threshold, img_size
+        ) if detection_session is not None else None
+        crop_limits_for_warp = (_compute_crop_limits(detections_for_limits, orig_w, orig_h)
+                                if detections_for_limits is not None else None)
+        results = warp_recovery(
+            pose_session, image, results,
+            detection_session=detection_session,
+            pose_conf=pose_conf,
+            img_size=img_size,
+            max_iters=warp_recover_max_iters,
+            absolute_thresh=warp_recover_absolute_thresh,
+            outlier_ratio=warp_recover_outlier_ratio,
+            dedup_min_dist=min_dist if detection_session is not None else 0,
+            crop_limits_list=crop_limits_for_warp,
+            det_detections=detections_for_limits,
+        )
 
     # ── Corner refinement ──
     # After pose (+ optional CV refinement), refine corner positions using
@@ -3385,6 +3899,8 @@ def infer_single(detection_session, pose_session, image_path: str,
         mode += " + cv-refine"
     if corner_refine:
         mode += " + corner-refine"
+    if do_warp_recover:
+        mode += " + warp-recover"
     _log(f"Mode: {mode}")
     _log(f"\n{'=' * 60}")
     _log(f"Image: {image_path}")
@@ -3412,7 +3928,7 @@ def infer_single(detection_session, pose_session, image_path: str,
         pose_c = res.get("pose_confidence", 0)
         kps = res.get("keypoints", [])
 
-        line = f"\n  Photo #{i+1}:  detection_conf={det_c:.4f}  pose_conf={pose_c:.4f}"
+        line = f"\n  Photo #{i+1}:  detection_conf={det_c:.4f}  pose_conf={pose_c:.4f}  warp={warp_score(res):.3f}"
         if sweep_params:
             sp = sweep_params[i] if i < len(sweep_params) else None
             if sp:
@@ -3491,10 +4007,10 @@ def infer_batch(detection_session, pose_session, image_dir: str,
                img_size: int = DEFAULT_IMG_SIZE,
                dedup_min_dist_ratio: float = DEDUP_MIN_DIST_RATIO,
                limit: int = 0,
-               crop_mode: str = None, crop_dir: str = None,
+               crop_mode: str = "warp-stretch", crop_dir: str = None,
                transparent: bool = False,
-               border_fill: tuple = (114, 114, 114),
-               margin: float = 0,
+               border_fill = "edge-extend",
+               margin: float = 0.02,
                do_pose_sweep: bool = False,
                sweep_crop_expands: list = None,
                sweep_refine_expands: list = None,
@@ -3514,7 +4030,15 @@ def infer_batch(detection_session, pose_session, image_dir: str,
                corner_refine_iterations: int = 2,
                corner_refine_conf: float = 0.3,
                corner_refine_model: str = "regression",
-               corner_regression_session=None):
+               corner_regression_session=None,
+               workers: int = 1,
+               detection_model_path: str = None,
+               pose_model_path: str = None,
+               corner_regression_model_path: str = None,
+               do_warp_recover: bool = False,
+               warp_recover_max_iters: int = WARP_RECOVER_MAX_ITERS,
+               warp_recover_outlier_ratio: float = WARP_RECOVER_OUTLIER_RATIO,
+               warp_recover_absolute_thresh: float = WARP_RECOVER_ABSOLUTE_THRESH):
 
     image_dir = Path(image_dir)
     extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
@@ -3537,42 +4061,90 @@ def infer_batch(detection_session, pose_session, image_dir: str,
     _log(f"  Output: {out_path}")
 
     summary = []
-    for img_path in images:
-        out_file = out_path / f"{img_path.stem}_detected.jpg"
-        results = infer_single(
-            detection_session, pose_session, str(img_path), str(out_file),
-            det_conf, pose_conf, iou_threshold, pose_crop_expand,
-            pose_refine, pose_refine_expand,
-            img_size, dedup_min_dist_ratio,
-            crop_mode, crop_dir,
-            transparent, border_fill,
-            margin,
-            do_pose_sweep=do_pose_sweep,
-            sweep_crop_expands=sweep_crop_expands,
-            sweep_refine_expands=sweep_refine_expands,
-            do_pose_sweep_xy=do_pose_sweep_xy,
-            sweep_xy_expands=sweep_xy_expands,
-            center_bias=center_bias,
-            cv_refine=cv_refine,
-            cv_refine_radius=cv_refine_radius,
-            coords=coords,
-            debug=debug,
-            no_image=no_image,
-            adaptive_margin=adaptive_margin,
-            adaptive_margin_thresh=adaptive_margin_thresh,
-            adaptive_margin_max=adaptive_margin_max,
-            warp_fallback_thresh=warp_fallback_thresh,
-            corner_refine=corner_refine,
-            corner_refine_iterations=corner_refine_iterations,
-            corner_refine_conf=corner_refine_conf,
-            corner_refine_model=corner_refine_model,
-            corner_regression_session=corner_regression_session,
-        )
-        summary.append({
-            "image": img_path.name,
-            "photos": len(results),
-            "with_pose": pose_ok,
-        })
+
+    # Common kwargs passed to infer_single for each image
+    infer_kwargs = dict(
+        det_conf=det_conf, pose_conf=pose_conf,
+        iou_threshold=iou_threshold, pose_crop_expand=pose_crop_expand,
+        pose_refine=pose_refine, pose_refine_expand=pose_refine_expand,
+        img_size=img_size, dedup_min_dist_ratio=dedup_min_dist_ratio,
+        crop_mode=crop_mode, crop_dir=crop_dir,
+        transparent=transparent, border_fill=border_fill,
+        margin=margin,
+        do_pose_sweep=do_pose_sweep,
+        sweep_crop_expands=sweep_crop_expands,
+        sweep_refine_expands=sweep_refine_expands,
+        do_pose_sweep_xy=do_pose_sweep_xy,
+        sweep_xy_expands=sweep_xy_expands,
+        center_bias=center_bias,
+        cv_refine=cv_refine, cv_refine_radius=cv_refine_radius,
+        coords=coords, debug=debug, no_image=no_image,
+        adaptive_margin=adaptive_margin,
+        adaptive_margin_thresh=adaptive_margin_thresh,
+        adaptive_margin_max=adaptive_margin_max,
+        warp_fallback_thresh=warp_fallback_thresh,
+        corner_refine=corner_refine,
+        corner_refine_iterations=corner_refine_iterations,
+        corner_refine_conf=corner_refine_conf,
+        corner_refine_model=corner_refine_model,
+        do_warp_recover=do_warp_recover,
+        warp_recover_max_iters=warp_recover_max_iters,
+        warp_recover_outlier_ratio=warp_recover_outlier_ratio,
+        warp_recover_absolute_thresh=warp_recover_absolute_thresh,
+    )
+
+    if workers <= 1:
+        # Sequential processing (default) -- use the main thread's sessions
+        for img_path in images:
+            out_file = out_path / f"{img_path.stem}_detected.jpg"
+            results = infer_single(
+                detection_session, pose_session, str(img_path), str(out_file),
+                corner_regression_session=corner_regression_session,
+                **infer_kwargs,
+            )
+            pose_count = sum(1 for r in results if r.get("keypoints"))
+            summary.append({
+                "image": img_path.name,
+                "photos": len(results),
+                "with_pose": pose_count,
+            })
+    else:
+        # Parallel processing -- each worker loads its own model sessions
+        # since ONNX Runtime sessions are not thread-safe for concurrent use.
+        num_workers = workers
+        if num_workers == 0:
+            import os
+            num_workers = min(len(images), os.cpu_count() or 1)
+
+        _log(f"  Parallel processing: {num_workers} workers")
+
+        def _process_image(args_tuple):
+            """Worker function: load sessions, process one image."""
+            img_path, out_dir = args_tuple
+            # Each thread needs its own sessions
+            det_sess = load_onnx_model(str(detection_model_path))
+            pose_sess = load_onnx_model(str(pose_model_path))
+            cr_sess = None
+            if corner_refine and corner_regression_model_path:
+                cr_sess = load_onnx_model(str(corner_regression_model_path))
+
+            out_file = out_dir / f"{img_path.stem}_detected.jpg"
+            results = infer_single(
+                det_sess, pose_sess, str(img_path), str(out_file),
+                corner_regression_session=cr_sess,
+                **infer_kwargs,
+            )
+            pose_count = sum(1 for r in results if r.get("keypoints"))
+            return {
+                "image": img_path.name,
+                "photos": len(results),
+                "with_pose": pose_count,
+            }
+
+        image_args = [(img, out_path) for img in images]
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            for result in pool.map(_process_image, image_args):
+                summary.append(result)
 
     # Summary
     _log(f"\n{'=' * 60}")
@@ -3603,51 +4175,53 @@ def infer_batch(detection_session, pose_session, image_dir: str,
 # warns (not errors) on questionable pairings.
 
 _PRESETS = {
-    "quick": {
-        "description": "Fast detection + pose, no refinement",
+    "fast": {
+        "description": "Fast detection + pose only, no refinement",
         "args": {},
     },
-    "standard": {
-        "description": "Pose-refine + adaptive margin (good balance of speed and accuracy)",
+    "pose_refine": {
+        "description": "Add pose-refine (re-center crop) + adaptive margin "
+                       "(better accuracy, modest speed cost)",
         "args": {
             "pose_refine": True,
             "adaptive_margin": True,
         },
     },
-    "thorough": {
-        "description": "Full refinement: pose-refine -> corner-refine (regression) -> cv-refine -> adaptive margin "
-                       "(best quality, recovers invisible corners)",
+    "corner_refine": {
+        "description": "Add corner-refine (regression V2 per-corner model) + "
+                       "adaptive margin (best accuracy, default)",
         "args": {
             "pose_refine": True,
             "corner_refine": True,
             "corner_refine_iterations": 2,
             "corner_refine_conf": 0.3,
             "corner_refine_model": "regression",
-            "cv_refine": True,
             "adaptive_margin": True,
         },
     },
 }
 
-# Crop defaults that pair well with each preset (used when --crop is
-# specified alongside a preset but individual crop settings like
-# --crop-margin are left at defaults).
+# Default preset: best quality out of the box
+DEFAULT_PRESET = "corner_refine"
+
+# Crop defaults that pair well with each preset.
+# These are applied when --crop is used alongside a preset but individual
+# crop settings like --crop-margin are left at their parser defaults.
+# Since crop_margin and border_fill now have safe parser-level defaults
+# (0.02 and "edge-extend"), these are empty -- parser defaults handle it.
 _PRESET_CROP_DEFAULTS = {
-    "quick": {
-        "crop_margin": 0.02,
-    },
-    "standard": {
-        "crop_margin": 0.02,
-    },
-    "thorough": {
-        "crop_margin": 0.02,
-        "border_fill": "white",
-    },
+    "fast": {},
+    "pose_refine": {},
+    "corner_refine": {},
 }
 
 
 def _validate_preset_crop(preset_name: str, crop_mode: str | None):
     """Check for questionable preset + crop method combinations.
+
+    Both --preset and --crop have defaults (corner_refine, warp-stretch), so
+    this typically warns on questionable combinations. Only errors on
+    explicitly impossible states (e.g. 'none' crop_mode).
 
     Returns (errors, warnings) where:
       errors:   list of error messages (combine is invalid, should abort)
@@ -3657,31 +4231,13 @@ def _validate_preset_crop(preset_name: str, crop_mode: str | None):
     warnings = []
 
     if preset_name and crop_mode:
-        # thorough + simple: refinement effort wasted on a loose crop
-        if preset_name == "thorough" and crop_mode == "simple":
+        # fast + warp variants: no refinement + perspective warp
+        if preset_name == "fast" and crop_mode.startswith("warp"):
             warnings.append(
-                f"Preset 'thorough' with --crop simple: thorough refinement "
-                f"is wasted on a detection-bbox crop that doesn't use corner "
-                f"positions. Consider --crop simple-corners or --crop warp-stretch."
-            )
-        # quick + warp variants: imprecise corners + perspective warp
-        if preset_name == "quick" and crop_mode.startswith("warp"):
-            warnings.append(
-                f"Preset 'quick' with --crop {crop_mode}: no corner refinement, "
+                f"Preset 'fast' with --crop {crop_mode}: no refinement, "
                 f"so warp accuracy depends on raw pose keypoints. Consider "
-                f"--preset standard or --preset thorough for better corners."
+                f"--preset pose_refine for better corners."
             )
-
-    if crop_mode and preset_name is None:
-        # --crop specified with no preset -- valid use case
-        pass
-
-    if preset_name and crop_mode is None:
-        # Preset specified but no --crop: bad usage -- no output will be produced
-        errors.append(
-            f"Preset '{preset_name}' requires --crop. "
-            f"Specify a crop method: --crop simple-corners or --crop warp-stretch."
-        )
 
     return errors, warnings
 
@@ -3756,86 +4312,62 @@ def main():
         description="photocrop -- Detect & Extract Photos from Multi-Photo Scans",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Basic Usage:
-  # Single image (models auto-detected)
+Quick Start:
+  # Just works -- corner_refine preset + warp-stretch crop (default)
   photocrop --image scan.jpg
 
-  # Folder of images -> folder of results
+  # Fast -- detect + pose only, no refinement (~5s)
+  photocrop --image scan.jpg --preset fast
+
+  # Pose-refine -- re-center crop for better accuracy (~7s)
+  photocrop --image scan.jpg --preset pose_refine
+
+  # Process a whole folder
   photocrop --image ./scans/ --output ./crops/
 
-Presets + Crop Method:
-  Presets control detection/refinement SPEED and ACCURACY only.
-  The --crop argument controls the OUTPUT CROP METHOD separately.
-  Use them together for the best results.
+  # Process a folder in parallel (4 workers)
+  photocrop --image ./scans/ --workers 4
 
-  # Quick -- detect + pose, no refinement (~5s)
-  photocrop --image scan.jpg --preset quick --crop simple-corners
+Presets (detection/refinement):
+  fast            = detect + pose only (fastest, ~5s, no refinement)
+  pose_refine     = + pose-refine + adaptive margin (re-centers crop for better
+                    accuracy, no corner model)
+  corner_refine   = + corner-refine (regression V2 per-corner model) [DEFAULT]
 
-  # Standard -- pose-refine + adaptive margin (~7s)
-  photocrop --image scan.jpg --preset standard --crop simple-corners
-  photocrop --image scan.jpg --preset standard --crop warp-stretch --border-fill white
+Crop Methods (--crop, default: warp-stretch):
+  simple          = detection bbox crop (no corner positions used)
+  simple-corners  = tighter bbox from detected corner keypoints
+  warp            = perspective warp (inward -- may lose small edge slivers)
+  warp-stretch    = perspective warp (outward -- preserves ALL photo content)
+                    [DEFAULT -- best for most photos]
 
-  # Thorough -- full pipeline, best corner accuracy (~15s)
-  photocrop --image scan.jpg --preset thorough --crop warp-stretch --border-fill white
+Common Overrides:
+  # Different crop method
+  photocrop --image scan.jpg --crop simple-corners
 
-  # Quick + warp -- works but corners may be less accurate (warning issued)
-  photocrop --image scan.jpg --preset quick --crop warp-stretch
+  # More margin (for photos that are hard to separate from background)
+  photocrop --image scan.jpg --crop-margin 0.04
 
-  # Override preset defaults
-  photocrop --image scan.jpg --preset thorough --crop warp-stretch --crop-margin 0.03
+  # Transparent crops for compositing
+  photocrop --image scan.jpg --crop-transparent
 
-  # Detection only -- preset without --crop (no files saved, warning issued)
-  photocrop --image scan.jpg --preset standard
+  # Solid color border fill (default is edge-extend)
+  photocrop --image scan.jpg --border-fill white
+  photocrop --image scan.jpg --border-fill black
 
-Recommended for photos close together:
-  When photos are close together on the scanner bed, the pose model can
-  latch onto an adjacent photo if the crop is too large. --pose-sweep-xy
-  tries multiple crop-expand sizes per photo and picks the best, preventing
-  this issue. It adds ~3x processing time but significantly improves
-  corner detection on tight layouts:
+  # Debug: save annotated image showing boxes and keypoints
+  photocrop --image scan.jpg --debug
 
-  # Add sweep to any preset + crop combination
-  photocrop --image scan.jpg --preset standard --crop warp-stretch --pose-sweep-xy
+Photos Close Together:
+  When photos are near each other on the scanner, the pose model can
+  latch onto an adjacent photo. --pose-sweep-xy tries multiple crop sizes
+  and picks the best, preventing cross-photo contamination (~3x slower):
 
-  # Thorough + sweep for the most challenging layouts
-  photocrop --image scan.jpg --preset thorough --crop warp-stretch --pose-sweep-xy
+  photocrop --image scan.jpg --pose-sweep-xy
 
-CV Refinement (manual):
-  # Edge detection + line intersection (Enhancements 1+2)
-  photocrop --image scan.jpg --cv-refine
-
-  # With perspective warp cropping
-  photocrop --image scan.jpg --cv-refine \\
-    --crop warp-stretch --crop-margin 0.02 --border-fill white
-
-Detailed Crop Commands:
-  # Best simple crop -- keypoint bbox + margin so edges aren't clipped
-  photocrop --image scan.jpg --crop simple-corners --crop-margin 0.02
-
-  # Best warp crop -- outward warp + margin + white fill for clean edges
-  photocrop --image scan.jpg --crop warp-stretch \\
-    --crop-margin 0.02 --border-fill white
-
-  # Best transparent crop -- corner-based with margin, for compositing
-  photocrop --image scan.jpg --crop simple-corners \\
-    --crop-margin 0.02 --crop-transparent
-
-  # Crop a whole folder
-  photocrop --image ./scans/ --output ./crops/ \\
-    --crop simple-corners --crop-margin 0.02
-
-Coordinates Only (scripting-friendly):
-  # Output corner coordinates as JSON, no file output
+Coordinates (scripting-friendly):
   photocrop --image scan.jpg --coords json --no-image
-
-  # Coordinates as line-delimited text (bash-friendly)
   photocrop --image scan.jpg --coords text --no-image
-
-  # Debug: save annotated detection image with boxes and keypoints
-  photocrop --image scan.jpg --preset standard --crop warp-stretch --debug
-
-  # Coordinates + debug image
-  photocrop --image scan.jpg --coords json --debug
 """,
     )
 
@@ -3852,16 +4384,15 @@ Coordinates Only (scripting-friendly):
         help="Path to image file or directory of images to process",
     )
     parser.add_argument(
-        "--preset", type=str, default=None,
+        "--preset", type=str, default=DEFAULT_PRESET,
         choices=list(_PRESETS.keys()),
         help="Detection/refinement preset. Controls how corners are found, "
              "NOT the output crop method (use --crop for that). "
-             "quick=detect+pose only, standard=+pose-refine+adaptive-margin, "
-             "thorough=+pose-refine+corner-refine+cv-refine+adaptive-margin. "
+             "fast=detect+pose only, pose_refine=+pose-refine+adaptive-margin, "
+             "corner_refine=+corner-refine(regression V2)+adaptive-margin. "
              "Note: low-visibility corner rescue (CV edge detection) is always "
              "on -- it runs automatically when corners are invisible. "
-             "Always pair with --crop to save output. "
-             "(default: none)",
+             f"(default: {DEFAULT_PRESET})",
     )
     parser.add_argument(
         "--output", "-o", type=str, default=None,
@@ -3965,7 +4496,7 @@ Coordinates Only (scripting-friendly):
     )
     parser.add_argument(
         "--dedup-dist", type=float, default=DEDUP_MIN_DIST_RATIO,
-        help="Min center distance for dedup, as fraction of image min-dimension (default: 0.08)",
+        help="Min center distance for dedup, as fraction of image min-dimension (default: 0.12)",
     )
     parser.add_argument(
         "--limit", "-n", type=int, default=0,
@@ -3973,7 +4504,15 @@ Coordinates Only (scripting-friendly):
              "to process (0 = all)",
     )
     parser.add_argument(
-        "--crop", type=str, default=None,
+        "--workers", "-w", type=int, default=1,
+        help="Number of parallel workers for directory processing. "
+             "1 = sequential (default). 0 = auto (uses CPU count). "
+             "Each worker loads its own copy of the ONNX models, so "
+             "memory usage scales with worker count. Only effective "
+             "when processing a directory of images.",
+    )
+    parser.add_argument(
+        "--crop", type=str, default="warp-stretch",
         choices=["simple", "simple-corners", "warp", "warp-stretch"],
         help="Crop detected photos: "
              "'simple' (detection bbox crop, no transforms), "
@@ -3982,6 +4521,7 @@ Coordinates Only (scripting-friendly):
              "'warp' (perspective warp, inward -- average edge dims), or "
              "'warp-stretch' (perspective warp, outward -- max edge dims, "
              "preserves all photo content). "
+             "(default: warp-stretch). "
              "Output saved as {stem}_{tag}_{N}.{ext} where tag is "
              "'warp', 'crop', or 'box' based on actual crop mode used.",
     )
@@ -3991,13 +4531,13 @@ Coordinates Only (scripting-friendly):
              "next to input image)",
     )
     parser.add_argument(
-        "--crop-margin", type=float, default=0,
+        "--crop-margin", type=float, default=0.02,
         help="Margin as a fraction of the detected photo's diagonal. E.g. "
              "0.02 adds ~2%% of the diagonal (~20px on a 1000px photo). "
              "For simple crops, expands the bounding box. For warp crops, "
              "pushes corner keypoints outward from the quad center. "
              "Resolution-independent -- works across different image sizes. "
-             "(default: 0)",
+             "(default: 0.02)",
     )
     parser.add_argument(
         "--crop-transparent", action="store_true",
@@ -4007,11 +4547,13 @@ Coordinates Only (scripting-friendly):
              "the border color. Forces .png output format.",
     )
     parser.add_argument(
-        "--border-fill", type=str, default="grey",
-        help="Border fill color for perspective warp (areas outside source "
-             "image). Accepts 'R,G,B' (0-255), '#RRGGBB', '#RGB', or named "
-             "colors: white, black, grey/gray, red, green, blue. "
-             "Ignored when --crop-transparent is set. (default: grey)",
+        "--border-fill", type=str, default="edge-extend",
+        help="Border fill for perspective warp (areas outside source "
+             "image). 'edge-extend' replicates the nearest edge pixel "
+             "for a natural border extension (default). "
+             "Also accepts solid colors: 'R,G,B' (0-255), '#RRGGBB', "
+             "'#RGB', or named colors: white, black, grey/gray, red, "
+             "green, blue. Ignored when --crop-transparent is set.",
     )
     parser.add_argument(
         "--coords", type=str, default=None,
@@ -4090,6 +4632,38 @@ Coordinates Only (scripting-friendly):
         "--corner-regression-model", type=str, default=str(DEFAULT_CORNER_REGRESSION_MODEL),
         help="Path to corner regression ONNX model "
              "(default: ../models/corner-regression-v2.onnx)",
+    )
+    parser.add_argument(
+        "--warp-recover", action="store_true", default=False,
+        help="After pose detection, compute a warp score for each detected "
+             "photo. If some photos have much higher warp than others "
+             "(suggesting misdetection), iteratively re-run the pose model "
+             "with progressively larger crops to recover better detections. "
+             "Uses median warp * outlier-ratio as the threshold. "
+             "(default: disabled)",
+    )
+    parser.add_argument(
+        "--warp-recover-max-iters", type=int, default=WARP_RECOVER_MAX_ITERS,
+        help="Maximum number of retry iterations per outlier photo during "
+             "warp recovery. Each iteration increases the crop expand ratio. "
+             f"(default: {WARP_RECOVER_MAX_ITERS})",
+    )
+    parser.add_argument(
+        "--warp-recover-outlier-ratio", type=float, default=WARP_RECOVER_OUTLIER_RATIO,
+        help="A photo is flagged as a warp outlier when its warp score exceeds "
+             "the median warp score times this ratio. For example, 2.0 means a "
+             "photo needs 2x the median warp to trigger recovery. "
+             f"(default: {WARP_RECOVER_OUTLIER_RATIO})",
+    )
+    parser.add_argument(
+        "--warp-recover-absolute-thresh", type=float, default=WARP_RECOVER_ABSOLUTE_THRESH,
+        help="Absolute warp threshold for flagging a photo for recovery, "
+             "regardless of what other photos on the page look like. Any photo "
+             "whose opposing edge lengths differ by more than this ratio is "
+             "flagged. A real photo on a flatbed scan should be nearly "
+             "rectangular, so 1.15 (15%% edge mismatch) catches misdetections "
+             "even when all photos on the page are somewhat warped. "
+             f"(default: {WARP_RECOVER_ABSOLUTE_THRESH})",
     )
 
     args = parser.parse_args()
@@ -4196,6 +4770,14 @@ Coordinates Only (scripting-friendly):
             corner_refine_conf=args.corner_refine_conf,
             corner_refine_model=args.corner_refine_model,
             corner_regression_session=corner_regression_session,
+            workers=args.workers,
+            detection_model_path=str(detection_model_path),
+            pose_model_path=str(pose_model_path),
+            corner_regression_model_path=str(corner_regression_model_path) if corner_regression_session else None,
+            do_warp_recover=args.warp_recover,
+            warp_recover_max_iters=args.warp_recover_max_iters,
+            warp_recover_outlier_ratio=args.warp_recover_outlier_ratio,
+            warp_recover_absolute_thresh=args.warp_recover_absolute_thresh,
         )
     else:
         infer_single(
@@ -4233,6 +4815,10 @@ Coordinates Only (scripting-friendly):
             corner_refine_conf=args.corner_refine_conf,
             corner_refine_model=args.corner_refine_model,
             corner_regression_session=corner_regression_session,
+            do_warp_recover=args.warp_recover,
+            warp_recover_max_iters=args.warp_recover_max_iters,
+            warp_recover_outlier_ratio=args.warp_recover_outlier_ratio,
+            warp_recover_absolute_thresh=args.warp_recover_absolute_thresh,
         )
 
 
