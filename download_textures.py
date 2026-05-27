@@ -45,7 +45,7 @@ DTD_SHA256 = ""
 
 # Base directory for this project
 PROJECT_ROOT = Path(__file__).resolve().parent
-TEXTURES_DIR = PROJECT_ROOT / "textures"
+TEXTURES_DIR = PROJECT_ROOT / "data_generator" / "textures"
 
 # Temporary directories
 DOWNLOAD_DIR = PROJECT_ROOT / ".tmp_textures"

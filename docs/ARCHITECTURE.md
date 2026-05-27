@@ -122,7 +122,7 @@ Each model follows the same pattern: **generator → dataset → trainer**.
 
 ```
 Source photos (data_generator/images/)
-    + Backgrounds (textures/)
+    + Backgrounds (data_generator/textures/)
     + Oxford/DTD datasets
          │
          ▼

@@ -335,7 +335,7 @@ def apply_3_linear_gradients(img):
 
 def apply_texture_overlay(canvas):
     """Apply a random texture overlay to the background."""
-    textures_dir = Path(__file__).resolve().parent.parent / "textures"
+    textures_dir = Path(__file__).resolve().parent / "textures"
 
     if not textures_dir.exists():
         return canvas

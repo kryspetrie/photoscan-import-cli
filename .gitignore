@@ -1,5 +1,6 @@
 # Source images (large, not part of repo)
 data_generator/images/
+data_generator/textures/
 
 # Generated training data (large, regenerateable)
 data/
