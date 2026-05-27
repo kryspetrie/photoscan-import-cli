@@ -2,12 +2,13 @@
 
 ## Overview
 
-This guide covers using the two ONNX models in a Kotlin/Android application:
+This guide covers using the ONNX models in a Kotlin/Android application:
 
 1. **Detection model** — finds bounding boxes around photos in a scanned image
 2. **Pose model** — finds the 4 corner keypoints of each detected photo
+3. **Corner regression model** — finds precise corner positions in 320×320 crops
 
-Both models share the same input format and preprocessing. The pipeline is:
+The full pipeline is:
 
 ```
 Input Image
@@ -17,8 +18,20 @@ Input Image
     │         ▼
     └─→ Pose Model ─→ Corner keypoints per region
                          │
-                         ▼ (optional, recommended)
-              Corner Refinement ─→ Recover invisible corners
+                         ▼ (optional, --pose-refine)
+              Pose Refinement ─→ Re-crop + re-run pose for better localization
+                         │
+                         ▼
+              Dedup ─→ Remove duplicate detections
+                         │
+                         ▼ (enabled by default)
+              Warp Recovery ─→ Re-pose with larger crops for high-warp detections
+                         │
+                         ▼ (always on)
+              Rescue ─→ Sobel edge detection for invisible corners
+                         │
+                         ▼ (optional, --corner-refine)
+              Corner Regression ─→ 320×320 crop → precise corner position
                          │
                          ▼
               Perspective-corrected crops
@@ -102,6 +115,25 @@ Format: 300 candidate detections × 18 values each. Each row is:
 
 > **The pose model output is already NMS-filtered.** It returns at most 300 detections sorted by confidence. Filter by `row[4] > your_confidence_threshold`.
 
+### Corner Regression Model Output
+
+| Field | Shape | Description |
+|-------|-------|-------------|
+| **Output 0** | `(1, 300, 9)` | Filtered detections with 1 keypoint |
+
+Format: 300 candidate detections × 9 values each. Each row is:
+- `[0]` = x1 (left edge, pixel coords in 320×320 input space)
+- `[1]` = y1 (top edge)
+- `[2]` = x2 (right edge)
+- `[3]` = y2 (bottom edge)
+- `[4]` = objectness confidence
+- `[5]` = class probability (≈0 for the corner class)
+- `[6, 7, 8]` = keypoint 0 (corner): x, y, confidence
+
+> **The corner regression model output is already NMS-filtered.** It returns at most 300 detections sorted by confidence. Filter by `row[4] > 0.3` (lower threshold than the pose model since the model is very confident on true corners).
+
+> **Input size:** The corner regression model uses **320×320** input, not 640×640. Scale factors must be adjusted accordingly.
+
 ### Keypoint Order
 
 | Index | Name | Position |
@@ -137,9 +169,12 @@ Copy both ONNX models into your assets:
 
 ```
 app/src/main/assets/
-├── detection_model.onnx    (10.2 MB)
-└── pose_model.onnx         (10.0 MB)
+├── detection_model.onnx           (9.8 MB)
+├── pose_model.onnx                (38 MB)
+└── corner_regression_model.onnx   (10 MB)
 ```
+
+All three models are required for the full pipeline. The corner regression model is optional — skip it for detect+pose only.
 
 ---
 

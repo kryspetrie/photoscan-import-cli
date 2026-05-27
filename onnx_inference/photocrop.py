@@ -1056,10 +1056,49 @@ def refine_corners_regression(image: Image.Image, result: dict,
             # Fall back to bbox corner
             approx_corners[name] = _bbox_corner_coord(box, name)
 
+    # Compute neighbor-anchored projection for each corner.
+    # When neighboring corners have high visibility, they can project a
+    # better search center than the pose model's own position. The neighbor
+    # that shares the horizontal edge provides y, and the one sharing the
+    # vertical edge provides x. This is critical when the pose model places
+    # a corner on the wrong photo (e.g., UR at y=1031 near an adjacent
+    # photo's LR at y=1025, instead of the true UR at y=1072).
+    projected_refs = {}
+    for kp in result.get("keypoints", []):
+        if kp["name"] in _CORNER_NEIGHBORS:
+            idx = next(i for i, k in enumerate(result["keypoints"]) if k["name"] == kp["name"])
+            proj = _project_from_neighbors(
+                result["keypoints"], kp["name"], idx,
+                vis_threshold=_CORNER_REGRESS_NEIGHBOR_VIS_THRESHOLD)
+            projected_refs[kp["name"]] = proj
+
     refined_corners = {}
 
     for corner_name, (ax, ay) in approx_corners.items():
         orig_x, orig_y = ax, ay  # Pose model's original position
+
+        # Use neighbor-anchored projection as a secondary reference point
+        # for detecting when the pose model has placed this corner on the
+        # wrong photo. When two photos share a boundary, the pose model may
+        # place a high-visibility corner on the adjacent photo. Neighbor
+        # projection (using the corners that share edges with this one) can
+        # give a reference position that's closer to the true corner.
+        #
+        # Strategy: find the closest detection to the pose model position
+        # AND the closest detection to the projected position. If they're
+        # different detections, prefer the one with higher confidence.
+        # If they're the same, use it. This handles the case where the
+        # pose model places the corner on the wrong photo but with high
+        # confidence — the projected reference guides us to the right photo.
+        proj = projected_refs.get(corner_name)
+        has_projection = (proj is not None and proj["confidence"] > 0)
+        proj_ref_x = proj["proj_x"] if has_projection else None
+        proj_ref_y = proj["proj_y"] if has_projection else None
+
+        if has_projection:
+            _log(f"  {corner_name}: pose=({orig_x:.0f},{orig_y:.0f}) "
+                 f"proj=({proj_ref_x:.0f},{proj_ref_y:.0f}) "
+                 f"projAxis={proj['projected_axis']}")
 
         # Keep iterating until we get a confident detection or run out of
         # iterations. Base iterations cover the initial search, then extra
@@ -1085,16 +1124,18 @@ def refine_corners_regression(image: Image.Image, result: dict,
                      f"at ({ax:.0f},{ay:.0f}) iter={iteration}")
                 break
 
-            # Find the detection whose keypoint is closest to the ORIGINAL
-            # pose model position (orig_x, orig_y), not the crop center.
-            # Using the original position ensures we pick the corner belonging
-            # to the target photo, not an adjacent photo's corner that may
-            # appear in the same crop with higher confidence.
+            # Find two candidates:
+            # 1. Closest detection to the pose model position (original behavior)
+            # 2. Closest detection to the neighbor-projected position (if available)
+            # If they differ, prefer the one with higher confidence. This handles
+            # cases where the pose model places a corner on an adjacent photo.
             ref_x = orig_x - offset_x  # Original pose position in crop coords
             ref_y = orig_y - offset_y
 
-            best_det = None
-            best_dist = float('inf')
+            best_det_by_pose = None
+            best_dist_by_pose = float('inf')
+            best_det_by_proj = None
+            best_dist_by_proj = float('inf')
 
             for det in detections:
                 kp = det["keypoint"]
@@ -1102,10 +1143,42 @@ def refine_corners_regression(image: Image.Image, result: dict,
                     continue
                 dx = kp["x"] - ref_x
                 dy = kp["y"] - ref_y
-                dist = (dx * dx + dy * dy) ** 0.5
-                if dist < best_dist:
-                    best_dist = dist
-                    best_det = det
+                dist_to_pose = (dx * dx + dy * dy) ** 0.5
+                if dist_to_pose < best_dist_by_pose:
+                    best_dist_by_pose = dist_to_pose
+                    best_det_by_pose = det
+                if has_projection and proj_ref_x is not None and proj_ref_y is not None:
+                    px = kp["x"] - (proj_ref_x - offset_x)
+                    py = kp["y"] - (proj_ref_y - offset_y)
+                    dist_to_proj = (px * px + py * py) ** 0.5
+                    if dist_to_proj < best_dist_by_proj:
+                        best_dist_by_proj = dist_to_proj
+                        best_det_by_proj = det
+
+            # Pick the best detection: if projection is available and selects
+            # a different detection than the pose position, prefer the one
+            # with higher confidence. This handles cases where the pose model
+            # places the corner on an adjacent photo (wrong but high vis).
+            if (best_det_by_proj is not None and best_det_by_pose is not None
+                    and best_det_by_proj is not best_det_by_pose):
+                # Different detections: prefer higher confidence
+                if best_det_by_proj["confidence"] >= best_det_by_pose["confidence"]:
+                    _log(f"  {corner_name} iter={iteration}: proj detection "
+                         f"({best_det_by_proj['keypoint']['x']:.0f},"
+                         f"{best_det_by_proj['keypoint']['y']:.0f}) "
+                         f"conf={best_det_by_proj['confidence']:.3f} wins over "
+                         f"pose detection "
+                         f"({best_det_by_pose['keypoint']['x']:.0f},"
+                         f"{best_det_by_pose['keypoint']['y']:.0f}) "
+                         f"conf={best_det_by_pose['confidence']:.3f}")
+                    best_det = best_det_by_proj
+                    best_dist = best_dist_by_proj
+                else:
+                    best_det = best_det_by_pose
+                    best_dist = best_dist_by_pose
+            else:
+                best_det = best_det_by_pose or best_det_by_proj
+                best_dist = best_dist_by_pose if best_det_by_pose is not None else best_dist_by_proj
 
             if best_det is None:
                 _log(f"  {corner_name}: no visible keypoint in regression "
@@ -1116,13 +1189,29 @@ def refine_corners_regression(image: Image.Image, result: dict,
             new_x = best_det["keypoint"]["x"] + offset_x
             new_y = best_det["keypoint"]["y"] + offset_y
 
-            # Validate: reject if refinement moved too far from original
-            if (abs(new_x - orig_x) > max_shift or
-                    abs(new_y - orig_y) > max_shift):
-                _log(f"  {corner_name}: regression moved too far "
-                     f"({new_x:.0f},{new_y:.0f}) vs "
-                     f"({orig_x:.0f},{orig_y:.0f})")
-                break
+            # Validate: reject if refinement moved too far from original.
+            # When neighbor projection selected a different detection than the
+            # pose position, the detected point can be further from the pose
+            # position. Allow additional shift proportional to the distance
+            # between the projected reference and the pose position.
+            if has_projection and proj_ref_x is not None and proj_ref_y is not None:
+                proj_max_shift = max_shift + max(
+                    abs(proj_ref_x - orig_x),
+                    abs(proj_ref_y - orig_y))
+                if (abs(new_x - orig_x) > proj_max_shift or
+                        abs(new_y - orig_y) > proj_max_shift):
+                    _log(f"  {corner_name}: regression moved too far "
+                         f"({new_x:.0f},{new_y:.0f}) vs "
+                         f"({orig_x:.0f},{orig_y:.0f}) "
+                         f"(proj_max_shift={proj_max_shift:.0f})")
+                    break
+            else:
+                if (abs(new_x - orig_x) > max_shift or
+                        abs(new_y - orig_y) > max_shift):
+                    _log(f"  {corner_name}: regression moved too far "
+                         f"({new_x:.0f},{new_y:.0f}) vs "
+                         f"({orig_x:.0f},{orig_y:.0f})")
+                    break
 
             conf = best_det["confidence"]
             _log(f"  {corner_name}: regression refined to ({new_x:.1f},{new_y:.1f}) "
@@ -2216,7 +2305,15 @@ _CORNER_NEIGHBORS = {
 }
 
 # Minimum visibility for a neighbor corner to be used for projection
+# (rescue stage uses a higher threshold since it needs precise positioning)
 _NEIGHBOR_VIS_THRESHOLD = 0.5
+
+# Lower visibility threshold for neighbor projection in corner regression.
+# Corner regression just needs an approximate reference position to select
+# the right detection from multiple candidates. A lower threshold allows
+# neighbor projection to contribute even when neighbors have low visibility,
+# which is critical when the pose model places a corner on the wrong photo.
+_CORNER_REGRESS_NEIGHBOR_VIS_THRESHOLD = 0.15
 
 
 def _orientation_filter_edge_pixels(edge_abs_xs, edge_abs_ys, corner_name,
@@ -2259,7 +2356,8 @@ def _orientation_filter_edge_pixels(edge_abs_xs, edge_abs_ys, corner_name,
     return h_mask, v_mask
 
 
-def _project_from_neighbors(kps, corner_name, corner_idx):
+def _project_from_neighbors(kps, corner_name, corner_idx,
+                             vis_threshold=_NEIGHBOR_VIS_THRESHOLD):
     """Project a better search center using high-vis neighbor corners.
 
     For a low-visibility corner, the two adjacent corners share its edges:
@@ -2270,12 +2368,16 @@ def _project_from_neighbors(kps, corner_name, corner_idx):
     shares the right edge (projects x). If LL is at (100, 1974) and UR is
     at (750, 100), the projected center for LR is (750, 1974).
 
-    Only uses neighbors with visibility >= _NEIGHBOR_VIS_THRESHOLD.
+    Only uses neighbors with visibility >= vis_threshold.
 
     Args:
         kps: List of keypoint dicts from one result
         corner_name: "LL", "UL", "UR", or "LR"
         corner_idx: Index of this corner in the kps list
+        vis_threshold: Minimum visibility for a neighbor to be used for
+            projection. Defaults to _NEIGHBOR_VIS_THRESHOLD (0.5).
+            Corner regression uses a lower threshold (0.15) since it
+            only needs an approximate position for detection selection.
 
     Returns:
         dict with keys:
@@ -2301,13 +2403,13 @@ def _project_from_neighbors(kps, corner_name, corner_idx):
 
     # Horizontal-edge neighbor provides y-coordinate projection
     h_kp = kp_by_name.get(h_neighbor_name)
-    if h_kp and h_kp["visibility"] >= _NEIGHBOR_VIS_THRESHOLD:
+    if h_kp and h_kp["visibility"] >= vis_threshold:
         proj_y = h_kp["y"]
         proj_y_from_h = True
 
     # Vertical-edge neighbor provides x-coordinate projection
     v_kp = kp_by_name.get(v_neighbor_name)
-    if v_kp and v_kp["visibility"] >= _NEIGHBOR_VIS_THRESHOLD:
+    if v_kp and v_kp["visibility"] >= vis_threshold:
         proj_x = v_kp["x"]
         proj_x_from_v = True
 

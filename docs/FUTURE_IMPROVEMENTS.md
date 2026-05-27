@@ -10,8 +10,9 @@
 | Multi-pose model | ❌ Failed | — | 0.838* | Overfit: 0% bg images, precision stuck at 0.50 |
 | 4-class fiducial | ❌ Failed | 0.906 | 0.358 | cls_loss ≈ random; can't classify L-shapes by orientation |
 | Binary fiducial | ❌ Failed | 0.917 | 0.364 | Corner types are visually identical in crops; classification impossible |
-| **Corner refinement (pose)** | ✅ **Current** | — | — | Reuses pose model on corner crops; recovers invisible corners |
-| **Fiducial-pose segments** | 🔄 **In Dev** | — | — | YOLO pose model detects visible edge segments; assembles corners geometrically |
+| Corner regression V2 | ✅ Production | 0.994 | 0.994 | 320×320 crop model recovers invisible corners (epoch 24) |
+| Corner refinement (pose) | ✅ Current | — | — | Reuses pose model on corner crops; recovers invisible corners |
+| Fiducial-pose segments V3 | 🔄 In Dev | 0.857 | 0.851 | Detects edge segments; assembles corners geometrically |
 
 \* Best validation epoch before overfitting
 
@@ -64,6 +65,12 @@ Input Image
 ┌──────────────┐
 │  Dedup       │  Remove duplicate detections / overlapping poses
 └──────┬───────┘
+       │
+       ▼ (enabled by default; --no-warp-recover to disable)
+┌──────────────────────────┐
+│  Warp Recovery            │  Compute warp score per photo; re-pose with
+│                            │  larger crops for high-warp detections
+└──────┬───────────────────┘
        │
        ▼
 ┌──────────────────────────┐
@@ -124,7 +131,7 @@ Three corner refinement modes are available:
 
 ## Fiducial-Pose Segment Model (In Development)
 
-**Status**: 🔄 Training in progress (epoch 22/150 as of 2026-05-19)
+**Status**: V3 training completed (best: Pose mAP50=0.857, mAP50-95=0.851 at epoch 18). V4 training planned with improved hyperparameters.
 
 The fiducial-pose segment model takes a fundamentally different approach to corner
 detection. Instead of trying to detect corners directly, it detects the **visible
@@ -175,21 +182,22 @@ visible — without relying on the current Sobel/line-intersection rescue fallba
 | + Rescue (if triggered) | ~280ms | Only when a photo has < 3 visible corners; zero cost otherwise |
 | + Corner refinement (pose) | ~2,500ms | Recovers all invisible corners, vis=1.0 for all |
 | + Corner refinement (detection) | ~1,900ms | Recovers most corners, less precise than pose |
+| + Corner refinement (regression) | ~3,200ms | Best precision, dedicated 320×320 model |
 | + Sweep (XY) | ~6,900ms | Replaced by corner refinement — slower, same results |
 | + Sweep + corner refine | ~8,900ms | Redundant — sweep is unnecessary with corner refinement |
 
-**The "best" preset** now uses corner refinement instead of sweep:
+**The default preset** (`corner_refine`) uses corner regression for best precision:
 ```bash
-photocrop --image scan.jpg --preset best
+photocrop --image scan.jpg
 # Equivalent to:
 photocrop --image scan.jpg \
   --pose-refine \
-  --corner-refine --corner-refine-model pose \
-  --cv-refine \
-  --crop warp-stretch --crop-margin 0.02 --border-fill white \
-  --adaptive-margin
+  --corner-refine --corner-refine-model regression \
+  --crop warp-stretch --crop-margin 0.02 --border-fill edge-extend \
+  --adaptive-margin \
+  --warp-recover
 ```
-Auto-rescue is always on (no flag needed).
+Auto-rescue is always on (no flag needed). Warp recovery is on by default.
 
 ## Future Improvements
 

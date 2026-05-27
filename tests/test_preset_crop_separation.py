@@ -60,8 +60,9 @@ class TestPresetStructure:
                     f"Presets should be detection-only."
                 )
 
-    def test_fast_preset_has_no_args(self):
-        assert _PRESETS["fast"]["args"] == {}
+    def test_fast_preset_has_only_warp_recover(self):
+        """Fast preset only has warp_recover (enabled by default across all presets)."""
+        assert _PRESETS["fast"]["args"] == {"warp_recover": True}
 
     def test_pose_refine_preset_has_pose_refine_and_adaptive(self):
         args = _PRESETS["pose_refine"]["args"]
