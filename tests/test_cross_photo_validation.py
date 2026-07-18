@@ -20,7 +20,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from onnx_inference.photocrop import (
+from com.kryspetrie.photoscan_import_cli.photocrop import (
     _corner_crop,
     run_corner_regression,
     CORNER_CROP_SIZE_MIN,
@@ -154,8 +154,8 @@ class TestRealWorldIntegration:
 
     @pytest.fixture(scope="class")
     def models(self):
-        from onnx_inference.photocrop import load_onnx_model
-        from onnx_inference.photocrop import DEFAULT_DETECTION_MODEL, DEFAULT_POSE_MODEL
+        from com.kryspetrie.photoscan_import_cli.photocrop import load_onnx_model
+        from com.kryspetrie.photoscan_import_cli.photocrop import DEFAULT_DETECTION_MODEL, DEFAULT_POSE_MODEL
         det = load_onnx_model(str(DEFAULT_DETECTION_MODEL))
         pose = load_onnx_model(str(DEFAULT_POSE_MODEL))
         return (det, pose)

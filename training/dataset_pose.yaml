@@ -18,7 +18,7 @@
 #   python3 train_pose.py
 #   (or explicitly: python3 train_pose.py --data dataset_pose.yaml)
 
-path: /Users/krys.petrie/dev/photo-pose-detector/data_pose
+path: /Users/krys.petrie/dev/photoscan-import-cli/data_pose
 train: images/train
 val: images/val
 

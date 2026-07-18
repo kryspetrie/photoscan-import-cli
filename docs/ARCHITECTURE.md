@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**photo-pose-detector** detects physical photographs in camera-scanned images, locates their four corners, and extracts perspective-corrected crops. The pipeline runs detection to find photos within the scene, pose estimation to pinpoint corners, and geometric correction to produce final output.
+**photoscan-import-cli** detects physical photographs in camera-scanned images, locates their four corners, and extracts perspective-corrected crops. The pipeline runs detection to find photos within the scene, pose estimation to pinpoint corners, and geometric correction to produce final output.
 
 ## Model Inventory
 
@@ -52,7 +52,7 @@
 
 ## Inference Pipeline
 
-Implemented in `onnx_inference/photocrop.py`.
+Implemented in `com/kryspetrie/photoscan_import_cli/photocrop.py`.
 
 ```
 1. Detection     → find photo bounding boxes
@@ -143,7 +143,7 @@ Source photos (data_generator/images/)
     ONNX Export (export/export_onnx.py)
          │
          ▼
-    Inference (onnx_inference/photocrop.py)
+    Inference (com/kryspetrie/photoscan_import_cli/photocrop.py)
          │
          ▼
     Kotlin Integration (petrie-file-importer)

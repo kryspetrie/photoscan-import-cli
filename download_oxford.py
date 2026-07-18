@@ -192,7 +192,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Download Oxford Buildings Dataset for photo-pose-detector"
+        description="Download Oxford Buildings Dataset for photoscan-import-cli"
     )
     parser.add_argument(
         "--verify-only", action="store_true",

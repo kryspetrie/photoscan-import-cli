@@ -19,7 +19,7 @@ from PIL import Image
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from onnx_inference.photocrop import (
+from com.kryspetrie.photoscan_import_cli.photocrop import (
     _orientation_filter_edge_pixels,
     _project_from_neighbors,
     _fit_weighted_line,
@@ -259,7 +259,7 @@ class TestRealWorldExample:
     @pytest.fixture
     def models(self):
         """Load ONNX models."""
-        from onnx_inference.photocrop import load_onnx_model, DEFAULT_DETECTION_MODEL, DEFAULT_POSE_MODEL
+        from com.kryspetrie.photoscan_import_cli.photocrop import load_onnx_model, DEFAULT_DETECTION_MODEL, DEFAULT_POSE_MODEL
         det = load_onnx_model(str(DEFAULT_DETECTION_MODEL))
         pose = load_onnx_model(str(DEFAULT_POSE_MODEL))
         return det, pose
@@ -277,7 +277,7 @@ class TestRealWorldExample:
         The model has improved: Photo 4's LR is now detected near GT
         even without CV refine. Verify it's within 50px of ground truth.
         """
-        from onnx_inference.photocrop import infer_single
+        from com.kryspetrie.photoscan_import_cli.photocrop import infer_single
         det, pose = models
 
         results = infer_single(det, pose, image_path, "/tmp/test_detection/", cv_refine=False)
@@ -298,7 +298,7 @@ class TestRealWorldExample:
 
     def test_no_regression_photo1(self, models, image_path):
         """Photo 1 corners should not change significantly."""
-        from onnx_inference.photocrop import infer_single
+        from com.kryspetrie.photoscan_import_cli.photocrop import infer_single
         det, pose = models
 
         results_no_cv = infer_single(det, pose, image_path, "/tmp/test_reg1/", cv_refine=False)

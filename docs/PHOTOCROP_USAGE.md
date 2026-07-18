@@ -23,7 +23,7 @@ photocrop --image scan.jpg --preset warp --debug
 
 > If `photocrop` isn't on your PATH yet, you can also run it as a module:
 > ```bash
-> python -m onnx_inference --image scan.jpg --preset warp
+> python -m com.kryspetrie.photoscan_import_cli --image scan.jpg --preset warp
 > ```
 
 ---
@@ -526,8 +526,8 @@ Corner refinement adds ~1.8s for 4 photos using the pose model. Each corner is a
 For programmatic use, you can import and call the pipeline directly:
 
 ```python
-from onnx_inference.photocrop import pipeline, load_onnx_model, save_crops
-from onnx_inference.photocrop import format_coords
+from com.kryspetrie.photoscan_import_cli.photocrop import pipeline, load_onnx_model, save_crops
+from com.kryspetrie.photoscan_import_cli.photocrop import format_coords
 from PIL import Image
 
 # Load models

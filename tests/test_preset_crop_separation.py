@@ -22,7 +22,7 @@ import pytest
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from onnx_inference.photocrop import (
+from com.kryspetrie.photoscan_import_cli.photocrop import (
     _PRESETS,
     _PRESET_CROP_DEFAULTS,
     _validate_preset_crop,

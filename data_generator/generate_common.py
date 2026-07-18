@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Pose Detector — Shared Generation Utilities
+PhotoScan Import CLI — Shared Generation Utilities
 ==================================================
 
 Common functions used by both the detection and pose data generators.

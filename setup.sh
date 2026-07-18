@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Photo Pose Detector — Environment Setup
+# PhotoScan Import CLI — Environment Setup
 # ---------------------------------------------------------------------------
 # Usage:
 #   ./setup.sh              # create .venv, install deps (default CPU torch)

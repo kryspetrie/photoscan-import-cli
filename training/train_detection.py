@@ -14,7 +14,7 @@ USAGE
     python3 train_detection.py --resume
     python3 train_detection.py --data /path/to/dataset_detection.yaml
 
-Author: Photo Pose Detector Project
+Author: PhotoScan Import CLI Project
 Version: 33 - Separate Data Pipelines
 """
 

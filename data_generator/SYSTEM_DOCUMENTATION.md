@@ -1,4 +1,4 @@
-# Photo Pose Detector — Synthetic Data Generator
+# PhotoScan Import CLI — Synthetic Data Generator
 
 ## System Documentation
 
@@ -114,7 +114,7 @@ Each gradient is a normalized `[0, 1]` ramp along the chosen direction, multipli
 
 ### 4.3 Texture Overlay — `apply_texture_overlay(canvas)`
 
-If `/photo-pose-detector/data_generator/textures/` exists and contains `.jpg`/`.png` files:
+If `/photoscan-import-cli/data_generator/textures/` exists and contains `.jpg`/`.png` files:
 
 - Randomly selects one texture
 - Resizes to canvas dimensions

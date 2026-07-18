@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Pose Detector - ONNX Export
+PhotoScan Import CLI - ONNX Export
 
 Exports trained detection and pose models to ONNX format
 for cross-platform deployment outside Python/Ultralytics.

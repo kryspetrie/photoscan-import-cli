@@ -1,0 +1,1 @@
+"""photoscan-import-cli — Detect & extract photographs from multi-photo scans."""

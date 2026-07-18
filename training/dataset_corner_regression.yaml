@@ -23,7 +23,7 @@
 #   python3 train_corner_regression.py
 #   (or: python3 train_corner_regression.py --data dataset_corner_regression.yaml)
 
-path: /Users/krys.petrie/dev/photo-pose-detector/data_generator/data_corner_regression
+path: /Users/krys.petrie/dev/photoscan-import-cli/data_generator/data_corner_regression
 train: images/train
 val: images/val
 

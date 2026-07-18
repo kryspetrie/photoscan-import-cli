@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Pose Detector — Pose Data Generator
+PhotoScan Import CLI — Pose Data Generator
 ==========================================
 
 Generates synthetic training images for the **pose model only**.

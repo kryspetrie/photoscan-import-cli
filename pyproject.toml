@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "photo-pose-detector"
+name = "photoscan-import-cli"
 version = "0.1.0"
 description = "Detect and extract individual photographs from multi-photo scans"
 requires-python = ">=3.9"
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-photocrop = "onnx_inference.photocrop:main"
+photocrop = "com.kryspetrie.photoscan_import_cli.photocrop:main"
 
 [tool.setuptools.packages.find]
-include = ["onnx_inference*"]
+include = ["com*"]

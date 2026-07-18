@@ -16,7 +16,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from onnx_inference.photocrop import (
+from com.kryspetrie.photoscan_import_cli.photocrop import (
     _corner_crop,
     CORNER_CROP_SIZE_MIN,
 )

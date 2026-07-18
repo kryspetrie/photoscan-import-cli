@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Pose Detector — Corner Regression Data Generator V2
+PhotoScan Import CLI — Corner Regression Data Generator V2
 ==========================================================
 
 Generates corner crop training images for a lightweight regression model

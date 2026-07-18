@@ -4,7 +4,7 @@ Download and Prepare DTD Textures for Synthetic Data Generation
 ===============================================================
 
 Downloads specific texture images from the Describable Textures Dataset (DTD),
-then processes them for use as background textures in photo-pose-detector's
+then processes them for use as background textures in photoscan-import-cli's
 synthetic data generator.
 
 Processing pipeline:
@@ -382,7 +382,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Download and prepare DTD textures for photo-pose-detector"
+        description="Download and prepare DTD textures for photoscan-import-cli"
     )
     parser.add_argument(
         "--skip-download", action="store_true",

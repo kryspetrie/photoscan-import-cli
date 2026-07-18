@@ -1,4 +1,4 @@
-# Photo Pose Detector — Python Dependencies
+# PhotoScan Import CLI — Python Dependencies
 # ============================================
 # Install:  pip install -r requirements.txt
 # Full setup: ./setup.sh

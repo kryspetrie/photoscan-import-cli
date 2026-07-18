@@ -20,7 +20,7 @@ import numpy as np
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from onnx_inference.photocrop import (
+from com.kryspetrie.photoscan_import_cli.photocrop import (
     load_onnx_model,
     infer_single,
     _PRESETS,

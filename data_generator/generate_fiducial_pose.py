@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Pose Detector — Fiducial Pose Data Generator
+PhotoScan Import CLI — Fiducial Pose Data Generator
 ===================================================
 
 Generates synthetic training images for a **multi-pose corner fiducial model**.

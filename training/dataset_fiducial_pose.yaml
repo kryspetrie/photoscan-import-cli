@@ -23,7 +23,7 @@
 #   python3 train_fiducial_pose.py
 #   (or: python3 train_fiducial_pose.py --data dataset_fiducial_pose.yaml)
 
-path: /Users/krys.petrie/dev/photo-pose-detector/data_fiducial_pose
+path: /Users/krys.petrie/dev/photoscan-import-cli/data_fiducial_pose
 train: images/train
 val: images/val
 

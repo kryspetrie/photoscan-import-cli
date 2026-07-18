@@ -50,7 +50,7 @@ USAGE
     python3 train_fiducial_pose.py --resume
     python3 train_fiducial_pose.py --data /path/to/dataset_fiducial_pose.yaml
 
-Author: Photo Pose Detector Project
+Author: PhotoScan Import CLI Project
 Version: 3 - Loss rebalanced (box reduced, cls restored), mosaic off, lr0 restored
 """
 

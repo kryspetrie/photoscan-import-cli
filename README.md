@@ -1,4 +1,4 @@
-# Photo Pose Detector
+# PhotoScan Import CLI
 
 Detect the corners of physical photographs in camera-scanned images, extract each photo, and correct perspective distortion — powered by detection + pose models with geometric corner refinement and automatic rescue.
 
@@ -119,7 +119,7 @@ photocrop --image scan.jpg --coords json --no-image
 
 > If `photocrop` isn't on your PATH yet, you can also run it as a module:
 > ```bash
-> python -m onnx_inference --image scan.jpg
+> python -m com.kryspetrie.photoscan_import_cli --image scan.jpg
 > ```
 
 ## Presets
@@ -170,7 +170,7 @@ Instead of training a new model to classify corners (which failed repeatedly), w
 ## Project Structure
 
 ```
-photo-pose-detector/
+photoscan-import-cli/
 ├── data_generator/                # Synthetic training data generators
 │   ├── generate_common.py          #   Shared utilities (backgrounds, textures, shadows)
 │   ├── generate_detection.py       #   Detection model data generator
@@ -196,10 +196,12 @@ photo-pose-detector/
 │   ├── pose_single_ep42.onnx      #   ★ Active pose model
 │   ├── pose_single_ep42.pt         #   ★ Active pose model (PyTorch)
 │   └── corner-regression-v2.onnx   #   Corner regression model
-├── onnx_inference/                 # Main inference pipeline & CLI
-│   ├── photocrop.py                #   Single-file pipeline (all stages)
-│   ├── __init__.py                 #   Package init
-│   └── __main__.py                 #   python -m onnx_inference entry point
+├── com/                            #   Package root
+│   └── kryspetrie/                 #   Namespace package
+│       └── photoscan_import_cli/   #   Main inference pipeline & CLI
+│           ├── photocrop.py        #     Single-file pipeline (all stages)
+│           ├── __init__.py         #     Package init
+│           └── __main__.py         #     python -m com.kryspetrie.photoscan_import_cli entry point
 ├── export/
 │   └── export_onnx.py              # ONNX model export
 ├── tests/                          # Unit tests

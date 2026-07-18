@@ -24,14 +24,14 @@ from PIL import Image
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 MODEL_PATH = Path(
-    "/Users/krys.petrie/dev/photo-pose-detector/training/"
+    "/Users/krys.petrie/dev/photoscan-import-cli/training/"
     "runs/pose/runs/pose/corner-regression-v1/weights/best.pt"
 )
 VAL_IMG_DIR = Path(
-    "/Users/krys.petrie/dev/photo-pose-detector/data_corner_regression/images/val/"
+    "/Users/krys.petrie/dev/photoscan-import-cli/data_corner_regression/images/val/"
 )
 VAL_LBL_DIR = Path(
-    "/Users/krys.petrie/dev/photo-pose-detector/data_corner_regression/labels/val/"
+    "/Users/krys.petrie/dev/photoscan-import-cli/data_corner_regression/labels/val/"
 )
 
 # Thresholds for "within X pixels" metrics (in pixels)

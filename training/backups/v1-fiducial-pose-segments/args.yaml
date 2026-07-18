@@ -1,7 +1,7 @@
 task: pose
 mode: train
 model: yolo26s-pose.pt
-data: /Users/krys.petrie/dev/photo-pose-detector/training/dataset_fiducial_pose.yaml
+data: /Users/krys.petrie/dev/photoscan-import-cli/training/dataset_fiducial_pose.yaml
 epochs: 150
 time: null
 patience: 30
@@ -106,4 +106,4 @@ auto_augment: randaugment
 erasing: 0.4
 cfg: null
 tracker: botsort.yaml
-save_dir: /Users/krys.petrie/dev/photo-pose-detector/training/runs/pose/runs/pose/fiducial-pose-segments
+save_dir: /Users/krys.petrie/dev/photoscan-import-cli/training/runs/pose/runs/pose/fiducial-pose-segments
